@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import Any, Dict, Optional
 
 from . import status_sidecar as ss
@@ -39,6 +40,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 4 * 3600  # 4 hours — matches the design doc
 
+# Toolset the ``status_update`` tool is registered under.
+#
+# Why ``"todo"`` and not ``"memory"``:
+# Aleph's actual DM surface is Discord, and Zoe's ``platform_toolsets.discord``
+# in ``~/.hermes/config.yaml`` does NOT include ``memory`` (the built-in
+# ``memory`` tool is intentionally gated off for Aleph). If we left
+# ``status_update`` under ``"memory"``, it would be invisible on Discord and
+# the deterministic ``post_tool_call`` hook would be the *only* write path.
+# ``todo`` is in Discord's allowlist, is conceptually adjacent ("operational
+# hints for current work"), and is exposed in safe profiles already.
+STATUS_UPDATE_TOOLSET = "todo"
+
 
 def _ttl_seconds() -> float:
     """Resolve the TTL. Env override → config fallback → default."""
@@ -48,13 +61,11 @@ def _ttl_seconds() -> float:
             return float(raw)
         except (TypeError, ValueError):
             pass
-    # No reach into hermes_cli.config here — keep the hook cheap and
-    # crash-proof. Operators who want a non-default TTL set the env var.
     return float(DEFAULT_TTL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
-# Hook
+# pre_llm_call hook — render the bounded ``<system_status>`` block
 # ---------------------------------------------------------------------------
 
 def _on_pre_llm_call(
@@ -84,6 +95,132 @@ def _on_pre_llm_call(
 
 
 # ---------------------------------------------------------------------------
+# post_tool_call hook — deterministic ledger updates after observed tools
+# ---------------------------------------------------------------------------
+#
+# Hard rule: no tool *result body* or *args content* ever lands in the
+# ledger. The derivation policy is in
+# :func:`status_sidecar.derive_status_from_tool_call`; this hook only
+# applies its output.
+#
+# We also track tool-call counts per session for the
+# :func:`_on_session_finalize` compact drift signal — that's why we keep a
+# small per-session counter dict here. It does NOT store any tool args or
+# results, only a count.
+# ---------------------------------------------------------------------------
+
+# Bounded counter so a long-lived gateway process never grows the dict
+# unboundedly. We evict the smallest sessions when over the soft cap.
+_session_counters_lock = threading.Lock()
+_session_counters: Dict[str, Dict[str, Any]] = {}
+_MAX_TRACKED_SESSIONS = 64
+
+
+def _bump_session_counter(session_id: str, tool_name: str) -> None:
+    if not isinstance(session_id, str):
+        return
+    sid = session_id or "_unknown_"
+    with _session_counters_lock:
+        rec = _session_counters.setdefault(sid, {"count": 0, "last_tool": ""})
+        rec["count"] = int(rec.get("count", 0)) + 1
+        if isinstance(tool_name, str) and tool_name:
+            rec["last_tool"] = tool_name
+        # Soft-evict if we've blown the cap. Drop the smallest-count sessions
+        # first; for ties, drop arbitrarily (insertion order).
+        if len(_session_counters) > _MAX_TRACKED_SESSIONS:
+            # Pick the lowest-count entry to evict.
+            victim = min(
+                _session_counters.items(),
+                key=lambda kv: (kv[1].get("count", 0), kv[0]),
+            )[0]
+            if victim != sid:
+                _session_counters.pop(victim, None)
+
+
+def _drain_session_counter(session_id: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    with _session_counters_lock:
+        return _session_counters.pop(session_id, None)
+
+
+def _on_post_tool_call(
+    tool_name: str = "",
+    args: Any = None,
+    result: Any = None,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    duration_ms: int = 0,
+    **_: Any,
+) -> None:
+    """Apply deterministic ledger updates derived from a tool call.
+
+    NEVER raises. Errors are logged at debug level and swallowed — a
+    failing status write must never break the agent loop.
+    """
+    try:
+        # Track everything we see for the session-finalize signal — even
+        # ignored tools count, so the agent gets a true "I made N calls"
+        # signal.
+        _bump_session_counter(session_id, tool_name)
+
+        update = ss.derive_status_from_tool_call(tool_name, args, result)
+    except Exception as exc:  # pragma: no cover — derive is pure and safe
+        logger.debug("status_sidecar derive failed: %s", exc)
+        return
+
+    if not update:
+        return
+
+    drift = update.pop("_drift", None)
+    try:
+        if update:
+            # Only call write_status if we have at least one scalar field
+            # to set. Empty calls would still bump status_updated_at, which
+            # would falsely advertise freshness on no real change.
+            ss.write_status(**update)
+        if isinstance(drift, str) and drift.strip():
+            ss.append_drift_signal(drift)
+    except Exception as exc:  # pragma: no cover — write_status swallows internally
+        logger.debug("status_sidecar post_tool_call write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# on_session_finalize hook — compact end-of-session drift signal
+# ---------------------------------------------------------------------------
+
+def _on_session_finalize(session_id: str = "", **_: Any) -> None:
+    """Append a compact drift signal summarising the session.
+
+    Pure breadcrumb: ``"session ended: N tool calls, last=X"``. We do NOT
+    capture user prose, assistant prose, or tool results — only counts and
+    the last tool name we observed.
+
+    NEVER raises.
+    """
+    try:
+        counter = _drain_session_counter(session_id)
+        if counter is None:
+            # No activity tracked this session — finalize is a no-op rather
+            # than emitting a misleading "0 calls" signal that would just
+            # add noise.
+            return
+        count = int(counter.get("count", 0))
+        last_tool = counter.get("last_tool") or ""
+        if count <= 0:
+            return
+        # Keep the signal extremely short and structured. The drift-signal
+        # ring buffer is bounded; we don't need to bound this further.
+        signal = f"session ended: {count} tool calls"
+        if last_tool:
+            signal += f", last={last_tool}"
+        ss.append_drift_signal(signal)
+    except Exception as exc:  # pragma: no cover — append_drift_signal swallows
+        logger.debug("status_sidecar finalize failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Tool: status_update
 # ---------------------------------------------------------------------------
 
@@ -96,7 +233,10 @@ _STATUS_UPDATE_SCHEMA = {
         "workspace path. Not a memory store: entries are length-bounded and "
         "the drift-signal ring buffer keeps only the most recent few. The "
         "ledger is appended to the user message on the next turn via the "
-        "status-sidecar plugin's pre_llm_call hook."
+        "status-sidecar plugin's pre_llm_call hook. Most of the ledger is "
+        "updated automatically by the plugin's post_tool_call observer — "
+        "use this tool only for drift signals or when you want to override "
+        "what the observer captured."
     ),
     "parameters": {
         "type": "object",
@@ -194,9 +334,11 @@ def _status_update_check() -> bool:
 
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
     ctx.register_tool(
         name="status_update",
-        toolset="memory",  # sits near memory tools — not auto-loaded for safe profiles
+        toolset=STATUS_UPDATE_TOOLSET,
         schema=_STATUS_UPDATE_SCHEMA,
         handler=_status_update_handler,
         check_fn=_status_update_check,

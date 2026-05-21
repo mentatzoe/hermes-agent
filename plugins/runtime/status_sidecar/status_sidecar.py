@@ -287,6 +287,182 @@ def append_drift_signal(signal: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic update derivation from observed tool calls.
+#
+# ``derive_status_from_tool_call`` is a pure function (no I/O). The plugin's
+# ``post_tool_call`` hook calls this, then passes the returned dict into
+# :func:`write_status`. Splitting derivation from I/O makes the policy
+# trivially unit-testable and ensures we have ONE place that decides what
+# is safe to land in the ledger.
+#
+# **Hard rule:** nothing from a tool's *result body* or *args content* may
+# end up in the ledger. We only extract opaque identifiers (ids, paths) and
+# the tool name itself. Anything that could carry user prose — task titles,
+# Kanban bodies, cron prompts, file contents, terminal output, diffs — is
+# explicitly NOT captured.
+# ---------------------------------------------------------------------------
+
+# Tools whose post-call we track. Anything not in this set is ignored.
+_TRACKED_KANBAN_TOOLS = {
+    "kanban_show",
+    "kanban_create",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "kanban_link",
+}
+
+# File-mutation tools — recorded as "last_tool_invocation" with the basename
+# of the touched path appended as a short breadcrumb (no content).
+_TRACKED_FILE_TOOLS = {"write_file", "patch"}
+
+# Tools we explicitly skip: too noisy, recursive, or carry no useful pointer.
+_IGNORED_TOOLS = {
+    "terminal",        # runs every shell command; would churn the ledger.
+    "status_update",   # avoid recursive write loops.
+    "read_file",       # observational, no state change worth tracking.
+    "search_files",    # ditto.
+}
+
+
+def _safe_json_loads(s: Any) -> Any:
+    """Tolerant JSON-loader. Returns ``None`` on any failure rather than
+    raising. Tool ``result`` strings are *usually* JSON but not guaranteed.
+    """
+    if not isinstance(s, str):
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _short_basename(path: Optional[str], limit: int = 80) -> str:
+    """Return the trailing path component truncated to ``limit`` chars.
+
+    Used as a *non-content* breadcrumb on file-mutation tools. We
+    intentionally do NOT capture full absolute paths because they can leak
+    info about other users / projects / workspaces; the basename plus a
+    truncation is enough to remind the agent "you just touched X".
+    """
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    try:
+        base = os.path.basename(path.strip()) or path.strip()
+    except Exception:
+        base = path.strip()
+    if len(base) > limit:
+        base = base[:limit]
+    return base
+
+
+def derive_status_from_tool_call(
+    tool_name: str,
+    args: Any,
+    result: Any,
+) -> Dict[str, Any]:
+    """Decide which ledger fields to update from a single tool call.
+
+    Returns a dict suitable for ``**kwargs`` to :func:`write_status`,
+    plus an optional ``"_drift"`` key for an append-only ring-buffer
+    annotation. The hook applies these.
+
+    Hard guarantees:
+
+    * Never returns tool-result *body*, file content, kanban prose, cron
+      prompts, terminal output, or diff text.
+    * Returns ``{}`` for any tool not explicitly tracked.
+    * Never raises.
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return {}
+    if tool_name in _IGNORED_TOOLS:
+        return {}
+
+    out: Dict[str, Any] = {}
+    args_d = args if isinstance(args, dict) else {}
+    parsed = _safe_json_loads(result)
+
+    # --- Kanban -----------------------------------------------------------
+    if tool_name in _TRACKED_KANBAN_TOOLS:
+        out["last_tool_invocation"] = tool_name
+
+        # kanban_show: pull active task id + workspace from the result's
+        # ``task`` envelope, falling back to the input task_id arg.
+        if tool_name == "kanban_show":
+            task_id = args_d.get("task_id")
+            ws = None
+            if isinstance(parsed, dict):
+                task_obj = parsed.get("task")
+                if isinstance(task_obj, dict):
+                    # Result task.id is authoritative.
+                    if isinstance(task_obj.get("id"), str):
+                        task_id = task_obj["id"]
+                    cand_ws = task_obj.get("workspace_path")
+                    if isinstance(cand_ws, str) and cand_ws.strip():
+                        ws = cand_ws.strip()
+            if isinstance(task_id, str) and task_id.strip():
+                out["active_kanban_task_id"] = task_id.strip()
+            if ws:
+                out["active_workspace"] = ws
+
+        # kanban_create returns a new task_id; record only the id, never
+        # the title/body the agent supplied as args.
+        elif tool_name == "kanban_create":
+            if isinstance(parsed, dict):
+                tid = parsed.get("task_id")
+                if isinstance(tid, str) and tid.strip():
+                    # Don't override active_kanban_task_id here — the
+                    # creator is not necessarily switching to the new card.
+                    out["_drift"] = f"created kanban card {tid.strip()}"
+
+        # kanban_complete / kanban_block / kanban_comment: just record the
+        # tool name + the task id pointer from args. No summary / body / reason.
+        elif tool_name in {"kanban_complete", "kanban_block", "kanban_comment", "kanban_link"}:
+            tid = args_d.get("task_id") or args_d.get("parent_id")
+            if isinstance(tid, str) and tid.strip():
+                # Active task probably IS this id; update the pointer so the
+                # next pre_llm_call shows the agent it just acted on tid.
+                out["active_kanban_task_id"] = tid.strip()
+
+        return out
+
+    # --- Cron -------------------------------------------------------------
+    if tool_name == "cronjob":
+        out["last_tool_invocation"] = "cronjob"
+        action = args_d.get("action") if isinstance(args_d.get("action"), str) else ""
+        # Prefer result.job_id (returned by create); fall back to args.job_id
+        # (passed for update/remove/run/etc).
+        jid: Optional[str] = None
+        if isinstance(parsed, dict):
+            cand = parsed.get("job_id")
+            if isinstance(cand, str) and cand.strip():
+                jid = cand.strip()
+        if not jid:
+            cand = args_d.get("job_id")
+            if isinstance(cand, str) and cand.strip():
+                jid = cand.strip()
+        if jid:
+            out["last_cron_job_id"] = jid
+        # No prompt / schedule / script content stored.
+        if action:
+            out["_drift"] = f"cronjob {action}" + (f" {jid}" if jid else "")
+        return out
+
+    # --- File mutations ---------------------------------------------------
+    if tool_name in _TRACKED_FILE_TOOLS:
+        base = _short_basename(args_d.get("path"))
+        if base:
+            out["last_tool_invocation"] = f"{tool_name}:{base}"
+        else:
+            out["last_tool_invocation"] = tool_name
+        return out
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Test / internal helper — used only by tests to simulate ageing.
 # ---------------------------------------------------------------------------
 

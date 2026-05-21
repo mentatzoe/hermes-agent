@@ -1,8 +1,10 @@
 name: status-sidecar
-version: 0.1.0
-description: "Durable HEARTBEAT status ledger. Appends a bounded <system_status> block to the user message before each LLM call so the agent has current operational hints (active kanban task, workspace, recent drift signals) without polluting the system prompt or relying on memory recall. Strict TTL — stale state is never laundered as truth. See plugins/runtime/status_sidecar/README.md."
+version: 0.2.0
+description: "Durable HEARTBEAT status ledger with deterministic post_tool_call updates. Appends a bounded <system_status> block to the user message before each LLM call so the agent has current operational hints (active kanban task, workspace, recent drift signals) without polluting the system prompt or relying on memory recall. Deterministic post_tool_call hook keeps the ledger fresh after kanban / cron / file-write tool calls without the agent having to remember to update it; on_session_finalize appends a compact drift signal at session end. Strict TTL — stale state is never laundered as truth. See plugins/runtime/status_sidecar/README.md."
 author: "@zoe / aleph"
 hooks:
   - pre_llm_call
+  - post_tool_call
+  - on_session_finalize
 provides_tools:
   - status_update

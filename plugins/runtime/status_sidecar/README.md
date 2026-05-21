@@ -12,15 +12,52 @@ pointer the agent should verify with real tools before acting on.
 
 ## What it does
 
-1. `pre_llm_call` hook reads `$HERMES_HOME/state/status.db` and, when the
-   record is fresh (≤ 4 hours by default), returns a `{"context": "..."}`
-   dict. The agent loop (`run_agent.py`) appends that to the user message
-   via `_plugin_user_context`. **The system prompt is never touched** —
-   prompt-cache prefix stays intact.
+1. **`pre_llm_call` hook** reads `$HERMES_HOME/state/status.db` and, when
+   the record is fresh (≤ 4 hours by default), returns a
+   `{"context": "..."}` dict. The agent loop (`run_agent.py`) appends
+   that to the user message via `_plugin_user_context`. **The system
+   prompt is never touched** — prompt-cache prefix stays intact.
 
-2. `status_update` tool lets the agent post a short drift signal or update
-   the pointers. Length-bounded; the drift ring buffer keeps only the
-   most recent 5 entries.
+2. **`post_tool_call` hook** updates the ledger deterministically after
+   observed tool calls so the status stays fresh without the agent
+   having to remember to write it. Currently tracked:
+
+   | Tool family | What lands in the ledger |
+   |---|---|
+   | `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_comment`, `kanban_link`, `kanban_heartbeat` | `active_kanban_task_id` (from result `task.id` or args), `active_workspace` (kanban_show only), `last_tool_invocation` |
+   | `kanban_create` | `last_tool_invocation`, plus a `created kanban card <id>` drift signal (no title / body) |
+   | `cronjob` | `last_cron_job_id` (from result `job_id` or args), `last_tool_invocation`, plus `cronjob <action> [<id>]` drift signal (no prompt / schedule / script content) |
+   | `write_file`, `patch` | `last_tool_invocation = "<tool>:<basename>"` (no full path, no content, no diff) |
+   | Anything else | Ignored. `terminal`, `status_update`, `read_file`, `search_files` are explicitly excluded to keep noise out and avoid recursion. |
+
+   **Hard invariant:** nothing from a tool's result *body* or args
+   *content* lands in the ledger. The decision policy is in the pure
+   function `status_sidecar.derive_status_from_tool_call`, with tests
+   that grep the raw SQLite bytes to prove no prose, file content, cron
+   prompts, or kanban bodies leak through.
+
+3. **`on_session_finalize` hook** appends a single compact drift signal
+   when a session ends — `"session ended: N tool calls, last=<tool>"`.
+   Pure breadcrumb, no user / assistant prose captured. Skipped when a
+   session had no tracked tool calls.
+
+4. **`status_update` tool** lets the agent post a short drift signal or
+   override the auto-tracked pointers. Length-bounded; the drift ring
+   buffer keeps only the most recent 5 entries.
+
+## Tool exposure
+
+The `status_update` tool is registered under the **`todo`** toolset, not
+`memory`. This is deliberate: Aleph's actual DM surface is Discord, and
+`platform_toolsets.discord` in the user config does NOT include
+`memory`. Registering under `todo` (which IS allowlisted on Discord and
+in the default safe-profile set) means the tool is reachable from
+Aleph's actual chat surface.
+
+If you want to gate the tool further (e.g. allow only the deterministic
+`post_tool_call` path on locked-down profiles), remove `todo` from that
+profile's `platform_toolsets` — the plugin will continue updating the
+ledger via the hook even if the tool itself isn't loaded.
 
 ## Strict TTL — no laundering
 
@@ -49,6 +86,8 @@ To disable:
 - **Stale record (> TTL):** hook returns `None`.
 - **Oversized rendered block:** truncated to ~1200 chars with a
   `[truncated]` marker.
+- **Hook errors:** every hook is wrapped in try/except and logs at
+  debug. A failing status write must never break the agent loop.
 
 ## Configuration
 
@@ -59,20 +98,127 @@ To disable:
 ## Tests
 
 ```bash
-/Users/zmll/.venv/bin/python -m pytest tests/plugins/test_status_sidecar_plugin.py -v
+/Users/zmll/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/plugins/test_status_sidecar_plugin.py \
+  tests/plugins/test_status_sidecar_deterministic_updates.py -v
 ```
+
+51 tests total: 27 from the v1 ledger/inject suite + 24 from the v2
+deterministic-updates suite. The v2 suite specifically asserts the
+no-content invariant by reading raw bytes from the SQLite file after a
+hook run and grepping for marker strings.
+
+## Activation smoke plan
+
+The plugin is **opt-in**. Activation is a two-step manual operation
+because plugin discovery happens once at startup; an agent cannot
+self-activate it.
+
+### Step 1: merge / cherry-pick
+
+```bash
+# Option A: merge the branch into the installed checkout
+cd /Users/zmll/.hermes/hermes-agent
+git merge --ff-only feat/status-sidecar
+
+# Option B: cherry-pick just the relevant commits
+git cherry-pick <status-sidecar-commit-sha>
+```
+
+### Step 2: enable the plugin
+
+Edit `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - accountability
+    - message-timestamps
+    - superpowers
+    - status-sidecar    # add this line
+```
+
+### Step 3: restart
+
+Have Zoe `/restart` the gateway from the chat surface (do NOT
+`launchctl kickstart` from an agent tool — restart is a human-driven
+operation).
+
+### Step 4: smoke (post-restart, two checks)
+
+**Check A — fresh status injects:**
+
+```bash
+/Users/zmll/.hermes/hermes-agent/venv/bin/python - <<'PY'
+import sys
+sys.path.insert(0, "/Users/zmll/.hermes/hermes-agent/plugins/runtime/status_sidecar")
+import status_sidecar as ss
+ss.write_status(
+    active_kanban_task_id="t_smoke",
+    active_workspace="/tmp/smoke",
+    last_tool_invocation="smoke_check",
+)
+print(ss.render_status_block())
+PY
+```
+
+Then in Aleph DM: ask a trivial question. Verify the model's first
+response acknowledges (or at minimum doesn't contradict) the
+`active_kanban_task_id=t_smoke` pointer. The block should be present in
+the user message — confirm by inspecting the next session log under
+`~/.hermes/logs/gateway.log`.
+
+**Check B — stale status disappears:**
+
+```bash
+/Users/zmll/.hermes/hermes-agent/venv/bin/python - <<'PY'
+import sys, time
+sys.path.insert(0, "/Users/zmll/.hermes/hermes-agent/plugins/runtime/status_sidecar")
+import status_sidecar as ss
+ss._force_set_updated_at(time.time() - 24 * 3600)   # 24h ago
+print("rendered:", repr(ss.render_status_block()))
+PY
+```
+
+Output must be `rendered: ''`. Send another DM and confirm no
+`<system_status>` block appears in the gateway log.
+
+### Step 5: deterministic update smoke
+
+Send a DM that exercises a tracked tool (e.g. "show me kanban task
+t_8a4caa0e"). After the turn:
+
+```bash
+/Users/zmll/.hermes/hermes-agent/venv/bin/python - <<'PY'
+import sys
+sys.path.insert(0, "/Users/zmll/.hermes/hermes-agent/plugins/runtime/status_sidecar")
+import status_sidecar as ss
+print(ss.read_status())
+PY
+```
+
+The dict should now contain `active_kanban_task_id=t_8a4caa0e` and
+`active_workspace=/Users/zmll/.hermes/kanban/workspaces/t_8a4caa0e`,
+written by the `post_tool_call` hook without any explicit
+`status_update` call from the agent.
+
+Until all of the above passes on the live gateway, the plugin remains
+in **"implemented, not live"** state.
 
 ## Notes for future maintainers
 
-- The plugin is **opt-in** like every standalone Hermes plugin. Activation
-  requires `plugins.enabled: [..., status-sidecar]` in config.yaml plus a
-  restart.
-- The `status_update` tool is registered under the `memory` toolset so it
-  ships alongside other "agent-writes-its-own-context" tools, not the
-  always-on core surface. Safe-mode profiles won't see it.
+- The plugin is **opt-in** like every standalone Hermes plugin.
+  Activation requires `plugins.enabled: [..., status-sidecar]` in
+  config.yaml plus a restart.
+- The `status_update` tool is registered under the `todo` toolset (see
+  the "Tool exposure" section above for the rationale).
 - Hindsight remains in `memory_mode: tools`, `auto_recall: false`,
   `auto_retain: false`. This plugin does NOT change those.
 - The ledger is intentionally single-row. If someone wants per-tenant
   status, add a `tenant` column and key by `(tenant, id)` — but keep
   `read_status()` returning a single row at a time so the hook stays
   cheap.
+- The `derive_status_from_tool_call` function in `status_sidecar.py` is
+  the only place that decides what's safe to land in the ledger. To
+  track a new tool, add it there (and write a paired test that proves
+  no result body leaks). Do not bypass it from the hook.
