@@ -1,0 +1,8 @@
+name: status-sidecar
+version: 0.1.0
+description: "Durable HEARTBEAT status ledger. Appends a bounded <system_status> block to the user message before each LLM call so the agent has current operational hints (active kanban task, workspace, recent drift signals) without polluting the system prompt or relying on memory recall. Strict TTL — stale state is never laundered as truth. See plugins/runtime/status_sidecar/README.md."
+author: "@zoe / aleph"
+hooks:
+  - pre_llm_call
+provides_tools:
+  - status_update
