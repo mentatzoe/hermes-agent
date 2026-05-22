@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 
 MAX_DRIFT_SIGNALS = 5
 MAX_DRIFT_SIGNAL_CHARS = 200
+MAX_ACTIVE_SESSIONS = 5
+MAX_FIELD_CHARS = 240
 BLOCK_CHAR_BUDGET = 1200  # ~300 tokens of ASCII English
 
 # ---------------------------------------------------------------------------
@@ -105,10 +107,30 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             id                       INTEGER PRIMARY KEY CHECK (id = 1),
             active_kanban_task_id    TEXT,
             active_workspace         TEXT,
+            active_project_slug      TEXT,
             last_tool_invocation     TEXT,
             last_cron_job_id         TEXT,
             recent_drift_signals     TEXT,         -- JSON list[str]
             status_updated_at        REAL NOT NULL
+        )
+        """
+    )
+    try:
+        conn.execute("ALTER TABLE status ADD COLUMN active_project_slug TEXT")
+    except sqlite3.OperationalError:
+        # Column already exists.
+        pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            session_id              TEXT PRIMARY KEY,
+            surface                 TEXT,
+            model                   TEXT,
+            active_project_slug     TEXT,
+            active_kanban_task_id   TEXT,
+            active_workspace        TEXT,
+            last_tool_invocation    TEXT,
+            last_seen_at            REAL NOT NULL
         )
         """
     )
@@ -127,32 +149,41 @@ def read_status() -> Dict[str, Any]:
     path = get_ledger_path()
     if not path.exists():
         return {}
+    conn: Optional[sqlite3.Connection] = None
     try:
-        with _connect() as conn:
-            row = conn.execute(
-                """
-                SELECT active_kanban_task_id,
-                       active_workspace,
-                       last_tool_invocation,
-                       last_cron_job_id,
-                       recent_drift_signals,
-                       status_updated_at
-                  FROM status
-                 WHERE id = 1
-                """
-            ).fetchone()
+        conn = _connect()
+        _init_schema(conn)
+        row = conn.execute(
+            """
+            SELECT active_kanban_task_id,
+                   active_workspace,
+                   active_project_slug,
+                   last_tool_invocation,
+                   last_cron_job_id,
+                   recent_drift_signals,
+                   status_updated_at
+              FROM status
+             WHERE id = 1
+            """
+        ).fetchone()
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
         logger.debug("status_sidecar read failed: %s", exc)
         return {}
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("status_sidecar unexpected read error: %s", exc)
         return {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover — defensive
+                pass
 
     if row is None:
         return {}
 
     try:
-        drift = json.loads(row[4]) if row[4] else []
+        drift = json.loads(row[5]) if row[5] else []
         if not isinstance(drift, list):
             drift = []
     except (ValueError, TypeError):
@@ -161,16 +192,183 @@ def read_status() -> Dict[str, Any]:
     return {
         "active_kanban_task_id": row[0],
         "active_workspace": row[1],
-        "last_tool_invocation": row[2],
-        "last_cron_job_id": row[3],
+        "active_project_slug": row[2],
+        "last_tool_invocation": row[3],
+        "last_cron_job_id": row[4],
         "recent_drift_signals": drift,
-        "status_updated_at": row[5],
+        "status_updated_at": row[6],
     }
+
+def _clip(value: Optional[str], limit: int = MAX_FIELD_CHARS) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    return value.strip()[:limit]
+
+
+def _project_slug_from_path(path: Optional[str]) -> str:
+    """Best-effort non-content project slug from a path.
+
+    Deliberately heuristic and bounded: this is a current-work pointer, not a
+    canonical project registry. Never reads the file or shells out to git.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    raw = path.strip()
+    parts = [p for p in raw.replace("\\", "/").split("/") if p]
+    if "hermes-agent" in parts:
+        return "hermes-agent"
+    if "github" in parts:
+        try:
+            i = parts.index("github")
+            repo = parts[i + 1]
+        except (ValueError, IndexError):
+            return ""
+        slug = f"github/{repo}"
+        rel = parts[i + 2:]
+        if repo == "aleph-vault" and len(rel) >= 3 and rel[0] == "projects":
+            slug += "/" + "/".join(rel[:3])
+        elif repo == "aleph-vault" and rel:
+            slug += "/" + rel[0]
+        return slug[:MAX_FIELD_CHARS]
+    if "workspaces" in parts:
+        try:
+            i = parts.index("workspaces")
+            task = parts[i + 1]
+            return f"kanban/{task}"[:MAX_FIELD_CHARS]
+        except (ValueError, IndexError):
+            return ""
+    return ""
+
+
+def touch_session(
+    session_id: Optional[str],
+    surface: Optional[str] = None,
+    model: Optional[str] = None,
+    active_project_slug: Optional[str] = None,
+    active_kanban_task_id: Optional[str] = None,
+    active_workspace: Optional[str] = None,
+    last_tool_invocation: Optional[str] = None,
+) -> bool:
+    """Record a bounded active-session pointer without refreshing status row TTL."""
+    sid = _clip(session_id)
+    if not sid:
+        return False
+    now = time.time()
+    with _write_lock:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = _connect()
+            _init_schema(conn)
+            existing = conn.execute(
+                "SELECT surface, model, active_project_slug, active_kanban_task_id, "
+                "active_workspace, last_tool_invocation FROM active_sessions "
+                "WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            if existing is None:
+                cur_surface, cur_model, cur_project, cur_task, cur_ws, cur_tool = (
+                    None, None, None, None, None, None
+                )
+            else:
+                cur_surface, cur_model, cur_project, cur_task, cur_ws, cur_tool = existing
+            project = active_project_slug or _project_slug_from_path(active_workspace)
+            conn.execute(
+                """
+                INSERT INTO active_sessions (
+                    session_id, surface, model, active_project_slug,
+                    active_kanban_task_id, active_workspace,
+                    last_tool_invocation, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    surface               = excluded.surface,
+                    model                 = excluded.model,
+                    active_project_slug   = excluded.active_project_slug,
+                    active_kanban_task_id = excluded.active_kanban_task_id,
+                    active_workspace      = excluded.active_workspace,
+                    last_tool_invocation  = excluded.last_tool_invocation,
+                    last_seen_at          = excluded.last_seen_at
+                """,
+                (
+                    sid,
+                    _clip(surface) if surface is not None else cur_surface,
+                    _clip(model) if model is not None else cur_model,
+                    _clip(project) if project is not None else cur_project,
+                    _clip(active_kanban_task_id) if active_kanban_task_id is not None else cur_task,
+                    _clip(active_workspace) if active_workspace is not None else cur_ws,
+                    _clip(last_tool_invocation) if last_tool_invocation is not None else cur_tool,
+                    now,
+                ),
+            )
+            return True
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            logger.debug("status_sidecar session touch failed: %s", exc)
+            return False
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("status_sidecar unexpected session touch error: %s", exc)
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
+
+
+def read_active_sessions(ttl_seconds: float, limit: int = MAX_ACTIVE_SESSIONS) -> List[Dict[str, Any]]:
+    """Return fresh active-session pointers, newest first. NEVER raises."""
+    path = get_ledger_path()
+    if not path.exists() or ttl_seconds < 0:
+        return []
+    cutoff = time.time() - float(ttl_seconds)
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = _connect()
+        _init_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT session_id, surface, model, active_project_slug,
+                   active_kanban_task_id, active_workspace,
+                   last_tool_invocation, last_seen_at
+              FROM active_sessions
+             WHERE last_seen_at >= ?
+             ORDER BY last_seen_at DESC
+             LIMIT ?
+            """,
+            (cutoff, int(limit)),
+        ).fetchall()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        logger.debug("status_sidecar active-session read failed: %s", exc)
+        return []
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("status_sidecar unexpected active-session read error: %s", exc)
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover — defensive
+                pass
+    return [
+        {
+            "session_id": row[0],
+            "surface": row[1],
+            "model": row[2],
+            "active_project_slug": row[3],
+            "active_kanban_task_id": row[4],
+            "active_workspace": row[5],
+            "last_tool_invocation": row[6],
+            "last_seen_at": row[7],
+        }
+        for row in rows
+    ]
 
 
 def write_status(
     active_kanban_task_id: Optional[str] = None,
     active_workspace: Optional[str] = None,
+    active_project_slug: Optional[str] = None,
     last_tool_invocation: Optional[str] = None,
     last_cron_job_id: Optional[str] = None,
 ) -> bool:
@@ -185,46 +383,49 @@ def write_status(
     """
     now = time.time()
     with _write_lock:
+        conn: Optional[sqlite3.Connection] = None
         try:
-            with _connect() as conn:
-                _init_schema(conn)
-                existing = conn.execute(
-                    "SELECT active_kanban_task_id, active_workspace, "
-                    "last_tool_invocation, last_cron_job_id, "
-                    "recent_drift_signals FROM status WHERE id = 1"
-                ).fetchone()
-                if existing is None:
-                    cur_task, cur_ws, cur_tool, cur_cron, cur_drift = (
-                        None, None, None, None, "[]"
-                    )
-                else:
-                    cur_task, cur_ws, cur_tool, cur_cron, cur_drift = existing
-
-                conn.execute("BEGIN;")
-                conn.execute(
-                    """
-                    INSERT INTO status (
-                        id, active_kanban_task_id, active_workspace,
-                        last_tool_invocation, last_cron_job_id,
-                        recent_drift_signals, status_updated_at
-                    ) VALUES (1, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        active_kanban_task_id = excluded.active_kanban_task_id,
-                        active_workspace      = excluded.active_workspace,
-                        last_tool_invocation  = excluded.last_tool_invocation,
-                        last_cron_job_id      = excluded.last_cron_job_id,
-                        status_updated_at     = excluded.status_updated_at
-                    """,
-                    (
-                        active_kanban_task_id if active_kanban_task_id is not None else cur_task,
-                        active_workspace if active_workspace is not None else cur_ws,
-                        last_tool_invocation if last_tool_invocation is not None else cur_tool,
-                        last_cron_job_id if last_cron_job_id is not None else cur_cron,
-                        cur_drift if cur_drift is not None else "[]",
-                        now,
-                    ),
+            conn = _connect()
+            _init_schema(conn)
+            existing = conn.execute(
+                "SELECT active_kanban_task_id, active_workspace, "
+                "active_project_slug, last_tool_invocation, last_cron_job_id, "
+                "recent_drift_signals FROM status WHERE id = 1"
+            ).fetchone()
+            if existing is None:
+                cur_task, cur_ws, cur_project, cur_tool, cur_cron, cur_drift = (
+                    None, None, None, None, None, "[]"
                 )
-                conn.execute("COMMIT;")
+            else:
+                cur_task, cur_ws, cur_project, cur_tool, cur_cron, cur_drift = existing
+
+            conn.execute("BEGIN;")
+            conn.execute(
+                """
+                INSERT INTO status (
+                    id, active_kanban_task_id, active_workspace,
+                    active_project_slug, last_tool_invocation,
+                    last_cron_job_id, recent_drift_signals, status_updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    active_kanban_task_id = excluded.active_kanban_task_id,
+                    active_workspace      = excluded.active_workspace,
+                    active_project_slug   = excluded.active_project_slug,
+                    last_tool_invocation  = excluded.last_tool_invocation,
+                    last_cron_job_id      = excluded.last_cron_job_id,
+                    status_updated_at     = excluded.status_updated_at
+                """,
+                (
+                    _clip(active_kanban_task_id) if active_kanban_task_id is not None else cur_task,
+                    _clip(active_workspace) if active_workspace is not None else cur_ws,
+                    _clip(active_project_slug) if active_project_slug is not None else cur_project,
+                    _clip(last_tool_invocation) if last_tool_invocation is not None else cur_tool,
+                    _clip(last_cron_job_id) if last_cron_job_id is not None else cur_cron,
+                    cur_drift if cur_drift is not None else "[]",
+                    now,
+                ),
+            )
+            conn.execute("COMMIT;")
             return True
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             logger.warning("status_sidecar write failed: %s", exc)
@@ -232,7 +433,12 @@ def write_status(
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("status_sidecar unexpected write error: %s", exc)
             return False
-
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
 def append_drift_signal(signal: str) -> bool:
     """Append a short annotation to the bounded ring buffer.
@@ -245,38 +451,39 @@ def append_drift_signal(signal: str) -> bool:
     clipped = signal.strip()[:MAX_DRIFT_SIGNAL_CHARS]
     now = time.time()
     with _write_lock:
+        conn: Optional[sqlite3.Connection] = None
         try:
-            with _connect() as conn:
-                _init_schema(conn)
-                row = conn.execute(
-                    "SELECT recent_drift_signals FROM status WHERE id = 1"
-                ).fetchone()
-                if row is None or not row[0]:
-                    signals: List[str] = []
-                else:
-                    try:
-                        signals = json.loads(row[0])
-                        if not isinstance(signals, list):
-                            signals = []
-                    except (ValueError, TypeError):
+            conn = _connect()
+            _init_schema(conn)
+            row = conn.execute(
+                "SELECT recent_drift_signals FROM status WHERE id = 1"
+            ).fetchone()
+            if row is None or not row[0]:
+                signals: List[str] = []
+            else:
+                try:
+                    signals = json.loads(row[0])
+                    if not isinstance(signals, list):
                         signals = []
-                signals.append(clipped)
-                # Bound the ring buffer.
-                if len(signals) > MAX_DRIFT_SIGNALS:
-                    signals = signals[-MAX_DRIFT_SIGNALS:]
-                blob = json.dumps(signals)
-                conn.execute("BEGIN;")
-                conn.execute(
-                    """
-                    INSERT INTO status (id, recent_drift_signals, status_updated_at)
-                    VALUES (1, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        recent_drift_signals = excluded.recent_drift_signals,
-                        status_updated_at    = excluded.status_updated_at
-                    """,
-                    (blob, now),
-                )
-                conn.execute("COMMIT;")
+                except (ValueError, TypeError):
+                    signals = []
+            signals.append(clipped)
+            # Bound the ring buffer.
+            if len(signals) > MAX_DRIFT_SIGNALS:
+                signals = signals[-MAX_DRIFT_SIGNALS:]
+            blob = json.dumps(signals)
+            conn.execute("BEGIN;")
+            conn.execute(
+                """
+                INSERT INTO status (id, recent_drift_signals, status_updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    recent_drift_signals = excluded.recent_drift_signals,
+                    status_updated_at    = excluded.status_updated_at
+                """,
+                (blob, now),
+            )
+            conn.execute("COMMIT;")
             return True
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
             logger.warning("status_sidecar drift append failed: %s", exc)
@@ -284,6 +491,12 @@ def append_drift_signal(signal: str) -> bool:
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("status_sidecar unexpected drift error: %s", exc)
             return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +619,9 @@ def derive_status_from_tool_call(
                 out["active_kanban_task_id"] = task_id.strip()
             if ws:
                 out["active_workspace"] = ws
+                project = _project_slug_from_path(ws)
+                if project:
+                    out["active_project_slug"] = project
 
         # kanban_create returns a new task_id; record only the id, never
         # the title/body the agent supplied as args.
@@ -452,11 +668,15 @@ def derive_status_from_tool_call(
 
     # --- File mutations ---------------------------------------------------
     if tool_name in _TRACKED_FILE_TOOLS:
-        base = _short_basename(args_d.get("path"))
+        path = args_d.get("path")
+        base = _short_basename(path)
         if base:
             out["last_tool_invocation"] = f"{tool_name}:{base}"
         else:
             out["last_tool_invocation"] = tool_name
+        project = _project_slug_from_path(path)
+        if project:
+            out["active_project_slug"] = project
         return out
 
     return {}
@@ -471,12 +691,20 @@ def _force_set_updated_at(ts: float) -> None:
     fields. Used by tests to simulate stale ledgers.
     """
     with _write_lock:
-        with _connect() as conn:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = _connect()
             _init_schema(conn)
             conn.execute(
                 "UPDATE status SET status_updated_at = ? WHERE id = 1",
                 (ts,),
             )
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -514,36 +742,35 @@ def _fmt_age_seconds(ts: float) -> int:
 
 
 def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
-    """Render the current status record as a fenced ``<system_status>`` block.
+    """Render fresh status/session pointers as a fenced ``<system_status>`` block.
 
-    Returns an empty string when:
-      - the ledger doesn't exist,
-      - the ledger is corrupt,
-      - the record is empty,
-      - the record is stale beyond ``ttl_seconds`` (no laundering).
-
-    NEVER raises.
+    Returns an empty string when no status row or active-session row is fresh.
+    Stale task/project state is never rendered just because the current
+    session is fresh.
     """
     try:
         record = read_status()
-    except Exception:  # pragma: no cover — read_status already swallows
+        sessions = read_active_sessions(ttl_seconds=ttl_seconds)
+    except Exception:  # pragma: no cover — callees already swallow
         return ""
 
-    if not record:
+    fresh_status = bool(record) and is_fresh(record, ttl_seconds=ttl_seconds)
+    if not fresh_status:
+        record = {}
+    if not fresh_status and not sessions:
         return ""
 
+    timestamps: List[float] = []
     ts = record.get("status_updated_at")
-    if not isinstance(ts, (int, float)):
-        return ""
-
-    fresh = is_fresh(record, ttl_seconds=ttl_seconds)
-    if not fresh:
-        # Strict policy: don't inject stale state. Returning empty avoids
-        # the agent treating ancient hints as current truth.
-        return ""
-
-    age = _fmt_age_seconds(ts)
-    iso = _fmt_iso(ts)
+    if isinstance(ts, (int, float)):
+        timestamps.append(float(ts))
+    for sess in sessions:
+        s_ts = sess.get("last_seen_at")
+        if isinstance(s_ts, (int, float)):
+            timestamps.append(float(s_ts))
+    anchor_ts = max(timestamps) if timestamps else time.time()
+    age = _fmt_age_seconds(anchor_ts)
+    iso = _fmt_iso(anchor_ts)
 
     lines: List[str] = []
     lines.append(f"<system_status updated_iso=\"{iso}\" age_seconds=\"{age}\">")
@@ -556,20 +783,48 @@ def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
     def _add(key: str, label: str) -> None:
         val = record.get(key)
         if isinstance(val, str) and val.strip():
-            lines.append(f"  {label}: {val.strip()}")
+            lines.append(f"  {label}: {val.strip()[:MAX_FIELD_CHARS]}")
 
-    _add("active_kanban_task_id", "active_kanban_task_id")
-    _add("active_workspace", "active_workspace")
-    _add("last_tool_invocation", "last_tool_invocation")
-    _add("last_cron_job_id", "last_cron_job_id")
+    if fresh_status:
+        _add("active_project_slug", "active_project_slug")
+        _add("active_kanban_task_id", "active_kanban_task_id")
+        _add("active_workspace", "active_workspace")
+        _add("last_tool_invocation", "last_tool_invocation")
+        _add("last_cron_job_id", "last_cron_job_id")
 
-    signals = record.get("recent_drift_signals") or []
-    if isinstance(signals, list) and signals:
-        lines.append("  recent_drift_signals:")
-        # Show newest last (chronological).
-        for sig in signals[-MAX_DRIFT_SIGNALS:]:
-            if isinstance(sig, str) and sig.strip():
-                lines.append(f"    - {sig.strip()[:MAX_DRIFT_SIGNAL_CHARS]}")
+        signals = record.get("recent_drift_signals") or []
+        if isinstance(signals, list) and signals:
+            lines.append("  recent_drift_signals:")
+            # Show newest last (chronological).
+            for sig in signals[-MAX_DRIFT_SIGNALS:]:
+                if isinstance(sig, str) and sig.strip():
+                    lines.append(f"    - {sig.strip()[:MAX_DRIFT_SIGNAL_CHARS]}")
+
+    if sessions:
+        lines.append("  active_sessions:")
+        # Oldest first for readable chronology within the already-bounded set.
+        for sess in reversed(sessions[-MAX_ACTIVE_SESSIONS:]):
+            bits = []
+            sid = sess.get("session_id")
+            if isinstance(sid, str) and sid.strip():
+                bits.append(f"session_id={sid.strip()[:80]}")
+            surface = sess.get("surface")
+            if isinstance(surface, str) and surface.strip():
+                bits.append(f"surface={surface.strip()[:40]}")
+            project = sess.get("active_project_slug")
+            if isinstance(project, str) and project.strip():
+                bits.append(f"project={project.strip()[:120]}")
+            task = sess.get("active_kanban_task_id")
+            if isinstance(task, str) and task.strip():
+                bits.append(f"task={task.strip()[:80]}")
+            tool = sess.get("last_tool_invocation")
+            if isinstance(tool, str) and tool.strip():
+                bits.append(f"last_tool={tool.strip()[:80]}")
+            seen = sess.get("last_seen_at")
+            if isinstance(seen, (int, float)):
+                bits.append(f"age_seconds={_fmt_age_seconds(float(seen))}")
+            if bits:
+                lines.append("    - " + " ".join(bits))
 
     lines.append("</system_status>")
 

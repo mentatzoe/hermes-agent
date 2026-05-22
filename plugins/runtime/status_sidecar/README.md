@@ -1,9 +1,9 @@
 # status-sidecar
 
 A small durable ledger that holds **current operational hints** for the
-agent (active kanban task, workspace, last tool, recent drift signals)
-and appends them as a bounded `<system_status>` block to the user
-message before each LLM call.
+agent (active project, active sessions, active Kanban task, workspace,
+last tool, recent drift signals) and appends them as a bounded
+`<system_status>` block to the user message before each LLM call.
 
 This is the HEARTBEAT recommendation from
 `projects/aleph/hermes-harness/caveagent-status-ledger-design.md`. It is
@@ -12,11 +12,13 @@ pointer the agent should verify with real tools before acting on.
 
 ## What it does
 
-1. **`pre_llm_call` hook** reads `$HERMES_HOME/state/status.db` and, when
-   the record is fresh (≤ 4 hours by default), returns a
-   `{"context": "..."}` dict. The agent loop (`run_agent.py`) appends
-   that to the user message via `_plugin_user_context`. **The system
-   prompt is never touched** — prompt-cache prefix stays intact.
+1. **`pre_llm_call` hook** records the current session in an
+   `active_sessions` table, reads `$HERMES_HOME/state/status.db`, and
+   returns a `{"context": "..."}` dict when either the current-status row
+   or at least one session pointer is fresh (≤ 4 hours by default). The
+   agent loop (`run_agent.py`) appends that to the user message via
+   `_plugin_user_context`. **The system prompt is never touched** —
+   prompt-cache prefix stays intact.
 
 2. **`post_tool_call` hook** updates the ledger deterministically after
    observed tool calls so the status stays fresh without the agent
@@ -24,10 +26,10 @@ pointer the agent should verify with real tools before acting on.
 
    | Tool family | What lands in the ledger |
    |---|---|
-   | `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_comment`, `kanban_link`, `kanban_heartbeat` | `active_kanban_task_id` (from result `task.id` or args), `active_workspace` (kanban_show only), `last_tool_invocation` |
+   | `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_comment`, `kanban_link`, `kanban_heartbeat` | `active_kanban_task_id` (from result `task.id` or args), `active_workspace` (kanban_show only), inferred `active_project_slug`, `last_tool_invocation` |
    | `kanban_create` | `last_tool_invocation`, plus a `created kanban card <id>` drift signal (no title / body) |
    | `cronjob` | `last_cron_job_id` (from result `job_id` or args), `last_tool_invocation`, plus `cronjob <action> [<id>]` drift signal (no prompt / schedule / script content) |
-   | `write_file`, `patch` | `last_tool_invocation = "<tool>:<basename>"` (no full path, no content, no diff) |
+   | `write_file`, `patch` | `last_tool_invocation = "<tool>:<basename>"` plus inferred `active_project_slug` where possible (no full path, no content, no diff) |
    | Anything else | Ignored. `terminal`, `status_update`, `read_file`, `search_files` are explicitly excluded to keep noise out and avoid recursion. |
 
    **Hard invariant:** nothing from a tool's result *body* or args
@@ -42,8 +44,9 @@ pointer the agent should verify with real tools before acting on.
    session had no tracked tool calls.
 
 4. **`status_update` tool** lets the agent post a short drift signal or
-   override the auto-tracked pointers. Length-bounded; the drift ring
-   buffer keeps only the most recent 5 entries.
+   override the auto-tracked pointers, including `active_project_slug`.
+   Length-bounded; the drift ring buffer keeps only the most recent 5
+   entries.
 
 ## Tool exposure
 
@@ -61,10 +64,12 @@ ledger via the hook even if the tool itself isn't loaded.
 
 ## Strict TTL — no laundering
 
-Stale state (older than `STATUS_SIDECAR_TTL_SECONDS`, default 14400s) is
-**dropped**, not surfaced. This is deliberate: it's better to inject
-nothing than to let the agent treat an abandoned task from yesterday as
-current truth.
+Stale current-status rows (older than `STATUS_SIDECAR_TTL_SECONDS`,
+default 14400s) are **dropped**, not surfaced. Fresh active-session rows
+may still render, but they do not refresh the stale task/project row.
+This is deliberate: it's better to show only a fresh session pointer
+than to let the agent treat an abandoned task from yesterday as current
+truth.
 
 ## Rollback
 
@@ -79,11 +84,15 @@ To disable:
 
 ## Failure modes
 
-- **Missing ledger:** hook returns `None`, no block injected.
+- **Missing ledger:** hook can still render the current session after
+  touching `active_sessions`; without a session id it returns `None`.
 - **Corrupt SQLite file:** library swallows the
-  `sqlite3.OperationalError`, returns `{}`, hook returns `None`.
-- **Empty record:** hook returns `None`.
-- **Stale record (> TTL):** hook returns `None`.
+  `sqlite3.OperationalError`, returns `{}` / `[]`, hook returns `None`
+  or a session-only block.
+- **Empty status row:** current session may render; no fake task/project
+  status is created.
+- **Stale status row (> TTL):** stale task/project fields are skipped;
+  fresh active-session rows may still render.
 - **Oversized rendered block:** truncated to ~1200 chars with a
   `[truncated]` marker.
 - **Hook errors:** every hook is wrapped in try/except and logs at
@@ -93,7 +102,7 @@ To disable:
 
 | env var | default | what it does |
 |---|---|---|
-| `STATUS_SIDECAR_TTL_SECONDS` | `14400` | Block is dropped if the ledger's `status_updated_at` is older than this many seconds. |
+| `STATUS_SIDECAR_TTL_SECONDS` | `14400` | Current-status row is dropped if `status_updated_at` is older than this many seconds; active sessions use the same TTL against `last_seen_at`. |
 
 ## Tests
 
@@ -103,10 +112,11 @@ To disable:
   tests/plugins/test_status_sidecar_deterministic_updates.py -v
 ```
 
-51 tests total: 27 from the v1 ledger/inject suite + 24 from the v2
-deterministic-updates suite. The v2 suite specifically asserts the
-no-content invariant by reading raw bytes from the SQLite file after a
-hook run and grepping for marker strings.
+53 tests total: the original ledger/inject suite plus deterministic
+updates, active-session tracking, project-slug inference, and privacy
+checks. The deterministic suite specifically asserts the no-content
+invariant by reading raw bytes from the SQLite file after a hook run and
+grepping for marker strings.
 
 ## Activation smoke plan
 
@@ -119,7 +129,7 @@ self-activate it.
 ```bash
 # Option A: merge the branch into the installed checkout
 cd /Users/zmll/.hermes/hermes-agent
-git merge --ff-only feat/status-sidecar
+git merge --ff-only feat/status-sidecar-sqlite-reconciled
 
 # Option B: cherry-pick just the relevant commits
 git cherry-pick <status-sidecar-commit-sha>
@@ -155,7 +165,16 @@ sys.path.insert(0, "/Users/zmll/.hermes/hermes-agent/plugins/runtime/status_side
 import status_sidecar as ss
 ss.write_status(
     active_kanban_task_id="t_smoke",
-    active_workspace="/tmp/smoke",
+    active_workspace="/tmp/smoke/hermes-agent",
+    active_project_slug="hermes-agent",
+    last_tool_invocation="smoke_check",
+)
+ss.touch_session(
+    session_id="smoke-session",
+    surface="cli",
+    active_project_slug="hermes-agent",
+    active_kanban_task_id="t_smoke",
+    active_workspace="/tmp/smoke/hermes-agent",
     last_tool_invocation="smoke_check",
 )
 print(ss.render_status_block())
@@ -180,8 +199,9 @@ print("rendered:", repr(ss.render_status_block()))
 PY
 ```
 
-Output must be `rendered: ''`. Send another DM and confirm no
-`<system_status>` block appears in the gateway log.
+Output must be `rendered: ''` for the direct script when no fresh session
+row exists. If you then send a DM, `pre_llm_call` may render a
+session-only block; verify the stale `active_kanban_task_id` is absent.
 
 ### Step 5: deterministic update smoke
 
@@ -197,10 +217,11 @@ print(ss.read_status())
 PY
 ```
 
-The dict should now contain `active_kanban_task_id=t_8a4caa0e` and
-`active_workspace=/Users/zmll/.hermes/kanban/workspaces/t_8a4caa0e`,
-written by the `post_tool_call` hook without any explicit
-`status_update` call from the agent.
+The dict should now contain `active_kanban_task_id=t_8a4caa0e`, an
+`active_workspace`, and an inferred `active_project_slug`, written by
+the `post_tool_call` hook without any explicit `status_update` call from
+the agent. `read_active_sessions(14400)` should also include the session
+that ran the tool.
 
 Until all of the above passes on the live gateway, the plugin remains
 in **"implemented, not live"** state.
@@ -214,10 +235,11 @@ in **"implemented, not live"** state.
   the "Tool exposure" section above for the rationale).
 - Hindsight remains in `memory_mode: tools`, `auto_recall: false`,
   `auto_retain: false`. This plugin does NOT change those.
-- The ledger is intentionally single-row. If someone wants per-tenant
-  status, add a `tenant` column and key by `(tenant, id)` — but keep
-  `read_status()` returning a single row at a time so the hook stays
-  cheap.
+- The current-status row is intentionally single-row, with a separate
+  bounded `active_sessions` table. If someone wants per-tenant status,
+  add a `tenant` column and key by `(tenant, id)` — but keep
+  `read_status()` returning a single row at a time and keep
+  `read_active_sessions()` bounded so the hook stays cheap.
 - The `derive_status_from_tool_call` function in `status_sidecar.py` is
   the only place that decides what's safe to land in the ledger. To
   track a new tool, add it there (and write a paired test that proves

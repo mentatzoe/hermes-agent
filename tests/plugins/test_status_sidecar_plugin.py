@@ -114,15 +114,39 @@ class TestLedgerCrud:
         ss.write_status(
             active_kanban_task_id="t_abc123",
             active_workspace="/tmp/work",
+            active_project_slug="test/project",
             last_tool_invocation="kanban_show",
         )
         record = ss.read_status()
         assert record["active_kanban_task_id"] == "t_abc123"
         assert record["active_workspace"] == "/tmp/work"
+        assert record["active_project_slug"] == "test/project"
         assert record["last_tool_invocation"] == "kanban_show"
         assert "status_updated_at" in record
         # Must be a float epoch seconds value.
         assert isinstance(record["status_updated_at"], (int, float))
+
+    def test_active_sessions_round_trip_and_ttl(self, _isolate_env):
+        ss = _load_lib()
+        assert ss.read_active_sessions(ttl_seconds=3600) == []
+
+        assert ss.touch_session(
+            session_id="sess-active",
+            surface="discord",
+            active_project_slug="aleph/hermes-harness",
+            active_kanban_task_id="t_abc123",
+            active_workspace="/tmp/work",
+            last_tool_invocation="kanban_show",
+        ) is True
+
+        sessions = ss.read_active_sessions(ttl_seconds=3600)
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "sess-active"
+        assert sessions[0]["surface"] == "discord"
+        assert sessions[0]["active_project_slug"] == "aleph/hermes-harness"
+        assert sessions[0]["active_kanban_task_id"] == "t_abc123"
+
+        assert ss.read_active_sessions(ttl_seconds=-1) == []
 
     def test_write_updates_timestamp_each_call(self, _isolate_env):
         ss = _load_lib()
@@ -216,6 +240,7 @@ class TestRenderBlock:
         ss.write_status(
             active_kanban_task_id="t_abc",
             active_workspace="/work/here",
+            active_project_slug="test/project",
             last_tool_invocation="kanban_show",
         )
         block = ss.render_status_block(ttl_seconds=3600)
@@ -223,6 +248,7 @@ class TestRenderBlock:
         assert block.rstrip().endswith("</system_status>")
         assert "t_abc" in block
         assert "/work/here" in block
+        assert "test/project" in block
         # Provenance: must include the updated_at age or ISO timestamp.
         assert "updated" in block.lower() or "age" in block.lower()
 
@@ -265,6 +291,23 @@ class TestRenderBlock:
             for marker in ("updated", "age=", "age_seconds", "iso=")
         )
 
+    def test_stale_status_hidden_but_fresh_session_rendered(self, _isolate_env):
+        ss = _load_lib()
+        ss.write_status(active_kanban_task_id="t_stale", active_project_slug="old/project")
+        ss._force_set_updated_at(time.time() - 24 * 3600)
+        ss.touch_session(
+            session_id="sess-fresh",
+            surface="discord",
+            active_project_slug="fresh/project",
+            last_tool_invocation="pre_llm_call",
+        )
+
+        block = ss.render_status_block(ttl_seconds=4 * 3600)
+        assert "sess-fresh" in block
+        assert "fresh/project" in block
+        assert "t_stale" not in block
+        assert "old/project" not in block
+
 
 # ---------------------------------------------------------------------------
 # Plugin __init__: pre_llm_call hook
@@ -289,8 +332,9 @@ class TestPreLlmCallHook:
         assert "<system_status" in result["context"]
         assert "t_hook" in result["context"]
 
-    def test_hook_returns_None_when_ledger_empty(self, _isolate_env):
-        # Don't write anything to the ledger.
+    def test_hook_records_current_session_when_status_empty(self, _isolate_env):
+        # Don't write any status row. The hook should still record and render
+        # the current session as a fresh operational pointer.
         plugin = _load_plugin_init()
         result = plugin._on_pre_llm_call(
             session_id="sess2",
@@ -301,8 +345,9 @@ class TestPreLlmCallHook:
             platform="cli",
             sender_id="zoe",
         )
-        # No content → don't inject anything (no laundering of empty state).
-        assert result is None
+        assert isinstance(result, dict)
+        assert "sess2" in result["context"]
+        assert "cli" in result["context"]
 
     def test_hook_skips_stale_state(self, _isolate_env, monkeypatch):
         ss = _load_lib()
@@ -320,9 +365,11 @@ class TestPreLlmCallHook:
             platform="cli",
             sender_id="zoe",
         )
-        # Either None (skipped) or context explicitly marked stale.
-        if result is not None:
-            assert "stale" in result["context"].lower() or "expired" in result["context"].lower()
+        # Stale task status is skipped, but the current session is allowed
+        # to render as fresh. The stale task id must not leak through.
+        assert isinstance(result, dict)
+        assert "sess3" in result["context"]
+        assert "t_old" not in result["context"]
 
     def test_hook_never_raises_on_corruption(self, _isolate_env):
         ss = _load_lib()
@@ -386,12 +433,16 @@ class TestStatusUpdateTool:
     def test_tool_writes_active_task(self, _isolate_env):
         plugin = _load_plugin_init()
         result = plugin._status_update_handler(
-            {"active_kanban_task_id": "t_via_tool"},
+            {
+                "active_kanban_task_id": "t_via_tool",
+                "active_project_slug": "manual/project",
+            },
         )
         payload = json.loads(result)
         assert payload.get("ok") is True
         ss = _load_lib()
         assert ss.read_status()["active_kanban_task_id"] == "t_via_tool"
+        assert ss.read_status()["active_project_slug"] == "manual/project"
 
     def test_tool_rejects_oversized_drift_signal(self, _isolate_env):
         """Drift signal text gets truncated, not stored unbounded."""

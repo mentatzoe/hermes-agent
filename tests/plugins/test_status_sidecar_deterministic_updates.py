@@ -94,7 +94,7 @@ class TestDeriveStatusFromToolCall:
         out = ss.derive_status_from_tool_call("random_thing", {"x": 1}, '{"ok":true}')
         assert out == {}
 
-    def test_kanban_show_captures_task_id_and_workspace(self, _isolate_env):
+    def test_kanban_show_captures_task_id_workspace_and_project(self, _isolate_env):
         ss = _load_lib()
         # Result mirrors what kanban_show actually returns: a JSON string.
         result = json.dumps(
@@ -102,7 +102,7 @@ class TestDeriveStatusFromToolCall:
                 "task": {
                     "id": "t_abc123",
                     "title": "Some title with body content not stored",
-                    "workspace_path": "/Users/x/.hermes/kanban/workspaces/t_abc123",
+                    "workspace_path": "/Users/x/.hermes/kanban/workspaces/t_abc123/hermes-agent",
                     "body": "PRIVATE BODY MUST NEVER LAND IN LEDGER",
                 }
             }
@@ -110,7 +110,8 @@ class TestDeriveStatusFromToolCall:
         out = ss.derive_status_from_tool_call("kanban_show", {"task_id": "t_abc123"}, result)
         assert out.get("active_kanban_task_id") == "t_abc123"
         assert "active_workspace" in out
-        assert out["active_workspace"].endswith("t_abc123")
+        assert out["active_workspace"].endswith("hermes-agent")
+        assert out.get("active_project_slug") == "hermes-agent"
         # Hard: must NEVER carry body / title / prose anywhere in the derived dict.
         flat = json.dumps(out)
         assert "PRIVATE BODY" not in flat
@@ -172,22 +173,23 @@ class TestDeriveStatusFromToolCall:
         # last_cron_job_id may be set from args; last_tool_invocation always.
         assert out.get("last_tool_invocation") == "cronjob"
 
-    def test_write_file_captures_path_only_no_content(self, _isolate_env):
+    def test_write_file_captures_path_project_only_no_content(self, _isolate_env):
         ss = _load_lib()
         out = ss.derive_status_from_tool_call(
             "write_file",
             {
-                "path": "/Users/zoe/notes.md",
+                "path": "/Users/zoe/github/aleph-vault/projects/aleph/hermes-harness/note.md",
                 "content": "PRIVATE NOTE CONTENT that must never be stored",
             },
             '{"ok": true}',
         )
-        # Path lands in last_tool_invocation as a brief breadcrumb.
-        # The full content MUST NOT appear.
+        # Path lands in last_tool_invocation as a brief basename breadcrumb.
+        # Project slug is inferred from path. The full content MUST NOT appear.
         flat = json.dumps(out)
         assert "PRIVATE NOTE CONTENT" not in flat
-        # Tool name recorded.
         assert out.get("last_tool_invocation", "").startswith("write_file")
+        assert "note.md" in out.get("last_tool_invocation", "")
+        assert out.get("active_project_slug") == "github/aleph-vault/projects/aleph/hermes-harness"
 
     def test_patch_captures_path_only_no_diff(self, _isolate_env):
         ss = _load_lib()
@@ -233,11 +235,11 @@ class TestDeriveStatusFromToolCall:
 # ---------------------------------------------------------------------------
 
 class TestPostToolCallHook:
-    def test_kanban_show_updates_ledger(self, _isolate_env):
+    def test_kanban_show_updates_ledger_and_active_session(self, _isolate_env):
         plugin = _load_plugin_init()
         ss = _load_lib()
         result = json.dumps(
-            {"task": {"id": "t_hookpost", "workspace_path": "/work/t_hookpost"}}
+            {"task": {"id": "t_hookpost", "workspace_path": "/Users/x/.hermes/kanban/workspaces/t_hookpost/hermes-agent"}}
         )
         plugin._on_post_tool_call(
             tool_name="kanban_show",
@@ -250,7 +252,14 @@ class TestPostToolCallHook:
         )
         rec = ss.read_status()
         assert rec.get("active_kanban_task_id") == "t_hookpost"
-        assert rec.get("active_workspace") == "/work/t_hookpost"
+        assert rec.get("active_workspace").endswith("hermes-agent")
+        assert rec.get("active_project_slug") == "hermes-agent"
+
+        sessions = ss.read_active_sessions(ttl_seconds=3600)
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "s1"
+        assert sessions[0]["active_kanban_task_id"] == "t_hookpost"
+        assert sessions[0]["active_project_slug"] == "hermes-agent"
 
     def test_no_result_body_in_ledger(self, _isolate_env):
         """Hard guarantee: the SQLite ledger file must never contain any

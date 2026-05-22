@@ -1,6 +1,6 @@
 """status-sidecar plugin — pre-response status anchoring for Aleph/Hermes.
 
-Wires two behaviours:
+Wires four behaviours:
 
 1. ``pre_llm_call`` hook — reads the durable status ledger and, when fresh,
    returns a ``{"context": "<system_status>...</system_status>"}`` dict.
@@ -8,7 +8,12 @@ Wires two behaviours:
    user message via ``_plugin_user_context``. The system prompt is never
    mutated; prompt-cache prefix stays intact.
 
-2. ``status_update`` tool — short-annotation write path for the agent. Lets
+2. ``post_tool_call`` hook — deterministic ledger/session updates after
+   selected tools.
+
+3. ``on_session_finalize`` hook — compact end-of-session drift signal.
+
+4. ``status_update`` tool — short-annotation write path for the agent. Lets
    it post a drift signal or update the active task/workspace pointers. NOT
    a general-purpose memory store; entries are length-bounded and the
    ring buffer is small.
@@ -85,6 +90,15 @@ def _on_pre_llm_call(
     depth: we should not depend on that.
     """
     try:
+        # Current-session presence is itself a low-confidence operational
+        # pointer, but it lives in the active_sessions table so it does NOT
+        # refresh stale task/project status rows.
+        ss.touch_session(
+            session_id=session_id,
+            surface=platform,
+            model=model,
+            last_tool_invocation="pre_llm_call",
+        )
         block = ss.render_status_block(ttl_seconds=_ttl_seconds())
     except Exception as exc:  # pragma: no cover — render_status_block already swallows
         logger.debug("status_sidecar render failed: %s", exc)
@@ -182,6 +196,13 @@ def _on_post_tool_call(
             ss.write_status(**update)
         if isinstance(drift, str) and drift.strip():
             ss.append_drift_signal(drift)
+        ss.touch_session(
+            session_id=session_id,
+            active_project_slug=update.get("active_project_slug"),
+            active_kanban_task_id=update.get("active_kanban_task_id"),
+            active_workspace=update.get("active_workspace"),
+            last_tool_invocation=update.get("last_tool_invocation") or tool_name,
+        )
     except Exception as exc:  # pragma: no cover — write_status swallows internally
         logger.debug("status_sidecar post_tool_call write failed: %s", exc)
 
@@ -264,6 +285,14 @@ _STATUS_UPDATE_SCHEMA = {
                     "Pass empty string to clear."
                 ),
             },
+            "active_project_slug": {
+                "type": "string",
+                "description": (
+                    "Short current-project pointer, e.g. "
+                    "'github/aleph-vault/projects/aleph/hermes-harness' "
+                    "or 'hermes-agent'. Pass empty string to clear."
+                ),
+            },
             "last_tool_invocation": {
                 "type": "string",
                 "description": (
@@ -305,6 +334,7 @@ def _status_update_handler(args: Dict[str, Any], **_: Any) -> str:
     scalar_fields = (
         "active_kanban_task_id",
         "active_workspace",
+        "active_project_slug",
         "last_tool_invocation",
         "last_cron_job_id",
     )
