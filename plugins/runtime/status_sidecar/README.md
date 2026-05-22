@@ -1,12 +1,13 @@
 # status-sidecar
 
 A small durable ledger that holds **current operational hints** for the
-agent (current focus, active project, active sessions, active Kanban task,
-workspace, last tool, recent structural events, compact digest) and appends
-them as a bounded XML-ish `<status>` block to the user message before each
-LLM call. Low-signal maintenance rows (`pre_llm_call`-only heartbeats,
-pointerless tool calls, and cron-job list/status/cleanup churn) are counted
-but hidden unless there is no stronger current-work pointer.
+agent (global current focus, this-surface session context, active project,
+active sessions, active Kanban task, workspace, last tool, recent structural
+events, compact digest) and appends them as a bounded XML-ish `<status>` block
+to the user message before each LLM call. Low-signal maintenance rows
+(`pre_llm_call`-only heartbeats, pointerless tool calls, and cron-job
+list/status/cleanup churn) are counted but hidden unless there is no stronger
+current-work pointer.
 
 This is the HEARTBEAT recommendation from
 `projects/aleph/hermes-harness/caveagent-status-ledger-design.md`. It is
@@ -19,7 +20,18 @@ pointer the agent should verify with real tools before acting on.
    `active_sessions` table, reads `$HERMES_HOME/state/status.db`, and
    returns a `{"context": "..."}` dict when either the current-status row
    or at least one session pointer is fresh (≤ 4 hours by default). The
-   agent loop (`run_agent.py`) appends that to the user message via
+   rendered block separates the cross-session pointer from this surface:
+
+   ```xml
+   <global_focus scope="global" project="github/turnaware" ... />
+   <surface_focus scope="surface" surface="discord" session="..." ... />
+   ```
+
+   `global_focus` is the freshest explicit work pointer across Aleph's
+   concurrent surfaces. `surface_focus` is the current pre-LLM call's
+   session/surface context; it prevents a Discord DM asking about flights
+   from reading as if TurnAware were the only conversation. The agent loop
+   (`run_agent.py`) appends the block to the user message via
    `_plugin_user_context`. **The system prompt is never touched** —
    prompt-cache prefix stays intact.
 
@@ -93,10 +105,12 @@ To disable:
 - **Corrupt SQLite file:** library swallows the
   `sqlite3.OperationalError`, returns `{}` / `[]`, hook returns `None`
   or a session-only block.
-- **Empty status row:** current session may render; no fake task/project
-  status is created.
+- **Empty status row:** current session may render as `surface_focus`; no fake
+  task/project status is created.
 - **Stale status row (> TTL):** stale task/project fields are skipped;
-  fresh active-session rows may still render.
+  fresh active-session rows may still render. If the stale row was the
+  only global pointer, the block may contain only `surface_focus` and/or
+  meaningful active sessions.
 - **Oversized rendered block:** priority-rendered under ~1200 chars. The
   renderer drops optional events/digest/session detail before it would ever
   hard-truncate, so the XML-ish envelope stays parseable and no
@@ -118,12 +132,13 @@ To disable:
   tests/plugins/test_status_sidecar_deterministic_updates.py -v
 ```
 
-57 tests total: the original ledger/inject suite plus deterministic
+60 tests total: the original ledger/inject suite plus deterministic
 updates, active-session tracking, project-slug inference, compact XML-ish
-priority rendering, low-signal cron/heartbeat/tool filtering, maintenance-cron
-focus guards, and privacy checks. The deterministic suite specifically
-asserts the no-content invariant by reading raw bytes from the SQLite file
-after a hook run and grepping for marker strings.
+priority rendering, explicit `global_focus` / `surface_focus` separation,
+low-signal cron/heartbeat/tool filtering, maintenance-cron focus guards, and
+privacy checks. The deterministic suite specifically asserts the no-content
+invariant by reading raw bytes from the SQLite file after a hook run and
+grepping for marker strings.
 
 ## Activation smoke plan
 

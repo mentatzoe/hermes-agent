@@ -99,7 +99,11 @@ def _on_pre_llm_call(
             model=model,
             last_tool_invocation="pre_llm_call",
         )
-        block = ss.render_status_block(ttl_seconds=_ttl_seconds())
+        block = ss.render_status_block(
+            ttl_seconds=_ttl_seconds(),
+            current_session_id=session_id,
+            current_surface=platform,
+        )
     except Exception as exc:  # pragma: no cover — render_status_block already swallows
         logger.debug("status_sidecar render failed: %s", exc)
         return None
