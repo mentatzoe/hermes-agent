@@ -4,7 +4,9 @@ A small durable ledger that holds **current operational hints** for the
 agent (current focus, active project, active sessions, active Kanban task,
 workspace, last tool, recent structural events, compact digest) and appends
 them as a bounded XML-ish `<status>` block to the user message before each
-LLM call.
+LLM call. Low-signal maintenance rows (`pre_llm_call`-only heartbeats,
+pointerless tool calls, and cron-job list/status/cleanup churn) are counted
+but hidden unless there is no stronger current-work pointer.
 
 This is the HEARTBEAT recommendation from
 `projects/aleph/hermes-harness/caveagent-status-ledger-design.md`. It is
@@ -116,12 +118,12 @@ To disable:
   tests/plugins/test_status_sidecar_deterministic_updates.py -v
 ```
 
-56 tests total: the original ledger/inject suite plus deterministic
+57 tests total: the original ledger/inject suite plus deterministic
 updates, active-session tracking, project-slug inference, compact XML-ish
-priority rendering, low-signal cron/heartbeat filtering, and privacy
-checks. The deterministic suite specifically asserts the no-content
-invariant by reading raw bytes from the SQLite file after a hook run and
-grepping for marker strings.
+priority rendering, low-signal cron/heartbeat/tool filtering, maintenance-cron
+focus guards, and privacy checks. The deterministic suite specifically
+asserts the no-content invariant by reading raw bytes from the SQLite file
+after a hook run and grepping for marker strings.
 
 ## Activation smoke plan
 
