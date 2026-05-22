@@ -170,9 +170,20 @@ class TestDeriveStatusFromToolCall:
             {"action": "remove", "job_id": "job_42"},
             '{"ok": true}',
         )
-        # last_cron_job_id may be set from args; last_tool_invocation always.
+        # Mutating cron actions remain structural events, but render as events
+        # rather than top-level "current focus".
         assert out.get("last_tool_invocation") == "cronjob"
+        assert out.get("last_cron_job_id") == "job_42"
+        assert out.get("_drift") == "cronjob remove job_42"
 
+    def test_cronjob_list_is_low_signal_and_ignored(self, _isolate_env):
+        ss = _load_lib()
+        out = ss.derive_status_from_tool_call(
+            "cronjob",
+            {"action": "list"},
+            '{"jobs": [{"job_id": "SECRET_JOB_BODY_SHOULD_NOT_MATTER"}]}',
+        )
+        assert out == {}
     def test_write_file_captures_path_project_only_no_content(self, _isolate_env):
         ss = _load_lib()
         out = ss.derive_status_from_tool_call(

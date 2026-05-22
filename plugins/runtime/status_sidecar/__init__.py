@@ -3,7 +3,7 @@
 Wires four behaviours:
 
 1. ``pre_llm_call`` hook — reads the durable status ledger and, when fresh,
-   returns a ``{"context": "<system_status>...</system_status>"}`` dict.
+   returns a ``{"context": "<status>...</status>"}`` dict.
    The agent loop (``run_agent.py``) appends that to the current turn's
    user message via ``_plugin_user_context``. The system prompt is never
    mutated; prompt-cache prefix stays intact.
@@ -293,6 +293,34 @@ _STATUS_UPDATE_SCHEMA = {
                     "or 'hermes-agent'. Pass empty string to clear."
                 ),
             },
+            "focus_label": {
+                "type": "string",
+                "description": (
+                    "Short human-readable current focus label. Typed current-work "
+                    "metadata only; not a memory fact or transcript."
+                ),
+            },
+            "focus_state": {
+                "type": "string",
+                "description": (
+                    "Compact current state / blocker phrase for the active focus. "
+                    "Truncated; do not put file contents, prompts, or logs here."
+                ),
+            },
+            "focus_ref": {
+                "type": "string",
+                "description": (
+                    "Opaque reference for the focus, e.g. task id, PR URL, repo, "
+                    "or local path. Keep it structural."
+                ),
+            },
+            "recent_activity_digest": {
+                "type": "string",
+                "description": (
+                    "Very short rolling digest of recent operational state. "
+                    "No raw memory facts, transcripts, tool bodies, or diffs."
+                ),
+            },
             "last_tool_invocation": {
                 "type": "string",
                 "description": (
@@ -335,6 +363,10 @@ def _status_update_handler(args: Dict[str, Any], **_: Any) -> str:
         "active_kanban_task_id",
         "active_workspace",
         "active_project_slug",
+        "focus_label",
+        "focus_state",
+        "focus_ref",
+        "recent_activity_digest",
         "last_tool_invocation",
         "last_cron_job_id",
     )

@@ -1,9 +1,10 @@
 # status-sidecar
 
 A small durable ledger that holds **current operational hints** for the
-agent (active project, active sessions, active Kanban task, workspace,
-last tool, recent drift signals) and appends them as a bounded
-`<system_status>` block to the user message before each LLM call.
+agent (current focus, active project, active sessions, active Kanban task,
+workspace, last tool, recent structural events, compact digest) and appends
+them as a bounded XML-ish `<status>` block to the user message before each
+LLM call.
 
 This is the HEARTBEAT recommendation from
 `projects/aleph/hermes-harness/caveagent-status-ledger-design.md`. It is
@@ -28,7 +29,7 @@ pointer the agent should verify with real tools before acting on.
    |---|---|
    | `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_comment`, `kanban_link`, `kanban_heartbeat` | `active_kanban_task_id` (from result `task.id` or args), `active_workspace` (kanban_show only), inferred `active_project_slug`, `last_tool_invocation` |
    | `kanban_create` | `last_tool_invocation`, plus a `created kanban card <id>` drift signal (no title / body) |
-   | `cronjob` | `last_cron_job_id` (from result `job_id` or args), `last_tool_invocation`, plus `cronjob <action> [<id>]` drift signal (no prompt / schedule / script content) |
+   | `cronjob` | Mutating actions: `last_cron_job_id` (from result `job_id` or args), `last_tool_invocation`, plus `cronjob <action> [<id>]` drift signal (no prompt / schedule / script content). Low-signal `list`/`status` actions are ignored. |
    | `write_file`, `patch` | `last_tool_invocation = "<tool>:<basename>"` plus inferred `active_project_slug` where possible (no full path, no content, no diff) |
    | Anything else | Ignored. `terminal`, `status_update`, `read_file`, `search_files` are explicitly excluded to keep noise out and avoid recursion. |
 
@@ -44,9 +45,10 @@ pointer the agent should verify with real tools before acting on.
    session had no tracked tool calls.
 
 4. **`status_update` tool** lets the agent post a short drift signal or
-   override the auto-tracked pointers, including `active_project_slug`.
-   Length-bounded; the drift ring buffer keeps only the most recent 5
-   entries.
+   override the auto-tracked pointers, including `active_project_slug` and
+   the compact focus fields (`focus_label`, `focus_state`, `focus_ref`,
+   `recent_activity_digest`). Length-bounded; the drift ring buffer keeps
+   only the most recent 5 entries.
 
 ## Tool exposure
 
@@ -93,8 +95,10 @@ To disable:
   status is created.
 - **Stale status row (> TTL):** stale task/project fields are skipped;
   fresh active-session rows may still render.
-- **Oversized rendered block:** truncated to ~1200 chars with a
-  `[truncated]` marker.
+- **Oversized rendered block:** priority-rendered under ~1200 chars. The
+  renderer drops optional events/digest/session detail before it would ever
+  hard-truncate, so the XML-ish envelope stays parseable and no
+  `[truncated]` marker is emitted.
 - **Hook errors:** every hook is wrapped in try/except and logs at
   debug. A failing status write must never break the agent loop.
 
@@ -112,8 +116,9 @@ To disable:
   tests/plugins/test_status_sidecar_deterministic_updates.py -v
 ```
 
-53 tests total: the original ledger/inject suite plus deterministic
-updates, active-session tracking, project-slug inference, and privacy
+56 tests total: the original ledger/inject suite plus deterministic
+updates, active-session tracking, project-slug inference, compact XML-ish
+priority rendering, low-signal cron/heartbeat filtering, and privacy
 checks. The deterministic suite specifically asserts the no-content
 invariant by reading raw bytes from the SQLite file after a hook run and
 grepping for marker strings.
