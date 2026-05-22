@@ -1,7 +1,7 @@
 """Tests for the status-sidecar plugin.
 
 The plugin maintains a small durable status ledger ("HEARTBEAT" sidecar) and
-appends a ``<system_status>`` block to the user message via the
+appends a ``<status>`` block to the user message via the
 ``pre_llm_call`` hook. Verifies:
 
   * Library: schema CRUD, atomic writes, TTL staleness, corrupt-file safety.
@@ -227,7 +227,7 @@ class TestCorruptionSafety:
         # render_status_block is never allowed to raise; returns either
         # empty string or a clearly-marked "unavailable" hint.
         assert isinstance(block, str)
-        assert "<system_status" not in block or "unavailable" in block.lower()
+        assert "<status" not in block or "unavailable" in block.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +244,8 @@ class TestRenderBlock:
             last_tool_invocation="kanban_show",
         )
         block = ss.render_status_block(ttl_seconds=3600)
-        assert block.startswith("<system_status")
-        assert block.rstrip().endswith("</system_status>")
+        assert block.startswith("<status")
+        assert block.rstrip().endswith("</status>")
         assert "t_abc" in block
         assert "/work/here" in block
         assert "test/project" in block
@@ -263,7 +263,7 @@ class TestRenderBlock:
             assert "stale" in block.lower() or "expired" in block.lower()
             assert "current=true" not in block.lower()
         # Live-looking block forbidden.
-        assert "<system_status live=" not in block or "stale" in block.lower()
+        assert "<status live=" not in block or "stale" in block.lower()
 
     def test_block_under_token_budget(self, _isolate_env):
         ss = _load_lib()
@@ -308,6 +308,70 @@ class TestRenderBlock:
         assert "t_stale" not in block
         assert "old/project" not in block
 
+    def test_compact_xmlish_render_prioritizes_focus_and_omits_hard_truncation(self, _isolate_env):
+        ss = _load_lib()
+        ss.write_status(
+            active_workspace="/Users/zmll/github/turnaware",
+            active_project_slug="github/mentatzoe/turnaware",
+            focus_label="TurnAware Multica setup",
+            focus_state="awaiting Zoe approval; no Multica writes/dispatches yet",
+            focus_ref="repo:mentatzoe/turnaware",
+            recent_activity_digest=(
+                "status-sidecar live; Hindsight UI live on Tailscale; "
+                "TurnAware setup staged."
+            ),
+        )
+        for i in range(30):
+            ss.append_drift_signal(f"noisy drift signal {i:02d} that should not force hard truncation")
+        for i in range(12):
+            ss.touch_session(
+                session_id=f"heartbeat-{i}",
+                surface="discord",
+                last_tool_invocation="pre_llm_call",
+            )
+        ss.touch_session(
+            session_id="meaningful-session",
+            surface="discord",
+            activity_class="user_active",
+            focus_label="status-sidecar schema refinement",
+            focus_ref="repo:mentatzoe/hermes-agent",
+            last_tool_invocation="patch",
+        )
+
+        block = ss.render_status_block(ttl_seconds=3600)
+        assert block.startswith("<status ")
+        assert block.rstrip().endswith("</status>")
+        assert "Operational hints" not in block
+        assert "active_project_slug:" not in block
+        assert "[truncated]" not in block
+        assert len(block) <= ss.BLOCK_CHAR_BUDGET
+        assert "<focus " in block
+        assert "TurnAware Multica setup" in block
+        assert "repo:mentatzoe/turnaware" in block
+        assert "<sessions " in block
+        assert "meaningful-session" in block
+        assert "hidden_heartbeat=" in block
+        assert "<digest " in block
+
+    def test_status_update_focus_fields_round_trip_and_render(self, _isolate_env):
+        plugin = _load_plugin_init()
+        payload = json.loads(plugin._status_update_handler({
+            "focus_label": "Hindsight Control Plane UI",
+            "focus_state": "tailnet UI live; temporary process, not reboot-proof",
+            "focus_ref": "url:http://100.107.255.109:9999/dashboard",
+            "recent_activity_digest": "Hindsight UI browser-verified for personal-bank.",
+        }))
+        assert payload.get("ok") is True
+        assert set(payload.get("wrote", [])) >= {
+            "focus_label", "focus_state", "focus_ref", "recent_activity_digest"
+        }
+        ss = _load_lib()
+        block = ss.render_status_block(ttl_seconds=3600)
+        assert "Hindsight Control Plane UI" in block
+        assert "temporary process" in block
+        assert "url:http://100.107.255.109:9999/dashboard" in block
+        assert "Hindsight UI browser-verified" in block
+
 
 # ---------------------------------------------------------------------------
 # Plugin __init__: pre_llm_call hook
@@ -329,7 +393,7 @@ class TestPreLlmCallHook:
         )
         assert isinstance(result, dict)
         assert "context" in result
-        assert "<system_status" in result["context"]
+        assert "<status" in result["context"]
         assert "t_hook" in result["context"]
 
     def test_hook_records_current_session_when_status_empty(self, _isolate_env):

@@ -13,7 +13,7 @@ agent:
   * ``status_updated_at``         — float epoch seconds; the TTL anchor
 
 The plugin's ``pre_llm_call`` hook renders this into a fenced
-``<system_status>`` block and the agent loop appends it to the user
+``<status>`` block and the agent loop appends it to the user
 message via ``_plugin_user_context`` — the system prompt is never touched
 (preserves prompt cache).
 
@@ -34,6 +34,7 @@ Design rules (from card t_8a4caa0e):
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -42,7 +43,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from hermes_constants import get_hermes_home
@@ -61,7 +62,12 @@ logger = logging.getLogger(__name__)
 MAX_DRIFT_SIGNALS = 5
 MAX_DRIFT_SIGNAL_CHARS = 200
 MAX_ACTIVE_SESSIONS = 5
+MAX_RENDERED_EVENTS = 3
 MAX_FIELD_CHARS = 240
+MAX_FOCUS_LABEL_CHARS = 120
+MAX_FOCUS_STATE_CHARS = 160
+MAX_FOCUS_REF_CHARS = 160
+MAX_DIGEST_CHARS = 300
 BLOCK_CHAR_BUDGET = 1200  # ~300 tokens of ASCII English
 
 # ---------------------------------------------------------------------------
@@ -96,10 +102,11 @@ def _connect() -> sqlite3.Connection:
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
-    """Create the single-row ``status`` table if it doesn't exist.
+    """Create / migrate the small status ledger schema.
 
-    Schema is a fixed set of scalar columns plus one JSON blob for
-    drift signals. One row only (``id=1``).
+    The schema deliberately stays typed and bounded: a single current-status
+    row, plus per-session pointers. New columns are additive so live ledgers
+    survive plugin upgrades.
     """
     conn.execute(
         """
@@ -108,6 +115,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             active_kanban_task_id    TEXT,
             active_workspace         TEXT,
             active_project_slug      TEXT,
+            focus_label              TEXT,
+            focus_state              TEXT,
+            focus_ref                TEXT,
+            recent_activity_digest   TEXT,
             last_tool_invocation     TEXT,
             last_cron_job_id         TEXT,
             recent_drift_signals     TEXT,         -- JSON list[str]
@@ -115,17 +126,28 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    try:
-        conn.execute("ALTER TABLE status ADD COLUMN active_project_slug TEXT")
-    except sqlite3.OperationalError:
-        # Column already exists.
-        pass
+    for column, decl in (
+        ("active_project_slug", "TEXT"),
+        ("focus_label", "TEXT"),
+        ("focus_state", "TEXT"),
+        ("focus_ref", "TEXT"),
+        ("recent_activity_digest", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE status ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError:
+            # Column already exists.
+            pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS active_sessions (
             session_id              TEXT PRIMARY KEY,
             surface                 TEXT,
             model                   TEXT,
+            activity_class          TEXT,
+            focus_label             TEXT,
+            focus_state             TEXT,
+            focus_ref               TEXT,
             active_project_slug     TEXT,
             active_kanban_task_id   TEXT,
             active_workspace        TEXT,
@@ -134,6 +156,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    for column, decl in (
+        ("activity_class", "TEXT"),
+        ("focus_label", "TEXT"),
+        ("focus_state", "TEXT"),
+        ("focus_ref", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE active_sessions ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +190,10 @@ def read_status() -> Dict[str, Any]:
             SELECT active_kanban_task_id,
                    active_workspace,
                    active_project_slug,
+                   focus_label,
+                   focus_state,
+                   focus_ref,
+                   recent_activity_digest,
                    last_tool_invocation,
                    last_cron_job_id,
                    recent_drift_signals,
@@ -183,7 +219,7 @@ def read_status() -> Dict[str, Any]:
         return {}
 
     try:
-        drift = json.loads(row[5]) if row[5] else []
+        drift = json.loads(row[9]) if row[9] else []
         if not isinstance(drift, list):
             drift = []
     except (ValueError, TypeError):
@@ -193,10 +229,14 @@ def read_status() -> Dict[str, Any]:
         "active_kanban_task_id": row[0],
         "active_workspace": row[1],
         "active_project_slug": row[2],
-        "last_tool_invocation": row[3],
-        "last_cron_job_id": row[4],
+        "focus_label": row[3],
+        "focus_state": row[4],
+        "focus_ref": row[5],
+        "recent_activity_digest": row[6],
+        "last_tool_invocation": row[7],
+        "last_cron_job_id": row[8],
         "recent_drift_signals": drift,
-        "status_updated_at": row[6],
+        "status_updated_at": row[10],
     }
 
 def _clip(value: Optional[str], limit: int = MAX_FIELD_CHARS) -> Optional[str]:
@@ -242,10 +282,48 @@ def _project_slug_from_path(path: Optional[str]) -> str:
     return ""
 
 
+def _infer_activity_class(
+    last_tool_invocation: Optional[str],
+    active_project_slug: Optional[str] = None,
+    active_kanban_task_id: Optional[str] = None,
+    active_workspace: Optional[str] = None,
+    focus_label: Optional[str] = None,
+    focus_state: Optional[str] = None,
+    focus_ref: Optional[str] = None,
+) -> str:
+    """Classify session rows so render can filter heartbeat noise.
+
+    ``pre_llm_call`` touches are useful as liveness, but they should not crowd
+    out real work pointers. Any typed project/task/workspace/focus field turns
+    the row into a meaningful current-work pointer.
+    """
+    has_pointer = any(
+        isinstance(v, str) and v.strip()
+        for v in (
+            active_project_slug,
+            active_kanban_task_id,
+            active_workspace,
+            focus_label,
+            focus_state,
+            focus_ref,
+        )
+    )
+    tool = last_tool_invocation if isinstance(last_tool_invocation, str) else ""
+    if not has_pointer and tool == "pre_llm_call":
+        return "heartbeat"
+    if has_pointer:
+        return "work"
+    return "tool"
+
+
 def touch_session(
     session_id: Optional[str],
     surface: Optional[str] = None,
     model: Optional[str] = None,
+    activity_class: Optional[str] = None,
+    focus_label: Optional[str] = None,
+    focus_state: Optional[str] = None,
+    focus_ref: Optional[str] = None,
     active_project_slug: Optional[str] = None,
     active_kanban_task_id: Optional[str] = None,
     active_workspace: Optional[str] = None,
@@ -262,28 +340,64 @@ def touch_session(
             conn = _connect()
             _init_schema(conn)
             existing = conn.execute(
-                "SELECT surface, model, active_project_slug, active_kanban_task_id, "
-                "active_workspace, last_tool_invocation FROM active_sessions "
-                "WHERE session_id = ?",
+                "SELECT surface, model, activity_class, focus_label, focus_state, focus_ref, "
+                "active_project_slug, active_kanban_task_id, active_workspace, "
+                "last_tool_invocation FROM active_sessions WHERE session_id = ?",
                 (sid,),
             ).fetchone()
             if existing is None:
-                cur_surface, cur_model, cur_project, cur_task, cur_ws, cur_tool = (
-                    None, None, None, None, None, None
-                )
+                (
+                    cur_surface,
+                    cur_model,
+                    cur_class,
+                    cur_focus_label,
+                    cur_focus_state,
+                    cur_focus_ref,
+                    cur_project,
+                    cur_task,
+                    cur_ws,
+                    cur_tool,
+                ) = (None, None, None, None, None, None, None, None, None, None)
             else:
-                cur_surface, cur_model, cur_project, cur_task, cur_ws, cur_tool = existing
+                (
+                    cur_surface,
+                    cur_model,
+                    cur_class,
+                    cur_focus_label,
+                    cur_focus_state,
+                    cur_focus_ref,
+                    cur_project,
+                    cur_task,
+                    cur_ws,
+                    cur_tool,
+                ) = existing
+
             project = active_project_slug or _project_slug_from_path(active_workspace)
+            next_tool = _clip(last_tool_invocation) if last_tool_invocation is not None else cur_tool
+            inferred_class = _infer_activity_class(
+                next_tool,
+                project if project is not None else cur_project,
+                active_kanban_task_id if active_kanban_task_id is not None else cur_task,
+                active_workspace if active_workspace is not None else cur_ws,
+                focus_label if focus_label is not None else cur_focus_label,
+                focus_state if focus_state is not None else cur_focus_state,
+                focus_ref if focus_ref is not None else cur_focus_ref,
+            )
             conn.execute(
                 """
                 INSERT INTO active_sessions (
-                    session_id, surface, model, active_project_slug,
+                    session_id, surface, model, activity_class, focus_label,
+                    focus_state, focus_ref, active_project_slug,
                     active_kanban_task_id, active_workspace,
                     last_tool_invocation, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     surface               = excluded.surface,
                     model                 = excluded.model,
+                    activity_class        = excluded.activity_class,
+                    focus_label           = excluded.focus_label,
+                    focus_state           = excluded.focus_state,
+                    focus_ref             = excluded.focus_ref,
                     active_project_slug   = excluded.active_project_slug,
                     active_kanban_task_id = excluded.active_kanban_task_id,
                     active_workspace      = excluded.active_workspace,
@@ -294,10 +408,14 @@ def touch_session(
                     sid,
                     _clip(surface) if surface is not None else cur_surface,
                     _clip(model) if model is not None else cur_model,
+                    _clip(activity_class) if activity_class is not None else inferred_class,
+                    _clip(focus_label, MAX_FOCUS_LABEL_CHARS) if focus_label is not None else cur_focus_label,
+                    _clip(focus_state, MAX_FOCUS_STATE_CHARS) if focus_state is not None else cur_focus_state,
+                    _clip(focus_ref, MAX_FOCUS_REF_CHARS) if focus_ref is not None else cur_focus_ref,
                     _clip(project) if project is not None else cur_project,
                     _clip(active_kanban_task_id) if active_kanban_task_id is not None else cur_task,
                     _clip(active_workspace) if active_workspace is not None else cur_ws,
-                    _clip(last_tool_invocation) if last_tool_invocation is not None else cur_tool,
+                    next_tool,
                     now,
                 ),
             )
@@ -328,7 +446,8 @@ def read_active_sessions(ttl_seconds: float, limit: int = MAX_ACTIVE_SESSIONS) -
         _init_schema(conn)
         rows = conn.execute(
             """
-            SELECT session_id, surface, model, active_project_slug,
+            SELECT session_id, surface, model, activity_class, focus_label,
+                   focus_state, focus_ref, active_project_slug,
                    active_kanban_task_id, active_workspace,
                    last_tool_invocation, last_seen_at
               FROM active_sessions
@@ -355,11 +474,15 @@ def read_active_sessions(ttl_seconds: float, limit: int = MAX_ACTIVE_SESSIONS) -
             "session_id": row[0],
             "surface": row[1],
             "model": row[2],
-            "active_project_slug": row[3],
-            "active_kanban_task_id": row[4],
-            "active_workspace": row[5],
-            "last_tool_invocation": row[6],
-            "last_seen_at": row[7],
+            "activity_class": row[3],
+            "focus_label": row[4],
+            "focus_state": row[5],
+            "focus_ref": row[6],
+            "active_project_slug": row[7],
+            "active_kanban_task_id": row[8],
+            "active_workspace": row[9],
+            "last_tool_invocation": row[10],
+            "last_seen_at": row[11],
         }
         for row in rows
     ]
@@ -369,6 +492,10 @@ def write_status(
     active_kanban_task_id: Optional[str] = None,
     active_workspace: Optional[str] = None,
     active_project_slug: Optional[str] = None,
+    focus_label: Optional[str] = None,
+    focus_state: Optional[str] = None,
+    focus_ref: Optional[str] = None,
+    recent_activity_digest: Optional[str] = None,
     last_tool_invocation: Optional[str] = None,
     last_cron_job_id: Optional[str] = None,
 ) -> bool:
@@ -388,37 +515,67 @@ def write_status(
             conn = _connect()
             _init_schema(conn)
             existing = conn.execute(
-                "SELECT active_kanban_task_id, active_workspace, "
-                "active_project_slug, last_tool_invocation, last_cron_job_id, "
-                "recent_drift_signals FROM status WHERE id = 1"
+                "SELECT active_kanban_task_id, active_workspace, active_project_slug, "
+                "focus_label, focus_state, focus_ref, recent_activity_digest, "
+                "last_tool_invocation, last_cron_job_id, recent_drift_signals "
+                "FROM status WHERE id = 1"
             ).fetchone()
             if existing is None:
-                cur_task, cur_ws, cur_project, cur_tool, cur_cron, cur_drift = (
-                    None, None, None, None, None, "[]"
-                )
+                (
+                    cur_task,
+                    cur_ws,
+                    cur_project,
+                    cur_focus_label,
+                    cur_focus_state,
+                    cur_focus_ref,
+                    cur_digest,
+                    cur_tool,
+                    cur_cron,
+                    cur_drift,
+                ) = (None, None, None, None, None, None, None, None, None, "[]")
             else:
-                cur_task, cur_ws, cur_project, cur_tool, cur_cron, cur_drift = existing
+                (
+                    cur_task,
+                    cur_ws,
+                    cur_project,
+                    cur_focus_label,
+                    cur_focus_state,
+                    cur_focus_ref,
+                    cur_digest,
+                    cur_tool,
+                    cur_cron,
+                    cur_drift,
+                ) = existing
 
             conn.execute("BEGIN;")
             conn.execute(
                 """
                 INSERT INTO status (
                     id, active_kanban_task_id, active_workspace,
-                    active_project_slug, last_tool_invocation,
+                    active_project_slug, focus_label, focus_state,
+                    focus_ref, recent_activity_digest, last_tool_invocation,
                     last_cron_job_id, recent_drift_signals, status_updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    active_kanban_task_id = excluded.active_kanban_task_id,
-                    active_workspace      = excluded.active_workspace,
-                    active_project_slug   = excluded.active_project_slug,
-                    last_tool_invocation  = excluded.last_tool_invocation,
-                    last_cron_job_id      = excluded.last_cron_job_id,
-                    status_updated_at     = excluded.status_updated_at
+                    active_kanban_task_id  = excluded.active_kanban_task_id,
+                    active_workspace       = excluded.active_workspace,
+                    active_project_slug    = excluded.active_project_slug,
+                    focus_label            = excluded.focus_label,
+                    focus_state            = excluded.focus_state,
+                    focus_ref              = excluded.focus_ref,
+                    recent_activity_digest = excluded.recent_activity_digest,
+                    last_tool_invocation   = excluded.last_tool_invocation,
+                    last_cron_job_id       = excluded.last_cron_job_id,
+                    status_updated_at      = excluded.status_updated_at
                 """,
                 (
                     _clip(active_kanban_task_id) if active_kanban_task_id is not None else cur_task,
                     _clip(active_workspace) if active_workspace is not None else cur_ws,
                     _clip(active_project_slug) if active_project_slug is not None else cur_project,
+                    _clip(focus_label, MAX_FOCUS_LABEL_CHARS) if focus_label is not None else cur_focus_label,
+                    _clip(focus_state, MAX_FOCUS_STATE_CHARS) if focus_state is not None else cur_focus_state,
+                    _clip(focus_ref, MAX_FOCUS_REF_CHARS) if focus_ref is not None else cur_focus_ref,
+                    _clip(recent_activity_digest, MAX_DIGEST_CHARS) if recent_activity_digest is not None else cur_digest,
                     _clip(last_tool_invocation) if last_tool_invocation is not None else cur_tool,
                     _clip(last_cron_job_id) if last_cron_job_id is not None else cur_cron,
                     cur_drift if cur_drift is not None else "[]",
@@ -646,8 +803,14 @@ def derive_status_from_tool_call(
 
     # --- Cron -------------------------------------------------------------
     if tool_name == "cronjob":
-        out["last_tool_invocation"] = "cronjob"
         action = args_d.get("action") if isinstance(args_d.get("action"), str) else ""
+        action = action.strip().lower()
+        # Listing/polling cron jobs is low-signal heartbeat noise; don't let it
+        # become top-level focus or drift.
+        if action in {"list", "status"}:
+            return {}
+
+        out["last_tool_invocation"] = "cronjob"
         # Prefer result.job_id (returned by create); fall back to args.job_id
         # (passed for update/remove/run/etc).
         jid: Optional[str] = None
@@ -741,16 +904,142 @@ def _fmt_age_seconds(ts: float) -> int:
         return -1
 
 
+def _xml_attr(value: Any, limit: int = MAX_FIELD_CHARS) -> str:
+    """Bound + XML-escape an attribute value."""
+    clipped = _clip(value, limit) or ""
+    return html.escape(clipped, quote=True)
+
+
+def _xml_text(value: Any, limit: int = MAX_FIELD_CHARS) -> str:
+    clipped = _clip(value, limit) or ""
+    return html.escape(clipped, quote=False)
+
+
+def _attrs(items: List[Tuple[str, Any, int]]) -> str:
+    parts = []
+    for key, value, limit in items:
+        if isinstance(value, str) and value.strip():
+            parts.append(f'{key}="{_xml_attr(value, limit)}"')
+        elif isinstance(value, (int, float)):
+            parts.append(f'{key}="{value}"')
+    return " ".join(parts)
+
+
+def _session_is_heartbeat(sess: Dict[str, Any]) -> bool:
+    cls = sess.get("activity_class")
+    if isinstance(cls, str) and cls.strip().lower() == "heartbeat":
+        return True
+    tool = sess.get("last_tool_invocation")
+    has_pointer = any(
+        isinstance(sess.get(key), str) and sess.get(key).strip()
+        for key in (
+            "active_project_slug",
+            "active_kanban_task_id",
+            "active_workspace",
+            "focus_label",
+            "focus_state",
+            "focus_ref",
+        )
+    )
+    return tool == "pre_llm_call" and not has_pointer
+
+
+def _compact_render(
+    *,
+    iso: str,
+    age: int,
+    record: Dict[str, Any],
+    fresh_status: bool,
+    sessions: List[Dict[str, Any]],
+    include_digest: bool = True,
+    include_events: bool = True,
+    session_limit: int = MAX_ACTIVE_SESSIONS,
+) -> str:
+    """Render in priority order; caller can drop optional sections to fit budget."""
+    lines: List[str] = [
+        f'<status updated_iso="{_xml_attr(iso, 40)}" age_seconds="{age}" '
+        'confidence="pointer" scope="current-work">'
+    ]
+    lines.append('  <note kind="verification">verify_refs_before_acting; no_memory_facts</note>')
+
+    if fresh_status:
+        focus_attrs = _attrs([
+            ("project", record.get("active_project_slug"), MAX_FIELD_CHARS),
+            ("task", record.get("active_kanban_task_id"), 80),
+            ("workspace", record.get("active_workspace"), MAX_FIELD_CHARS),
+            ("label", record.get("focus_label"), MAX_FOCUS_LABEL_CHARS),
+            ("state", record.get("focus_state"), MAX_FOCUS_STATE_CHARS),
+            ("ref", record.get("focus_ref"), MAX_FOCUS_REF_CHARS),
+            ("last_tool", record.get("last_tool_invocation"), 80),
+            ("last_cron", record.get("last_cron_job_id"), 80),
+        ])
+        if focus_attrs:
+            lines.append(f"  <focus {focus_attrs} />")
+
+    hidden_heartbeat = sum(1 for sess in sessions if _session_is_heartbeat(sess))
+    meaningful_sessions = [sess for sess in sessions if not _session_is_heartbeat(sess)]
+    rendered_sessions = meaningful_sessions[:session_limit]
+    if not rendered_sessions and sessions:
+        # If all we know is current-session liveness, keep one row so a fresh
+        # newly-started session still has a visible posture pointer.
+        rendered_sessions = sessions[:1]
+        hidden_heartbeat = max(0, hidden_heartbeat - len(rendered_sessions))
+
+    if rendered_sessions or hidden_heartbeat:
+        lines.append(
+            f'  <sessions total="{len(sessions)}" rendered="{len(rendered_sessions)}" '
+            f'hidden_heartbeat="{hidden_heartbeat}">'
+        )
+        for sess in rendered_sessions:
+            seen = sess.get("last_seen_at")
+            age_s: Any = _fmt_age_seconds(float(seen)) if isinstance(seen, (int, float)) else ""
+            session_attrs = _attrs([
+                ("id", sess.get("session_id"), 80),
+                ("surface", sess.get("surface"), 40),
+                ("class", sess.get("activity_class") or ("heartbeat" if _session_is_heartbeat(sess) else "work"), 40),
+                ("project", sess.get("active_project_slug"), MAX_FIELD_CHARS),
+                ("task", sess.get("active_kanban_task_id"), 80),
+                ("focus", sess.get("focus_label"), MAX_FOCUS_LABEL_CHARS),
+                ("ref", sess.get("focus_ref"), MAX_FOCUS_REF_CHARS),
+                ("last_tool", sess.get("last_tool_invocation"), 80),
+                ("age_s", age_s, 20),
+            ])
+            if session_attrs:
+                lines.append(f"    <session {session_attrs} />")
+        lines.append("  </sessions>")
+
+    if include_events and fresh_status:
+        signals = record.get("recent_drift_signals") or []
+        if isinstance(signals, list):
+            events = [s for s in signals[-MAX_RENDERED_EVENTS:] if isinstance(s, str) and s.strip()]
+        else:
+            events = []
+        if events:
+            lines.append(f'  <events count="{len(events)}">')
+            for sig in events:
+                lines.append(f"    <event>{_xml_text(sig, MAX_DRIFT_SIGNAL_CHARS)}</event>")
+            lines.append("  </events>")
+
+    if include_digest and fresh_status:
+        digest = record.get("recent_activity_digest")
+        if isinstance(digest, str) and digest.strip():
+            lines.append(f'  <digest text="{_xml_attr(digest, MAX_DIGEST_CHARS)}" />')
+
+    lines.append("</status>")
+    return "\n".join(lines)
+
+
 def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
-    """Render fresh status/session pointers as a fenced ``<system_status>`` block.
+    """Render fresh status/session pointers as compact XML-ish current-work data.
 
     Returns an empty string when no status row or active-session row is fresh.
     Stale task/project state is never rendered just because the current
-    session is fresh.
+    session is fresh. Rendering is priority-based: focus first, then meaningful
+    sessions, then optional events/digest. It should not hard-truncate.
     """
     try:
         record = read_status()
-        sessions = read_active_sessions(ttl_seconds=ttl_seconds)
+        sessions = read_active_sessions(ttl_seconds=ttl_seconds, limit=MAX_ACTIVE_SESSIONS * 4)
     except Exception:  # pragma: no cover — callees already swallow
         return ""
 
@@ -772,66 +1061,36 @@ def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
     age = _fmt_age_seconds(anchor_ts)
     iso = _fmt_iso(anchor_ts)
 
-    lines: List[str] = []
-    lines.append(f"<system_status updated_iso=\"{iso}\" age_seconds=\"{age}\">")
-    lines.append(
-        "  Operational hints from the local status ledger. Treat as a "
-        "low-confidence pointer, not canonical truth. Verify with the "
-        "relevant tool before acting on it."
+    # First pass: full compact block. Then drop optional sections rather than
+    # using a misleading hard truncation marker.
+    for include_events, include_digest, session_limit in (
+        (True, True, MAX_ACTIVE_SESSIONS),
+        (False, True, MAX_ACTIVE_SESSIONS),
+        (False, False, MAX_ACTIVE_SESSIONS),
+        (False, False, 2),
+        (False, False, 1),
+    ):
+        block = _compact_render(
+            iso=iso,
+            age=age,
+            record=record,
+            fresh_status=fresh_status,
+            sessions=sessions,
+            include_events=include_events,
+            include_digest=include_digest,
+            session_limit=session_limit,
+        )
+        if len(block) <= BLOCK_CHAR_BUDGET:
+            return block
+
+    # Last resort: return the strictly highest-priority focus note only.
+    return _compact_render(
+        iso=iso,
+        age=age,
+        record=record,
+        fresh_status=fresh_status,
+        sessions=[],
+        include_events=False,
+        include_digest=False,
+        session_limit=0,
     )
-
-    def _add(key: str, label: str) -> None:
-        val = record.get(key)
-        if isinstance(val, str) and val.strip():
-            lines.append(f"  {label}: {val.strip()[:MAX_FIELD_CHARS]}")
-
-    if fresh_status:
-        _add("active_project_slug", "active_project_slug")
-        _add("active_kanban_task_id", "active_kanban_task_id")
-        _add("active_workspace", "active_workspace")
-        _add("last_tool_invocation", "last_tool_invocation")
-        _add("last_cron_job_id", "last_cron_job_id")
-
-        signals = record.get("recent_drift_signals") or []
-        if isinstance(signals, list) and signals:
-            lines.append("  recent_drift_signals:")
-            # Show newest last (chronological).
-            for sig in signals[-MAX_DRIFT_SIGNALS:]:
-                if isinstance(sig, str) and sig.strip():
-                    lines.append(f"    - {sig.strip()[:MAX_DRIFT_SIGNAL_CHARS]}")
-
-    if sessions:
-        lines.append("  active_sessions:")
-        # Oldest first for readable chronology within the already-bounded set.
-        for sess in reversed(sessions[-MAX_ACTIVE_SESSIONS:]):
-            bits = []
-            sid = sess.get("session_id")
-            if isinstance(sid, str) and sid.strip():
-                bits.append(f"session_id={sid.strip()[:80]}")
-            surface = sess.get("surface")
-            if isinstance(surface, str) and surface.strip():
-                bits.append(f"surface={surface.strip()[:40]}")
-            project = sess.get("active_project_slug")
-            if isinstance(project, str) and project.strip():
-                bits.append(f"project={project.strip()[:120]}")
-            task = sess.get("active_kanban_task_id")
-            if isinstance(task, str) and task.strip():
-                bits.append(f"task={task.strip()[:80]}")
-            tool = sess.get("last_tool_invocation")
-            if isinstance(tool, str) and tool.strip():
-                bits.append(f"last_tool={tool.strip()[:80]}")
-            seen = sess.get("last_seen_at")
-            if isinstance(seen, (int, float)):
-                bits.append(f"age_seconds={_fmt_age_seconds(float(seen))}")
-            if bits:
-                lines.append("    - " + " ".join(bits))
-
-    lines.append("</system_status>")
-
-    block = "\n".join(lines)
-    if len(block) > BLOCK_CHAR_BUDGET:
-        # Hard-truncate. Keep the opening tag + a truncated body + closing tag
-        # so the block stays parseable.
-        body_cap = BLOCK_CHAR_BUDGET - len("</system_status>") - 4
-        block = block[:body_cap].rstrip() + "\n  [truncated]\n</system_status>"
-    return block
