@@ -952,6 +952,27 @@ def _session_is_heartbeat(sess: Dict[str, Any]) -> bool:
     return _session_is_low_signal(sess)
 
 
+def _current_surface_session(
+    sessions: List[Dict[str, Any]],
+    current_session_id: str = "",
+    current_surface: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Find the row that represents *this* pre-LLM call, if available.
+
+    Exact session id wins. Surface-only fallback is intentionally weak: use the
+    freshest matching row only when the caller cannot provide a session id.
+    """
+    if current_session_id:
+        for sess in sessions:
+            if sess.get("session_id") == current_session_id:
+                return sess
+    if not current_session_id and current_surface:
+        for sess in sessions:
+            if sess.get("surface") == current_surface:
+                return sess
+    return None
+
+
 def _compact_render(
     *,
     iso: str,
@@ -959,6 +980,8 @@ def _compact_render(
     record: Dict[str, Any],
     fresh_status: bool,
     sessions: List[Dict[str, Any]],
+    current_session_id: str = "",
+    current_surface: str = "",
     include_digest: bool = True,
     include_events: bool = True,
     session_limit: int = MAX_ACTIVE_SESSIONS,
@@ -973,10 +996,11 @@ def _compact_render(
     if fresh_status:
         last_tool = record.get("last_tool_invocation")
         # Maintenance cron activity is useful as an event, but should not
-        # dominate the top-level focus line.
+        # dominate the global focus line.
         if last_tool == "cronjob":
             last_tool = ""
         focus_attrs = _attrs([
+            ("scope", "global", 20),
             ("project", record.get("active_project_slug"), MAX_FIELD_CHARS),
             ("task", record.get("active_kanban_task_id"), 80),
             ("workspace", record.get("active_workspace"), MAX_FIELD_CHARS),
@@ -986,17 +1010,50 @@ def _compact_render(
             ("last_tool", last_tool, 80),
         ])
         if focus_attrs:
-            lines.append(f"  <focus {focus_attrs} />")
+            lines.append(f"  <global_focus {focus_attrs} />")
 
-    hidden_low_signal = sum(1 for sess in sessions if _session_is_low_signal(sess))
-    meaningful_sessions = [sess for sess in sessions if not _session_is_low_signal(sess)]
+    surface_session = _current_surface_session(sessions, current_session_id, current_surface)
+    surface_session_id = ""
+    if surface_session:
+        surface_session_id = str(surface_session.get("session_id") or "")
+    surface_id = current_session_id or surface_session_id
+    surface = current_surface or (surface_session.get("surface") if surface_session else "")
+    if surface_id or surface:
+        seen = surface_session.get("last_seen_at") if surface_session else None
+        age_s: Any = _fmt_age_seconds(float(seen)) if isinstance(seen, (int, float)) else ""
+        activity_class = "active_chat"
+        if surface_session:
+            raw_class = surface_session.get("activity_class")
+            if isinstance(raw_class, str) and raw_class.strip():
+                activity_class = raw_class
+        surface_attrs = _attrs([
+            ("scope", "surface", 20),
+            ("surface", surface, 40),
+            ("session", surface_id, 80),
+            ("class", activity_class, 40),
+            ("project", surface_session.get("active_project_slug") if surface_session else "", MAX_FIELD_CHARS),
+            ("task", surface_session.get("active_kanban_task_id") if surface_session else "", 80),
+            ("focus", surface_session.get("focus_label") if surface_session else "", MAX_FOCUS_LABEL_CHARS),
+            ("ref", surface_session.get("focus_ref") if surface_session else "", MAX_FOCUS_REF_CHARS),
+            ("last_tool", surface_session.get("last_tool_invocation") if surface_session else "", 80),
+            ("age_s", age_s, 20),
+        ])
+        if surface_attrs:
+            lines.append(f"  <surface_focus {surface_attrs} />")
+
+    sessions_for_list = [
+        sess for sess in sessions
+        if not surface_session_id or sess.get("session_id") != surface_session_id
+    ]
+    hidden_low_signal = sum(1 for sess in sessions_for_list if _session_is_low_signal(sess))
+    meaningful_sessions = [sess for sess in sessions_for_list if not _session_is_low_signal(sess)]
     rendered_sessions = meaningful_sessions[:session_limit]
-    if not rendered_sessions and sessions and not fresh_status:
+    if not rendered_sessions and sessions_for_list and not fresh_status:
         # If all we know is current-session liveness and there is no fresh
-        # focus row, keep one row so a newly-started session still has a
-        # visible posture pointer. If a fresh focus exists, hide maintenance
-        # rows entirely.
-        rendered_sessions = sessions[:1]
+        # focus row, keep one non-current row so a newly-started session still
+        # has a visible posture pointer. If the only fresh row is the current
+        # surface pre_llm_call, surface_focus already represents it.
+        rendered_sessions = sessions_for_list[:1]
         hidden_low_signal = max(0, hidden_low_signal - len(rendered_sessions))
 
     if rendered_sessions or hidden_low_signal:
@@ -1043,13 +1100,18 @@ def _compact_render(
     return "\n".join(lines)
 
 
-def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
+def render_status_block(
+    ttl_seconds: float = 4 * 3600,
+    current_session_id: str = "",
+    current_surface: str = "",
+) -> str:
     """Render fresh status/session pointers as compact XML-ish current-work data.
 
     Returns an empty string when no status row or active-session row is fresh.
     Stale task/project state is never rendered just because the current
-    session is fresh. Rendering is priority-based: focus first, then meaningful
-    sessions, then optional events/digest. It should not hard-truncate.
+    session is fresh. Rendering is priority-based: global focus first,
+    then this-surface focus, then meaningful sessions, then optional
+    events/digest. It should not hard-truncate.
     """
     try:
         record = read_status()
@@ -1090,6 +1152,8 @@ def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
             record=record,
             fresh_status=fresh_status,
             sessions=sessions,
+            current_session_id=current_session_id,
+            current_surface=current_surface,
             include_events=include_events,
             include_digest=include_digest,
             session_limit=session_limit,
@@ -1104,6 +1168,8 @@ def render_status_block(ttl_seconds: float = 4 * 3600) -> str:
         record=record,
         fresh_status=fresh_status,
         sessions=[],
+        current_session_id=current_session_id,
+        current_surface=current_surface,
         include_events=False,
         include_digest=False,
         session_limit=0,

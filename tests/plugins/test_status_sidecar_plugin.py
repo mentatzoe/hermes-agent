@@ -345,7 +345,7 @@ class TestRenderBlock:
         assert "active_project_slug:" not in block
         assert "[truncated]" not in block
         assert len(block) <= ss.BLOCK_CHAR_BUDGET
-        assert "<focus " in block
+        assert "<global_focus " in block
         assert "TurnAware Multica setup" in block
         assert "repo:mentatzoe/turnaware" in block
         assert "<sessions " in block
@@ -372,6 +372,82 @@ class TestRenderBlock:
         assert "url:http://100.107.255.109:9999/dashboard" in block
         assert "Hindsight UI browser-verified" in block
 
+    def test_global_and_surface_focus_are_explicitly_distinct(self, _isolate_env):
+        ss = _load_lib()
+        ss.write_status(
+            active_workspace="/Users/zmll/github/turnaware",
+            active_project_slug="github/turnaware",
+            focus_label="TurnAware Multica setup",
+            focus_state="GH app install still pending",
+            focus_ref="workspace=turnaware",
+            last_tool_invocation="write_file:turnaware-grok-one-shot-prompt.md",
+        )
+        ss.touch_session(
+            session_id="current-dm-session",
+            surface="discord",
+            model="gpt-5.5",
+            last_tool_invocation="pre_llm_call",
+        )
+        ss.touch_session(
+            session_id="other-hermes-session",
+            surface="discord",
+            activity_class="work",
+            active_project_slug="hermes-agent",
+            focus_label="status-sidecar schema refinement",
+            focus_ref="https://github.com/mentatzoe/hermes-agent/pull/4",
+            last_tool_invocation="patch:status_sidecar.py",
+        )
+
+        block = ss.render_status_block(
+            ttl_seconds=3600,
+            current_session_id="current-dm-session",
+            current_surface="discord",
+        )
+
+        assert "<global_focus " in block
+        global_line = next(line for line in block.splitlines() if "<global_focus " in line)
+        assert "TurnAware Multica setup" in global_line
+        assert "scope=\"global\"" in global_line
+
+        assert "<surface_focus " in block
+        surface_line = next(line for line in block.splitlines() if "<surface_focus " in line)
+        assert "surface=\"discord\"" in surface_line
+        assert "session=\"current-dm-session\"" in surface_line
+        assert "scope=\"surface\"" in surface_line
+        assert "TurnAware Multica setup" not in surface_line
+
+        # Other meaningful sessions remain visible separately; the current
+        # low-signal pre_llm_call row is represented by surface_focus instead
+        # of pretending it is a work session.
+        assert "other-hermes-session" in block
+        assert "current-dm-session" not in next(
+            line for line in block.splitlines() if "<sessions " in line
+        )
+
+    def test_surface_focus_does_not_mix_unknown_session_with_other_surface_row(self, _isolate_env):
+        ss = _load_lib()
+        ss.write_status(active_project_slug="github/turnaware")
+        ss.touch_session(
+            session_id="other-discord-session",
+            surface="discord",
+            activity_class="work",
+            active_project_slug="hermes-agent",
+            focus_label="other work",
+            last_tool_invocation="patch:README.md",
+        )
+
+        block = ss.render_status_block(
+            ttl_seconds=3600,
+            current_session_id="current-session-not-yet-recorded",
+            current_surface="discord",
+        )
+
+        surface_line = next(line for line in block.splitlines() if "<surface_focus " in line)
+        assert "session=\"current-session-not-yet-recorded\"" in surface_line
+        assert "surface=\"discord\"" in surface_line
+        assert "hermes-agent" not in surface_line
+        assert "other work" not in surface_line
+
     def test_maintenance_cron_does_not_dominate_focus_or_sessions(self, _isolate_env):
         ss = _load_lib()
         ss.write_status(
@@ -389,7 +465,7 @@ class TestRenderBlock:
 
         block = ss.render_status_block(ttl_seconds=3600)
         assert "status-sidecar compact schema live" in block
-        focus_line = next(line for line in block.splitlines() if "<focus " in line)
+        focus_line = next(line for line in block.splitlines() if "<global_focus " in line)
         assert "last_tool=\"cronjob\"" not in focus_line
         assert "last_cron=" not in focus_line
         assert "maintenance-cron-session" not in block
