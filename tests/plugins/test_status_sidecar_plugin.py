@@ -350,7 +350,7 @@ class TestRenderBlock:
         assert "repo:mentatzoe/turnaware" in block
         assert "<sessions " in block
         assert "meaningful-session" in block
-        assert "hidden_heartbeat=" in block
+        assert "hidden_low_signal=" in block
         assert "<digest " in block
 
     def test_status_update_focus_fields_round_trip_and_render(self, _isolate_env):
@@ -371,6 +371,48 @@ class TestRenderBlock:
         assert "temporary process" in block
         assert "url:http://100.107.255.109:9999/dashboard" in block
         assert "Hindsight UI browser-verified" in block
+
+    def test_maintenance_cron_does_not_dominate_focus_or_sessions(self, _isolate_env):
+        ss = _load_lib()
+        ss.write_status(
+            active_project_slug="hermes-agent/status-sidecar",
+            focus_label="status-sidecar compact schema live",
+            last_tool_invocation="cronjob",
+            last_cron_job_id="job_maintenance",
+        )
+        ss.append_drift_signal("cronjob remove job_maintenance")
+        ss.touch_session(
+            session_id="maintenance-cron-session",
+            surface="discord",
+            last_tool_invocation="cronjob",
+        )
+
+        block = ss.render_status_block(ttl_seconds=3600)
+        assert "status-sidecar compact schema live" in block
+        focus_line = next(line for line in block.splitlines() if "<focus " in line)
+        assert "last_tool=\"cronjob\"" not in focus_line
+        assert "last_cron=" not in focus_line
+        assert "maintenance-cron-session" not in block
+        assert "hidden_low_signal=\"1\"" in block
+
+    def test_pointerless_tool_session_is_hidden_when_focus_exists(self, _isolate_env):
+        ss = _load_lib()
+        ss.write_status(
+            active_project_slug="hermes-agent/status-sidecar",
+            focus_label="status-sidecar compact schema live",
+            last_tool_invocation="maintenance_cron_focus_fix_verified",
+        )
+        ss.touch_session(
+            session_id="pointerless-tool-session",
+            surface="discord",
+            last_tool_invocation="write_file:pr-body.md",
+        )
+
+        block = ss.render_status_block(ttl_seconds=3600)
+        assert "status-sidecar compact schema live" in block
+        assert "pointerless-tool-session" not in block
+        assert "write_file:pr-body.md" not in block
+        assert "hidden_low_signal=\"1\"" in block
 
 
 # ---------------------------------------------------------------------------

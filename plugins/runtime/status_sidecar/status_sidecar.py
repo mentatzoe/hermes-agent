@@ -309,8 +309,11 @@ def _infer_activity_class(
         )
     )
     tool = last_tool_invocation if isinstance(last_tool_invocation, str) else ""
-    if not has_pointer and tool == "pre_llm_call":
-        return "heartbeat"
+    if not has_pointer:
+        if tool == "pre_llm_call":
+            return "heartbeat"
+        if tool:
+            return "maintenance"
     if has_pointer:
         return "work"
     return "tool"
@@ -925,9 +928,9 @@ def _attrs(items: List[Tuple[str, Any, int]]) -> str:
     return " ".join(parts)
 
 
-def _session_is_heartbeat(sess: Dict[str, Any]) -> bool:
+def _session_is_low_signal(sess: Dict[str, Any]) -> bool:
     cls = sess.get("activity_class")
-    if isinstance(cls, str) and cls.strip().lower() == "heartbeat":
+    if isinstance(cls, str) and cls.strip().lower() in {"heartbeat", "maintenance"}:
         return True
     tool = sess.get("last_tool_invocation")
     has_pointer = any(
@@ -941,7 +944,12 @@ def _session_is_heartbeat(sess: Dict[str, Any]) -> bool:
             "focus_ref",
         )
     )
-    return tool == "pre_llm_call" and not has_pointer
+    return isinstance(tool, str) and bool(tool.strip()) and not has_pointer
+
+
+def _session_is_heartbeat(sess: Dict[str, Any]) -> bool:
+    """Backward-compatible alias for older callers/tests."""
+    return _session_is_low_signal(sess)
 
 
 def _compact_render(
@@ -963,6 +971,11 @@ def _compact_render(
     lines.append('  <note kind="verification">verify_refs_before_acting; no_memory_facts</note>')
 
     if fresh_status:
+        last_tool = record.get("last_tool_invocation")
+        # Maintenance cron activity is useful as an event, but should not
+        # dominate the top-level focus line.
+        if last_tool == "cronjob":
+            last_tool = ""
         focus_attrs = _attrs([
             ("project", record.get("active_project_slug"), MAX_FIELD_CHARS),
             ("task", record.get("active_kanban_task_id"), 80),
@@ -970,25 +983,26 @@ def _compact_render(
             ("label", record.get("focus_label"), MAX_FOCUS_LABEL_CHARS),
             ("state", record.get("focus_state"), MAX_FOCUS_STATE_CHARS),
             ("ref", record.get("focus_ref"), MAX_FOCUS_REF_CHARS),
-            ("last_tool", record.get("last_tool_invocation"), 80),
-            ("last_cron", record.get("last_cron_job_id"), 80),
+            ("last_tool", last_tool, 80),
         ])
         if focus_attrs:
             lines.append(f"  <focus {focus_attrs} />")
 
-    hidden_heartbeat = sum(1 for sess in sessions if _session_is_heartbeat(sess))
-    meaningful_sessions = [sess for sess in sessions if not _session_is_heartbeat(sess)]
+    hidden_low_signal = sum(1 for sess in sessions if _session_is_low_signal(sess))
+    meaningful_sessions = [sess for sess in sessions if not _session_is_low_signal(sess)]
     rendered_sessions = meaningful_sessions[:session_limit]
-    if not rendered_sessions and sessions:
-        # If all we know is current-session liveness, keep one row so a fresh
-        # newly-started session still has a visible posture pointer.
+    if not rendered_sessions and sessions and not fresh_status:
+        # If all we know is current-session liveness and there is no fresh
+        # focus row, keep one row so a newly-started session still has a
+        # visible posture pointer. If a fresh focus exists, hide maintenance
+        # rows entirely.
         rendered_sessions = sessions[:1]
-        hidden_heartbeat = max(0, hidden_heartbeat - len(rendered_sessions))
+        hidden_low_signal = max(0, hidden_low_signal - len(rendered_sessions))
 
-    if rendered_sessions or hidden_heartbeat:
+    if rendered_sessions or hidden_low_signal:
         lines.append(
             f'  <sessions total="{len(sessions)}" rendered="{len(rendered_sessions)}" '
-            f'hidden_heartbeat="{hidden_heartbeat}">'
+            f'hidden_low_signal="{hidden_low_signal}">'
         )
         for sess in rendered_sessions:
             seen = sess.get("last_seen_at")
@@ -996,7 +1010,7 @@ def _compact_render(
             session_attrs = _attrs([
                 ("id", sess.get("session_id"), 80),
                 ("surface", sess.get("surface"), 40),
-                ("class", sess.get("activity_class") or ("heartbeat" if _session_is_heartbeat(sess) else "work"), 40),
+                ("class", sess.get("activity_class") or ("heartbeat" if _session_is_low_signal(sess) else "work"), 40),
                 ("project", sess.get("active_project_slug"), MAX_FIELD_CHARS),
                 ("task", sess.get("active_kanban_task_id"), 80),
                 ("focus", sess.get("focus_label"), MAX_FOCUS_LABEL_CHARS),
