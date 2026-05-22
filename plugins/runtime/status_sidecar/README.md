@@ -124,16 +124,14 @@ The plugin is **opt-in**. Activation is a two-step manual operation
 because plugin discovery happens once at startup; an agent cannot
 self-activate it.
 
-### Step 1: merge / cherry-pick
+### Step 1: merge the reviewed branch
 
 ```bash
-# Option A: merge the branch into the installed checkout
 cd /Users/zmll/.hermes/hermes-agent
 git merge --ff-only feat/status-sidecar-sqlite-reconciled
-
-# Option B: cherry-pick just the relevant commits
-git cherry-pick <status-sidecar-commit-sha>
 ```
+
+Activation handle for this branch is deliberately simple: merge, enable, Zoe restarts. Do not present cherry-pick as the normal path; it makes the operator handoff sound more complex than it is.
 
 ### Step 2: enable the plugin
 
