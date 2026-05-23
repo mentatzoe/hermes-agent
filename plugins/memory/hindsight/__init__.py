@@ -583,6 +583,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
+        self._bank_retain_mission_applied_for: tuple[str, str] | None = None
         self._bank_id_template = ""
 
     @property
@@ -1013,6 +1014,41 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    def _apply_bank_retain_mission_config(self) -> None:
+        """Persist the configured retain mission on the Hindsight bank config."""
+        mission = self._bank_retain_mission
+        if not mission:
+            return
+        applied_key = (self._bank_id, mission)
+        if self._bank_retain_mission_applied_for == applied_key:
+            return
+
+        def _update(client):
+            update_bank_config = getattr(client, "update_bank_config", None)
+            if not callable(update_bank_config):
+                raise RuntimeError("Hindsight client does not support update_bank_config(retain_mission=...)")
+            result = update_bank_config(bank_id=self._bank_id, retain_mission=mission)
+            if asyncio.iscoroutine(result):
+                return self._run_sync(result)
+            return result
+
+        client = self._get_client()
+        try:
+            _update(client)
+        except Exception as exc:
+            if not self._is_retriable_embedded_connection_error(exc):
+                raise
+            logger.info(
+                "Hindsight embedded daemon appears unreachable while applying retain mission; "
+                "recreating client and retrying once: %s",
+                exc,
+            )
+            self._client = None
+            _update(self._get_client())
+
+        self._bank_retain_mission_applied_for = applied_key
+        logger.info("Applied Hindsight bank retain mission to bank=%s", self._bank_id)
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -1199,6 +1235,8 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
+        if self._mode != "local_embedded":
+            self._apply_bank_retain_mission_config()
 
         # For local mode, start the embedded daemon in the background so it
         # doesn't block the chat. Redirect stdout/stderr to a log file to
@@ -1236,6 +1274,7 @@ class HindsightMemoryProvider(MemoryProvider):
                             client._manager.stop(profile)
 
                     client._ensure_started()
+                    self._apply_bank_retain_mission_config()
                     with open(log_path, "a") as f:
                         f.write("\n=== Daemon started successfully ===\n")
                 except Exception as e:

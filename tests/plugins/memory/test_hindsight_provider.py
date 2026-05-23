@@ -8,7 +8,7 @@ turn counting, tags), and schema completeness.
 import json
 import re
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -75,6 +75,7 @@ def _make_mock_client():
         return_value=SimpleNamespace(text="Synthesized answer")
     )
     client.aretain_batch = AsyncMock()
+    client.update_bank_config = MagicMock(return_value={"ok": True})
     client.aclose = AsyncMock()
     return client
 
@@ -219,7 +220,6 @@ class TestConfig:
             auto_recall=False,
             retain_every_n_turns=3,
             retain_context="custom-ctx",
-            bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
@@ -237,12 +237,142 @@ class TestConfig:
         assert p._auto_recall is False
         assert p._retain_every_n_turns == 3
         assert p._retain_context == "custom-ctx"
-        assert p._bank_retain_mission == "Extract key facts"
+        assert p._bank_retain_mission is None
         assert p._recall_max_tokens == 2048
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
+
+    def test_initialize_applies_configured_bank_retain_mission_once(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+            "bank_retain_mission": "Extract durable preference facts only",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        client = _make_mock_client()
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def update_bank_config(self, **kwargs):
+                return client.update_bank_config(**kwargs)
+
+        monkeypatch.setitem(sys.modules, "hindsight_client", SimpleNamespace(Hindsight=FakeHindsight))
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        client.update_bank_config.assert_called_once_with(
+            bank_id="test-bank",
+            retain_mission="Extract durable preference facts only",
+        )
+
+    def test_initialize_skips_bank_config_update_when_retain_mission_unset(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        client = _make_mock_client()
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def update_bank_config(self, **kwargs):
+                return client.update_bank_config(**kwargs)
+
+        monkeypatch.setitem(sys.modules, "hindsight_client", SimpleNamespace(Hindsight=FakeHindsight))
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        client.update_bank_config.assert_not_called()
+
+    def test_local_embedded_applies_retain_mission_after_daemon_start(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "local_embedded",
+            "profile": "test-profile",
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+            "llm_api_key": "test-key",
+            "bank_id": "test-bank",
+            "bank_retain_mission": "Extract local embedded durable facts only",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+
+        events = []
+
+        class FakeManager:
+            def is_running(self, profile):
+                events.append(("is_running", profile))
+                return False
+
+            def stop(self, profile):
+                events.append(("stop", profile))
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self._manager = FakeManager()
+
+            def _ensure_started(self):
+                events.append(("ensure_started", None))
+
+            def update_bank_config(self, **kwargs):
+                events.append(("update_bank_config", kwargs))
+                return {"ok": True}
+
+        class ImmediateThread:
+            def __init__(self, target, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        fake_embed_pkg = ModuleType("hindsight_embed")
+        fake_embed_pkg.__path__ = []
+        fake_embed_daemon = ModuleType("hindsight_embed.daemon_embed_manager")
+        fake_embed_daemon.console = None
+        fake_embed_daemon.DaemonEmbedManager = object
+        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setitem(sys.modules, "hindsight_embed", fake_embed_pkg)
+        monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", fake_embed_daemon)
+        monkeypatch.setattr("plugins.memory.hindsight.threading.Thread", ImmediateThread)
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        assert events.index(("ensure_started", None)) < events.index(
+            (
+                "update_bank_config",
+                {
+                    "bank_id": "test-bank",
+                    "retain_mission": "Extract local embedded durable facts only",
+                },
+            )
+        )
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
