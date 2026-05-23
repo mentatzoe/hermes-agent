@@ -31,13 +31,17 @@ from __future__ import annotations
 import asyncio
 import atexit
 import importlib
+import inspect
 import json
 import logging
 import os
 import queue
+import sys
 import threading
+import time
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -452,6 +456,300 @@ def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: st
         encoding="utf-8",
     )
     return profile_env
+
+
+def _normalize_embedded_env_value(value: Any) -> str:
+    """Normalize env values before deciding whether daemon config drifted."""
+    text = str(value if value is not None else "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    return text.strip()
+
+
+def _canonical_embedded_env(values: dict[str, Any]) -> dict[str, str]:
+    """Return only daemon-managed env keys with daemon defaults filled in."""
+    canonical = {
+        str(key).strip(): _normalize_embedded_env_value(value)
+        for key, value in (values or {}).items()
+        if str(key).strip().startswith("HINDSIGHT_API_LLM_")
+        or str(key).strip() in {
+            "HINDSIGHT_API_LOG_LEVEL",
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
+        }
+    }
+    canonical.setdefault("HINDSIGHT_API_LOG_LEVEL", "info")
+    canonical.setdefault("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT", str(_DEFAULT_IDLE_TIMEOUT))
+    return canonical
+
+
+def _embedded_envs_equivalent(saved: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Return True when two profile env materializations are semantically equal."""
+    return _canonical_embedded_env(saved) == _canonical_embedded_env(expected)
+
+
+def _caller_path_summary() -> list[str]:
+    """Small caller stack summary suitable for structured daemon lifecycle logs."""
+    frames = []
+    for frame in inspect.stack()[2:8]:
+        frames.append(f"{frame.filename}:{frame.lineno}:{frame.function}")
+    return frames
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _daemon_port_from_manager(manager: Any, profile: str) -> int | None:
+    try:
+        url = str(manager.get_url(profile))
+        return int(url.rsplit(":", 1)[1].split("/", 1)[0])
+    except Exception:
+        return None
+
+
+def _daemon_health_snapshot(manager: Any, profile: str) -> dict[str, Any]:
+    start = time.monotonic()
+    try:
+        ok = bool(manager.is_running(profile))
+        return {"ok": ok, "elapsed_ms": int((time.monotonic() - start) * 1000)}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _emit_daemon_lifecycle_event(event: str, payload: dict[str, Any], log_path=None, *, level: int = logging.INFO) -> None:
+    line = f"{event} {json.dumps(payload, sort_keys=True)}"
+    logger.log(level, line)
+    if log_path is not None:
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{line}\n")
+        except Exception:
+            logger.debug("Failed to append Hindsight daemon diagnostic event", exc_info=True)
+
+
+def _install_embedded_daemon_diagnostics(manager: Any, *, profile: str = "hermes", log_path=None) -> None:
+    """Route embedded daemon lifecycle through Hermes diagnostic wrappers once.
+
+    Only replace the API launch command when this Python interpreter can import
+    the API package. Otherwise preserve upstream command resolution (dev
+    checkout, sibling binary, or uvx fallback) so diagnostics never make a
+    previously-startable daemon unstartable. Manager stop/port-reclaim wrappers
+    are installed alongside the command wrapper so every SIGTERM path that
+    Hermes can observe records a structured reason before delegating upstream.
+    """
+    if getattr(manager, "_hermes_diagnostics_installed", False):
+        return
+    original_find_api_command = getattr(manager, "_find_api_command", None)
+    if original_find_api_command is None:
+        return
+    try:
+        api_importable = importlib.util.find_spec("hindsight_api.main") is not None
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        api_importable = False
+    wrapper_path = Path(__file__).with_name("daemon_diagnostics.py")
+
+    if api_importable:
+        def _find_api_command_with_diagnostics():
+            return [sys.executable, str(wrapper_path)]
+
+        manager._find_api_command = _find_api_command_with_diagnostics
+    else:
+        logger.debug("Skipping Hindsight API command diagnostics wrapper; hindsight_api.main is not importable")
+
+    manager._hermes_original_find_api_command = original_find_api_command
+
+    original_stop = getattr(manager, "stop", None)
+    if original_stop is not None:
+        manager._hermes_original_stop = original_stop
+
+        def _stop_with_diagnostics(stop_profile: str) -> bool:
+            return _stop_embedded_daemon_with_diagnostics(
+                manager,
+                stop_profile,
+                reason="explicit-stop",
+                log_path=log_path,
+            )
+
+        manager.stop = _stop_with_diagnostics
+
+    original_clear_port = getattr(manager, "_clear_port", None)
+    if original_clear_port is not None:
+        manager._hermes_original_clear_port = original_clear_port
+
+        def _clear_port_with_diagnostics(port: int) -> bool:
+            return _clear_embedded_daemon_port_with_diagnostics(
+                manager,
+                port,
+                profile=profile,
+                log_path=log_path,
+            )
+
+        manager._clear_port = _clear_port_with_diagnostics
+
+    manager._hermes_diagnostics_installed = True
+
+
+def _clear_embedded_daemon_port_with_diagnostics(
+    manager: Any,
+    port: int,
+    *,
+    profile: str,
+    log_path=None,
+) -> bool:
+    """Clear a daemon port while logging the upstream SIGTERM decision.
+
+    Hindsight's startup path may reclaim an unhealthy listener before spawning a
+    replacement. This wrapper records that unhealthy-port reason before
+    delegating to the original port-clear implementation and records whether the
+    old PID is still alive afterward.
+    """
+    try:
+        port_in_use = bool(manager._is_port_in_use(port))
+    except Exception:
+        port_in_use = True
+    old_pid = None
+    if port_in_use and hasattr(manager, "_find_pid_on_port"):
+        try:
+            old_pid = manager._find_pid_on_port(port)
+        except Exception:
+            old_pid = None
+
+    if not port_in_use:
+        original_clear_port = getattr(manager, "_hermes_original_clear_port", None)
+        return bool(original_clear_port(port) if original_clear_port is not None else manager._clear_port(port))
+
+    before = {
+        "profile": profile,
+        "reason": "unhealthy-port",
+        "old_pid": old_pid,
+        "port": port,
+        "health_check": {"ok": False, "port_in_use": port_in_use},
+        "caller_path": _caller_path_summary(),
+    }
+    _emit_daemon_lifecycle_event("hindsight_daemon_stop", before, log_path)
+
+    original_clear_port = getattr(manager, "_hermes_original_clear_port", None)
+    cleared = bool(original_clear_port(port) if original_clear_port is not None else manager._clear_port(port))
+    overlap = bool(old_pid and _pid_alive(old_pid))
+    after = {
+        "profile": profile,
+        "reason": "unhealthy-port",
+        "old_pid": old_pid,
+        "port": port,
+        "stopped": cleared,
+        "old_pid_alive_after_stop": overlap,
+        "overlap": overlap,
+    }
+    if overlap:
+        after["diagnosis"] = "old PID alive but no LISTEN socket"
+    manager._hermes_last_stop_diagnostic = after.copy()
+    _emit_daemon_lifecycle_event(
+        "hindsight_daemon_stop_complete",
+        after,
+        log_path,
+        level=logging.WARNING if overlap or not cleared else logging.INFO,
+    )
+    return cleared
+
+
+def _emit_daemon_replacement_start_diagnostics(manager: Any, profile: str, log_path=None) -> None:
+    """Log the replacement-start boundary after ensure_started returns."""
+    last = getattr(manager, "_hermes_last_stop_diagnostic", None)
+    if not last:
+        return
+    port = last.get("port") or _daemon_port_from_manager(manager, profile)
+    old_pid = last.get("old_pid")
+    new_pid = None
+    if port is not None and hasattr(manager, "_find_pid_on_port"):
+        try:
+            new_pid = manager._find_pid_on_port(port)
+        except Exception:
+            new_pid = None
+    old_pid_alive = bool(old_pid and _pid_alive(old_pid))
+    overlap = bool(old_pid_alive and new_pid and new_pid != old_pid)
+    payload = {
+        "profile": profile,
+        "reason": last.get("reason", "startup-race"),
+        "old_pid": old_pid,
+        "new_pid": new_pid,
+        "port": port,
+        "old_pid_alive_at_start": old_pid_alive,
+        "overlap": overlap,
+    }
+    if overlap:
+        payload["diagnosis"] = "replacement started while old PID remained alive"
+    _emit_daemon_lifecycle_event(
+        "hindsight_daemon_replacement_start",
+        payload,
+        log_path,
+        level=logging.WARNING if overlap else logging.INFO,
+    )
+    manager._hermes_last_stop_diagnostic = None
+
+
+def _stop_embedded_daemon_with_diagnostics(
+    manager: Any,
+    profile: str,
+    *,
+    reason: str,
+    log_path=None,
+) -> bool:
+    """Stop an embedded daemon while recording why SIGTERM is about to be sent.
+
+    The underlying Hindsight manager owns the actual SIGTERM. This wrapper logs
+    the manager-visible state before calling stop(), then records whether the old
+    PID is still alive after the manager returns. The latter distinguishes the
+    health-critical "PID alive but no LISTEN socket" graceful-shutdown window.
+    """
+    port = _daemon_port_from_manager(manager, profile)
+    old_pid = None
+    if port is not None and hasattr(manager, "_find_pid_on_port"):
+        try:
+            old_pid = manager._find_pid_on_port(port)
+        except Exception:
+            old_pid = None
+    before = {
+        "profile": profile,
+        "reason": reason,
+        "old_pid": old_pid,
+        "port": port,
+        "health_check": _daemon_health_snapshot(manager, profile),
+        "caller_path": _caller_path_summary(),
+    }
+    _emit_daemon_lifecycle_event("hindsight_daemon_stop", before, log_path)
+
+    original_stop = getattr(manager, "_hermes_original_stop", None)
+    stopped = bool(original_stop(profile) if original_stop is not None else manager.stop(profile))
+    overlap = bool(old_pid and _pid_alive(old_pid))
+    after = {
+        "profile": profile,
+        "reason": reason,
+        "old_pid": old_pid,
+        "port": port,
+        "stopped": stopped,
+        "old_pid_alive_after_stop": overlap,
+        "overlap": overlap,
+    }
+    if overlap:
+        after["diagnosis"] = "old PID alive but no LISTEN socket"
+    manager._hermes_last_stop_diagnostic = after.copy()
+    _emit_daemon_lifecycle_event(
+        "hindsight_daemon_stop_complete",
+        after,
+        log_path,
+        level=logging.WARNING if overlap or not stopped else logging.INFO,
+    )
+    return stopped
 
 def _sanitize_bank_segment(value: str) -> str:
     """Sanitize a bank_id_template placeholder value.
@@ -1219,6 +1517,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
                     client = self._get_client()
                     profile = self._config.get("profile", "hermes")
+                    _install_embedded_daemon_diagnostics(client._manager, profile=profile, log_path=log_path)
 
                     # Update the profile .env to match our current config so
                     # the daemon always starts with the right settings.
@@ -1226,16 +1525,25 @@ class HindsightMemoryProvider(MemoryProvider):
                     profile_env = _embedded_profile_env_path(self._config)
                     expected_env = _build_embedded_profile_env(self._config)
                     saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    config_changed = not _embedded_envs_equivalent(saved, expected_env)
 
                     if config_changed:
                         profile_env = _materialize_embedded_profile_env(self._config)
                         if client._manager.is_running(profile):
-                            with open(log_path, "a") as f:
-                                f.write("\n=== Config changed, restarting daemon ===\n")
-                            client._manager.stop(profile)
+                            _stop_embedded_daemon_with_diagnostics(
+                                client._manager,
+                                profile,
+                                reason="config-drift",
+                                log_path=log_path,
+                            )
+                    else:
+                        logger.debug(
+                            "Hindsight embedded profile env already semantically equivalent for profile=%s; skipping restart",
+                            profile,
+                        )
 
                     client._ensure_started()
+                    _emit_daemon_replacement_start_diagnostics(client._manager, profile, log_path=log_path)
                     with open(log_path, "a") as f:
                         f.write("\n=== Daemon started successfully ===\n")
                 except Exception as e:

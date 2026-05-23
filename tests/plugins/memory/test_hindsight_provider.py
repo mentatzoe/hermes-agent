@@ -6,8 +6,13 @@ turn counting, tags), and schema completeness.
 """
 
 import json
+import logging
 import re
+import socket
+import subprocess
 import sys
+import textwrap
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,11 +23,14 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
-    _load_config,
     _build_embedded_profile_env,
+    _embedded_envs_equivalent,
+    _install_embedded_daemon_diagnostics,
+    _load_config,
     _normalize_retain_tags,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
+    _stop_embedded_daemon_with_diagnostics,
 )
 
 
@@ -38,7 +46,8 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
-        "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
+        "HINDSIGHT_API_LLM_BASE_URL", "HINDSIGHT_RETAIN_TAGS",
+        "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -273,6 +282,42 @@ class TestConfig:
 
         assert env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "42"
 
+    def test_embedded_profile_env_comparison_treats_quoted_defaults_as_equivalent(self):
+        saved = {
+            "HINDSIGHT_API_LLM_PROVIDER": "'openai'",
+            "HINDSIGHT_API_LLM_API_KEY": '"test-key"',
+            "HINDSIGHT_API_LLM_MODEL": "gpt-4o-mini",
+            "HINDSIGHT_API_LOG_LEVEL": "info",
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": "0",
+        }
+        expected = {
+            "HINDSIGHT_API_LLM_PROVIDER": "openai",
+            "HINDSIGHT_API_LLM_API_KEY": "test-key",
+            "HINDSIGHT_API_LLM_MODEL": "gpt-4o-mini",
+            # Log level is a daemon default; older materializers may omit it.
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": 0,
+        }
+
+        assert _embedded_envs_equivalent(saved, expected)
+
+    def test_embedded_profile_env_comparison_detects_meaningful_drift(self):
+        saved = {
+            "HINDSIGHT_API_LLM_PROVIDER": "openai",
+            "HINDSIGHT_API_LLM_API_KEY": "test-key",
+            "HINDSIGHT_API_LLM_MODEL": "old-model",
+            "HINDSIGHT_API_LOG_LEVEL": "info",
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": "0",
+        }
+        expected = {
+            "HINDSIGHT_API_LLM_PROVIDER": "openai",
+            "HINDSIGHT_API_LLM_API_KEY": "test-key",
+            "HINDSIGHT_API_LLM_MODEL": "new-model",
+            "HINDSIGHT_API_LOG_LEVEL": "info",
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT": "0",
+        }
+
+        assert not _embedded_envs_equivalent(saved, expected)
+
     def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
         captured = {}
 
@@ -298,6 +343,342 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+
+
+class TestEmbeddedDaemonDiagnostics:
+    def test_install_diagnostics_preserves_original_command_when_api_not_importable(self, monkeypatch, caplog):
+        calls = []
+
+        class FakeManager:
+            def _find_api_command(self):
+                return ["uvx", "hindsight-api@0.0.0"]
+
+            def get_url(self, profile):
+                return "http://127.0.0.1:19177"
+
+            def is_running(self, profile):
+                return True
+
+            def _find_pid_on_port(self, port):
+                return 4242
+
+            def stop(self, profile):
+                calls.append(profile)
+                return True
+
+        manager = FakeManager()
+        monkeypatch.setattr("plugins.memory.hindsight.importlib.util.find_spec", lambda name: None)
+        caplog.set_level(logging.INFO, logger="plugins.memory.hindsight")
+
+        _install_embedded_daemon_diagnostics(manager)
+
+        assert manager._find_api_command() == ["uvx", "hindsight-api@0.0.0"]
+        assert manager.stop("hermes") is True
+        assert calls == ["hermes"]
+        before_sigterm = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_stop ")
+        ][0]
+        assert before_sigterm["reason"] == "explicit-stop"
+
+    def test_install_diagnostics_preserves_original_command_when_find_spec_raises(self, monkeypatch):
+        class FakeManager:
+            def _find_api_command(self):
+                return ["uvx", "hindsight-api@0.0.0"]
+
+        def raises(_name):
+            raise ModuleNotFoundError("No module named 'hindsight_api'")
+
+        manager = FakeManager()
+        monkeypatch.setattr("plugins.memory.hindsight.importlib.util.find_spec", raises)
+
+        _install_embedded_daemon_diagnostics(manager)
+
+        assert manager._find_api_command() == ["uvx", "hindsight-api@0.0.0"]
+        assert manager._hermes_diagnostics_installed is True
+
+    def test_install_diagnostics_routes_to_wrapper_when_api_importable(self, monkeypatch):
+        class FakeManager:
+            def _find_api_command(self):
+                return ["hindsight-api"]
+
+        manager = FakeManager()
+        monkeypatch.setattr("plugins.memory.hindsight.importlib.util.find_spec", lambda name: object())
+
+        _install_embedded_daemon_diagnostics(manager)
+
+        command = manager._find_api_command()
+        assert command[0] == sys.executable
+        assert command[1].endswith("daemon_diagnostics.py")
+        assert manager._hermes_original_find_api_command() == ["hindsight-api"]
+
+    def test_install_diagnostics_wraps_explicit_stop_with_structured_reason(self, monkeypatch, caplog):
+        calls = []
+
+        class FakeManager:
+            def _find_api_command(self):
+                return ["hindsight-api"]
+
+            def get_url(self, profile):
+                return "http://127.0.0.1:19177"
+
+            def is_running(self, profile):
+                return True
+
+            def _find_pid_on_port(self, port):
+                return 4242
+
+            def stop(self, profile):
+                calls.append(("original_stop", profile))
+                return True
+
+        manager = FakeManager()
+        monkeypatch.setattr("plugins.memory.hindsight.importlib.util.find_spec", lambda name: object())
+        caplog.set_level(logging.INFO, logger="plugins.memory.hindsight")
+
+        _install_embedded_daemon_diagnostics(manager)
+        assert manager.stop("hermes") is True
+
+        assert calls == [("original_stop", "hermes")]
+        before_sigterm = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_stop ")
+        ][0]
+        assert before_sigterm["reason"] == "explicit-stop"
+        assert before_sigterm["profile"] == "hermes"
+        assert before_sigterm["old_pid"] == 4242
+        assert before_sigterm["caller_path"]
+
+    def test_install_diagnostics_logs_unhealthy_port_reclaim_before_clear_port_kill(self, monkeypatch, caplog):
+        calls = []
+
+        class FakeManager:
+            def _find_api_command(self):
+                return ["hindsight-api"]
+
+            def _is_port_in_use(self, port):
+                return True
+
+            def _find_pid_on_port(self, port):
+                return 4242
+
+            def _clear_port(self, port):
+                calls.append(("original_clear_port", port))
+                return True
+
+        manager = FakeManager()
+        monkeypatch.setattr("plugins.memory.hindsight.importlib.util.find_spec", lambda name: object())
+        caplog.set_level(logging.INFO, logger="plugins.memory.hindsight")
+
+        _install_embedded_daemon_diagnostics(manager, profile="hermes")
+        assert manager._clear_port(19177) is True
+
+        assert calls == [("original_clear_port", 19177)]
+        before_sigterm = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_stop ")
+        ][0]
+        assert before_sigterm["reason"] == "unhealthy-port"
+        assert before_sigterm["profile"] == "hermes"
+        assert before_sigterm["old_pid"] == 4242
+        assert before_sigterm["port"] == 19177
+
+    def test_stop_logs_structured_reason_before_sigterm_and_wait_result(self, caplog):
+        events = []
+
+        class FakeManager:
+            def is_running(self, profile):
+                events.append(("is_running", profile))
+                return True
+
+            def get_url(self, profile):
+                return "http://127.0.0.1:19177"
+
+            def _find_pid_on_port(self, port):
+                events.append(("find_pid", port))
+                return 4242
+
+            def stop(self, profile):
+                events.append(("stop", profile))
+                return True
+
+        caplog.set_level(logging.INFO, logger="plugins.memory.hindsight")
+
+        result = _stop_embedded_daemon_with_diagnostics(
+            FakeManager(),
+            "hermes",
+            reason="config-drift",
+            log_path=None,
+        )
+
+        assert result is True
+        assert events[-1] == ("stop", "hermes")
+        before_sigterm = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_stop ")
+        ][0]
+        after_stop = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_stop_complete ")
+        ][0]
+
+        assert before_sigterm["profile"] == "hermes"
+        assert before_sigterm["reason"] == "config-drift"
+        assert before_sigterm["old_pid"] == 4242
+        assert before_sigterm["health_check"]["ok"] is True
+        assert before_sigterm["caller_path"]
+        assert after_stop["stopped"] is True
+        assert after_stop["overlap"] is False
+
+    def test_stop_logs_pid_alive_without_listener_overlap(self, caplog, monkeypatch):
+        class FakeManager:
+            def is_running(self, profile):
+                return False
+
+            def get_url(self, profile):
+                return "http://127.0.0.1:19177"
+
+            def _find_pid_on_port(self, port):
+                return 4242
+
+            def stop(self, profile):
+                return False
+
+        monkeypatch.setattr("plugins.memory.hindsight._pid_alive", lambda pid: True)
+        caplog.set_level(logging.WARNING, logger="plugins.memory.hindsight")
+
+        _stop_embedded_daemon_with_diagnostics(
+            FakeManager(),
+            "hermes",
+            reason="unhealthy-port",
+            log_path=None,
+        )
+
+        overlap = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_stop_complete ")
+        ][0]
+        assert overlap["overlap"] is True
+        assert overlap["diagnosis"] == "old PID alive but no LISTEN socket"
+
+    def test_replacement_start_logs_old_pid_overlap_and_new_pid(self, caplog, monkeypatch):
+        class FakeManager:
+            _hermes_last_stop_diagnostic = {
+                "profile": "hermes",
+                "reason": "config-drift",
+                "old_pid": 4242,
+                "port": 19177,
+                "overlap": True,
+            }
+
+            def _find_pid_on_port(self, port):
+                assert port == 19177
+                return 5252
+
+        monkeypatch.setattr("plugins.memory.hindsight._pid_alive", lambda pid: pid == 4242)
+        caplog.set_level(logging.WARNING, logger="plugins.memory.hindsight")
+
+        from plugins.memory.hindsight import _emit_daemon_replacement_start_diagnostics
+
+        _emit_daemon_replacement_start_diagnostics(FakeManager(), "hermes", log_path=None)
+
+        event = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("hindsight_daemon_replacement_start ")
+        ][0]
+        assert event["profile"] == "hermes"
+        assert event["reason"] == "config-drift"
+        assert event["old_pid"] == 4242
+        assert event["old_pid_alive_at_start"] is True
+        assert event["overlap"] is True
+        assert event["new_pid"] == 5252
+        assert event["diagnosis"] == "replacement started while old PID remained alive"
+
+    def test_sigterm_with_in_flight_task_logs_pid_alive_without_listener(self, tmp_path, caplog):
+        child_script = tmp_path / "listener_gap.py"
+        child_script.write_text(textwrap.dedent('''
+            import signal
+            import socket
+            import sys
+            import time
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            shutting_down = False
+
+            def handle_term(signum, frame):
+                global shutting_down
+                shutting_down = True
+                sock.close()
+
+            signal.signal(signal.SIGTERM, handle_term)
+            print(port, flush=True)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if shutting_down:
+                    time.sleep(10)
+                    sys.exit(0)
+                time.sleep(0.05)
+        '''))
+        child = subprocess.Popen(
+            [sys.executable, str(child_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert child.stdout is not None
+            port = int(child.stdout.readline().strip())
+
+            class LiveManager:
+                def is_running(self, profile):
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                        sock.settimeout(0.2)
+                        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+                def get_url(self, profile):
+                    return f"http://127.0.0.1:{port}"
+
+                def _find_pid_on_port(self, probe_port):
+                    assert probe_port == port
+                    return child.pid
+
+                def stop(self, profile):
+                    child.terminate()
+                    deadline = time.time() + 2
+                    while time.time() < deadline and self.is_running(profile):
+                        time.sleep(0.05)
+                    return False
+
+            caplog.set_level(logging.WARNING, logger="plugins.memory.hindsight")
+            _stop_embedded_daemon_with_diagnostics(
+                LiveManager(),
+                "hermes",
+                reason="explicit-stop",
+                log_path=None,
+            )
+            overlap = [
+                json.loads(record.getMessage().split(" ", 1)[1])
+                for record in caplog.records
+                if record.getMessage().startswith("hindsight_daemon_stop_complete ")
+            ][0]
+            assert child.poll() is None
+            assert overlap["old_pid"] == child.pid
+            assert overlap["reason"] == "explicit-stop"
+            assert overlap["diagnosis"] == "old PID alive but no LISTEN socket"
+        finally:
+            child.kill()
+            child.wait(timeout=5)
 
 
 class TestPostSetup:
