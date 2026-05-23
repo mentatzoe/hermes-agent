@@ -546,6 +546,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        self._prefetch_key: tuple[str | None, str] | None = None
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
@@ -1282,11 +1283,24 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
             self._prefetch_thread.join(timeout=3.0)
+        expected_key = (session_id, self._prefetch_query_signature(query))
         with self._prefetch_lock:
+            cached_key = self._prefetch_key
             result = self._prefetch_result
             self._prefetch_result = ""
+            self._prefetch_key = None
         if not result:
             logger.debug("Prefetch: no results available")
+            return ""
+        if cached_key != expected_key:
+            cached_session, cached_query_sig = cached_key or (None, "")
+            logger.debug(
+                "Prefetch: dropping stale cached entry "
+                "(session_match=%s query_len=%d expected_query_len=%d)",
+                cached_session == session_id,
+                len(cached_query_sig),
+                len(expected_key[1]),
+            )
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
@@ -1309,6 +1323,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
+        cache_key = (session_id, self._prefetch_query_signature(query))
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+            self._prefetch_key = None
 
         def _run():
             try:
@@ -1335,11 +1353,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
+                        self._prefetch_key = cache_key
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
+
+    def _prefetch_query_signature(self, query: str) -> str:
+        if query is None:
+            return ""
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            return query[:self._recall_max_input_chars]
+        return query
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()
@@ -1676,6 +1702,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            self._prefetch_key = None
 
         # 3. Now rotate to the new session.
         if parent_session_id:
