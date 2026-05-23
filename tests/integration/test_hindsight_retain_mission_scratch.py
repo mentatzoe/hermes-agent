@@ -103,6 +103,7 @@ def test_retain_mission_is_applied_to_scratch_bank_config(tmp_path, monkeypatch)
         asyncio.run(_create_database(admin_url, db_name))
     embedded = None
     provider = None
+    client = None
     try:
         embedded = HindsightEmbedded(
             profile=profile,
@@ -145,6 +146,11 @@ def test_retain_mission_is_applied_to_scratch_bank_config(tmp_path, monkeypatch)
     finally:
         if provider is not None:
             provider.shutdown()
+        if client is not None:
+            try:
+                client.delete_bank(bank_id)
+            except Exception:
+                pass
         if embedded is not None:
             embedded.close(stop_daemon=True)
         if database_urls is not None:
