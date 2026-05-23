@@ -44,6 +44,7 @@ from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from plugins.memory.hindsight.api_patches import ensure_hindsight_api_source_patches
 
 logger = logging.getLogger(__name__)
 
@@ -872,12 +873,6 @@ class HindsightMemoryProvider(MemoryProvider):
         """Return the cached Hindsight client (created once, reused)."""
         if self._client is None:
             if self._mode == "local_embedded":
-                available, reason = _check_local_runtime()
-                if not available:
-                    raise RuntimeError(
-                        "Hindsight local runtime is unavailable"
-                        + (f": {reason}" if reason else "")
-                    )
                 try:
                     from tools.lazy_deps import ensure as _lazy_ensure
                     _lazy_ensure("memory.hindsight", prompt=False)
@@ -885,6 +880,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     pass
                 except Exception as _e:
                     raise ImportError(str(_e))
+                ensure_hindsight_api_source_patches()
+                available, reason = _check_local_runtime()
+                if not available:
+                    raise RuntimeError(
+                        "Hindsight local runtime is unavailable"
+                        + (f": {reason}" if reason else "")
+                    )
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
@@ -1123,6 +1125,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._mode == "local":
             self._mode = "local_embedded"
         if self._mode == "local_embedded":
+            ensure_hindsight_api_source_patches()
             available, reason = _check_local_runtime()
             if not available:
                 logger.warning(
