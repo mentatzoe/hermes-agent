@@ -459,7 +459,14 @@ class TestToolHandlers:
         p = provider_with_config(retain_tags=["pref", "ui"])
         p.handle_tool_call("hindsight_retain", {"content": "likes dark mode"})
         call_kwargs = p._client.aretain.call_args.kwargs
-        assert call_kwargs["tags"] == ["pref", "ui"]
+        assert call_kwargs["tags"] == [
+            "pref",
+            "ui",
+            "source_kind:cli",
+            "surface:terminal",
+            "speaker:user",
+            "source_handle:cli:test-session",
+        ]
 
     def test_retain_merges_per_call_tags_with_config_tags(self, provider_with_config):
         p = provider_with_config(retain_tags=["pref", "ui"])
@@ -468,12 +475,71 @@ class TestToolHandlers:
             {"content": "likes dark mode", "tags": ["client:x", "ui"]},
         )
         call_kwargs = p._client.aretain.call_args.kwargs
-        assert call_kwargs["tags"] == ["pref", "ui", "client:x"]
+        assert call_kwargs["tags"] == [
+            "pref",
+            "ui",
+            "source_kind:cli",
+            "surface:terminal",
+            "speaker:user",
+            "source_handle:cli:test-session",
+            "client:x",
+        ]
 
-    def test_retain_without_tags(self, provider):
+    def test_retain_cli_origin_adds_provenance_tags(self, tmp_path, monkeypatch):
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="cli-session", hermes_home=str(tmp_path), platform="cli", user_name="Zoe")
+        p._client = _make_mock_client()
+
+        p.handle_tool_call("hindsight_retain", {"content": "hello"})
+        tags = p._client.aretain.call_args.kwargs["tags"]
+
+        assert "source_kind:cli" in tags
+        assert "surface:terminal" in tags
+        assert "speaker:zoe" in tags
+        assert "source_handle:cli:cli-session" in tags
+
+    def test_retain_gateway_telegram_origin_adds_provenance_tags(self, tmp_path, monkeypatch):
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="telegram-session",
+            hermes_home=str(tmp_path),
+            platform="telegram",
+            user_id="u-123",
+            user_name="Zoe",
+            chat_id="chat-456",
+            thread_id="topic-789",
+        )
+        p._client = _make_mock_client()
+
+        p.handle_tool_call("hindsight_retain", {"content": "hello"})
+        tags = p._client.aretain.call_args.kwargs["tags"]
+
+        assert "source_kind:gateway" in tags
+        assert "surface:telegram" in tags
+        assert "speaker:zoe" in tags
+        assert "source_handle:telegram:chat-456:topic-789:u-123" in tags
+
+    def test_retain_without_config_tags_still_writes_provenance_tags(self, provider):
         provider.handle_tool_call("hindsight_retain", {"content": "hello"})
         call_kwargs = provider._client.aretain.call_args.kwargs
-        assert "tags" not in call_kwargs
+        assert call_kwargs["tags"] == [
+            "source_kind:cli",
+            "surface:terminal",
+            "speaker:user",
+            "source_handle:cli:test-session",
+        ]
 
     def test_retain_missing_content(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -487,6 +553,56 @@ class TestToolHandlers:
         ))
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
+
+    def test_recall_exposes_provenance_on_items(self, provider):
+        provider._client.arecall.return_value = SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    text="Memory 1",
+                    tags=[
+                        "source_kind:gateway",
+                        "surface:telegram",
+                        "speaker:zoe",
+                        "source_handle:telegram:chat-456:topic-789:u-123",
+                    ],
+                )
+            ]
+        )
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "dark mode"}
+        ))
+
+        assert result["items"] == [
+            {
+                "index": 1,
+                "text": "Memory 1",
+                "provenance": {
+                    "source_kind": "gateway",
+                    "surface": "telegram",
+                    "speaker": "zoe",
+                    "source_handle": "telegram:chat-456:topic-789:u-123",
+                },
+            }
+        ]
+        assert "source_kind=gateway" in result["result"]
+
+    def test_recall_older_units_without_provenance_render_safely(self, provider):
+        provider._client.arecall.return_value = SimpleNamespace(
+            results=[SimpleNamespace(text="Old memory without provenance")]
+        )
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "old"}
+        ))
+
+        assert result["result"] == "1. Old memory without provenance"
+        assert result["items"][0]["provenance"] == {
+            "source_kind": None,
+            "surface": None,
+            "speaker": None,
+            "source_handle": None,
+        }
 
     def test_recall_passes_max_tokens(self, provider_with_config):
         p = provider_with_config(recall_max_tokens=2048)
@@ -506,6 +622,58 @@ class TestToolHandlers:
         p.handle_tool_call("hindsight_recall", {"query": "test"})
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["types"] == ["world", "experience"]
+
+    def test_round_trip_retain_multiple_provenance_and_recall_by_tag(self, tmp_path, monkeypatch):
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        stored: list[dict] = []
+
+        async def _aretain(**kwargs):
+            stored.append(dict(kwargs))
+            return SimpleNamespace(ok=True)
+
+        async def _arecall(**kwargs):
+            wanted = set(kwargs.get("tags") or [])
+            matched = [
+                SimpleNamespace(text=item["content"], tags=item.get("tags", []))
+                for item in stored
+                if not wanted or wanted.issubset(set(item.get("tags", [])))
+            ]
+            return SimpleNamespace(results=matched)
+
+        fake_client = MagicMock()
+        fake_client.aretain = AsyncMock(side_effect=_aretain)
+        fake_client.arecall = AsyncMock(side_effect=_arecall)
+        fake_client.areflect = AsyncMock(return_value=SimpleNamespace(text=""))
+        fake_client.aretain_batch = AsyncMock()
+        fake_client.aclose = AsyncMock()
+
+        cli = HindsightMemoryProvider()
+        cli.initialize(session_id="cli-session", hermes_home=str(tmp_path), platform="cli", user_name="Zoe")
+        cli._client = fake_client
+        cli.handle_tool_call("hindsight_retain", {"content": "CLI memory"})
+
+        telegram = HindsightMemoryProvider()
+        telegram.initialize(
+            session_id="telegram-session",
+            hermes_home=str(tmp_path),
+            platform="telegram",
+            user_id="u-123",
+            user_name="Zoe",
+            chat_id="chat-456",
+        )
+        telegram._client = fake_client
+        telegram.handle_tool_call("hindsight_retain", {"content": "Telegram memory"})
+
+        cli._recall_tags = ["surface:telegram"]
+        result = json.loads(cli.handle_tool_call("hindsight_recall", {"query": "memory"}))
+
+        assert [item["text"] for item in result["items"]] == ["Telegram memory"]
+        assert result["items"][0]["provenance"]["source_kind"] == "gateway"
+        assert result["items"][0]["provenance"]["surface"] == "telegram"
 
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
@@ -701,7 +869,15 @@ class TestSyncTurn:
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
         assert item["context"] == "conversation between Hermes Agent and the User"
-        assert item["tags"] == ["conv", "session1", "session:session-1"]
+        assert item["tags"] == [
+            "conv",
+            "session1",
+            "source_kind:gateway",
+            "surface:discord",
+            "speaker:fakeusername",
+            "source_handle:discord:1485316232612941897:1491249007475949698:fakeusername-123",
+            "session:session-1",
+        ]
         content = json.loads(item["content"])
         assert len(content) == 1
         assert content[0][0]["role"] == "user"

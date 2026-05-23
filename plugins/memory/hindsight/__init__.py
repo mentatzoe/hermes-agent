@@ -378,6 +378,40 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _slug_tag_value(value: Any, *, fallback: str = "unknown") -> str:
+    """Normalize a provenance value for use after a tag prefix."""
+    text = str(value or "").strip().lower()
+    if not text:
+        text = fallback
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in text).strip("-") or fallback
+
+
+def _result_value(result: Any, key: str, default: Any = None) -> Any:
+    if isinstance(result, dict):
+        return result.get(key, default)
+    return getattr(result, key, default)
+
+
+def _provenance_from_tags(tags: Any) -> dict[str, str | None]:
+    provenance: dict[str, str | None] = {
+        "source_kind": None,
+        "surface": None,
+        "speaker": None,
+        "source_handle": None,
+    }
+    for tag in _normalize_retain_tags(tags):
+        key, sep, value = tag.partition(":")
+        if not sep or key not in provenance:
+            continue
+        provenance[key] = value or None
+    return provenance
+
+
+def _format_provenance_suffix(provenance: dict[str, str | None]) -> str:
+    parts = [f"{key}={value}" for key, value in provenance.items() if value]
+    return f" [provenance: {', '.join(parts)}]" if parts else ""
+
+
 def _embedded_profile_name(config: dict[str, Any]) -> str:
     """Return the Hindsight embedded profile name for this Hermes config."""
     profile = config.get("profile", "hermes")
@@ -1346,6 +1380,37 @@ class HindsightMemoryProvider(MemoryProvider):
             },
         ]
 
+    def _source_kind(self) -> str:
+        platform = (self._platform or "cli").strip().lower()
+        return "cli" if platform in {"cli", "terminal"} else "gateway"
+
+    def _surface(self) -> str:
+        platform = (self._platform or "cli").strip().lower()
+        return "terminal" if platform in {"cli", "terminal"} else _slug_tag_value(platform, fallback="unknown")
+
+    def _speaker(self) -> str:
+        return _slug_tag_value(self._user_name or self._user_id or "user", fallback="user")
+
+    def _source_handle(self) -> str:
+        surface = self._surface()
+        if self._source_kind() == "cli":
+            return f"cli:{_slug_tag_value(self._session_id, fallback='unknown-session')}"
+        parts = [surface]
+        for value in (self._chat_id, self._thread_id, self._user_id):
+            if value:
+                parts.append(_slug_tag_value(value))
+        if len(parts) == 1 and self._session_id:
+            parts.append(_slug_tag_value(self._session_id, fallback="unknown-session"))
+        return ":".join(parts)
+
+    def _provenance_tags(self) -> list[str]:
+        return [
+            f"source_kind:{self._source_kind()}",
+            f"surface:{self._surface()}",
+            f"speaker:{self._speaker()}",
+            f"source_handle:{self._source_handle()}",
+        ]
+
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
             "retained_at": _utc_timestamp(),
@@ -1396,6 +1461,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if retain_async is not None:
             kwargs["retain_async"] = retain_async
         merged_tags = _normalize_retain_tags(self._retain_tags)
+        for tag in self._provenance_tags():
+            if tag not in merged_tags:
+                merged_tags.append(tag)
         for tag in _normalize_retain_tags(tags):
             if tag not in merged_tags:
                 merged_tags.append(tag)
@@ -1526,9 +1594,15 @@ class HindsightMemoryProvider(MemoryProvider):
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
-                    return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
-                return json.dumps({"result": "\n".join(lines)})
+                    return json.dumps({"result": "No relevant memories found.", "items": []})
+                items = []
+                lines = []
+                for i, r in enumerate(resp.results, 1):
+                    text = str(_result_value(r, "text", "") or "")
+                    provenance = _provenance_from_tags(_result_value(r, "tags", []))
+                    items.append({"index": i, "text": text, "provenance": provenance})
+                    lines.append(f"{i}. {text}{_format_provenance_suffix(provenance)}")
+                return json.dumps({"result": "\n".join(lines), "items": items})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
