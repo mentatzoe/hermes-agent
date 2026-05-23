@@ -2377,6 +2377,60 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def test_hindsight_tools_mode_run_conversation_has_no_recall_injection(self, agent, tmp_path, monkeypatch):
+        self._setup_agent(agent)
+
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+            "memory_mode": "tools",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        from agent.memory_manager import MemoryManager
+        from plugins.memory.hindsight import HindsightMemoryProvider
+
+        provider = HindsightMemoryProvider()
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        provider._prefetch_result = "- stale warmed memory must not inject"
+        provider._client = MagicMock()
+        provider._client.aretain_batch = AsyncMock()
+        provider._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[]))
+        provider._client.aclose = AsyncMock()
+
+        manager = MemoryManager()
+        manager.add_provider(provider)
+        agent._memory_manager = manager
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer", finish_reason="stop"
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        provider._retain_queue.join()
+        api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        system_prompt = api_messages[0]["content"]
+        current_user = next(m["content"] for m in api_messages if m.get("role") == "user")
+
+        assert result["final_response"] == "Final answer"
+        assert "Hindsight Memory" not in system_prompt
+        assert "memory-context" not in current_user
+        assert "stale warmed memory" not in current_user
+        provider._client.arecall.assert_not_called()
+        provider._client.aretain_batch.assert_called_once()
+        assert provider._prefetch_thread is None
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")

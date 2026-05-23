@@ -1247,18 +1247,13 @@ class HindsightMemoryProvider(MemoryProvider):
             t.start()
 
     def system_prompt_block(self) -> str:
+        if self._memory_mode == "tools":
+            return ""
         if self._memory_mode == "context":
             return (
                 f"# Hindsight Memory\n"
                 f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
                 f"Relevant memories are automatically injected into context."
-            )
-        if self._memory_mode == "tools":
-            return (
-                f"# Hindsight Memory\n"
-                f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts."
             )
         return (
             f"# Hindsight Memory\n"
@@ -1269,6 +1264,11 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if self._memory_mode == "tools":
+            logger.debug("Prefetch: skipped (tools-only mode)")
+            with self._prefetch_lock:
+                self._prefetch_result = ""
+            return ""
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
             self._prefetch_thread.join(timeout=3.0)

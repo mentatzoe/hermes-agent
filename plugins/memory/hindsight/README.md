@@ -99,7 +99,7 @@ Config file: `~/.hermes/hindsight/config.json`
 **memory_mode:**
 - `hybrid` — automatic context injection + tools available to the LLM
 - `context` — automatic injection only, no tools exposed
-- `tools` — tools only, no automatic injection
+- `tools` — tools only, no automatic injection or Hindsight system-prompt block
 
 ### Local Embedded LLM
 

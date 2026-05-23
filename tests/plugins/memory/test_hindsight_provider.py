@@ -38,6 +38,7 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_BASE_URL", "HINDSIGHT_API_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
@@ -181,6 +182,11 @@ class TestSchemas:
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
+
+    def test_tools_mode_keeps_recall_and_retain_tools(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        names = {schema["name"] for schema in p.get_tool_schemas()}
+        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +598,12 @@ class TestPrefetch:
         assert result.startswith("Custom header:")
         assert "- memory line" in result
 
+    def test_prefetch_returns_empty_in_tools_mode_even_with_warmed_result(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        p._prefetch_result = "- stale warmed memory"
+        assert p.prefetch("test") == ""
+        assert p._prefetch_result == ""
+
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
         p.queue_prefetch("test")
@@ -648,6 +660,16 @@ class TestPrefetch:
 
 
 class TestSyncTurn:
+    def test_sync_turn_retains_in_tools_mode(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        p.sync_turn("hello", "hi there")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "hello" in item["content"]
+        assert "hi there" in item["content"]
+
     def test_sync_turn_retains_metadata_rich_turn(self, provider_with_config):
         p = provider_with_config(
             retain_tags=["conv", "session1"],
@@ -1194,11 +1216,9 @@ class TestSystemPrompt:
         assert "context mode" in block
         assert "hindsight_recall" not in block
 
-    def test_tools_mode_prompt(self, provider_with_config):
+    def test_tools_mode_prompt_is_empty(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
-        block = p.system_prompt_block()
-        assert "tools mode" in block
-        assert "hindsight_recall" in block
+        assert p.system_prompt_block() == ""
 
 
 # ---------------------------------------------------------------------------
