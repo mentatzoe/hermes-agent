@@ -44,6 +44,7 @@ from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from plugins.memory.hindsight.api_patches import ensure_hindsight_api_source_patches
 
 logger = logging.getLogger(__name__)
 
@@ -885,6 +886,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     pass
                 except Exception as _e:
                     raise ImportError(str(_e))
+                ensure_hindsight_api_source_patches()
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")

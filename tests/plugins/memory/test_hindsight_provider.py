@@ -38,6 +38,8 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_API_LLM_MODEL", "HINDSIGHT_API_LLM_PROVIDER",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
@@ -282,6 +284,7 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("plugins.memory.hindsight.ensure_hindsight_api_source_patches", lambda: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -298,6 +301,37 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+
+    def test_get_client_patches_hindsight_api_before_embedded_import(self, monkeypatch):
+        events = []
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                events.append("embedded-init")
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "hindsight" and fromlist == ("HindsightEmbedded",):
+                events.append("import-hindsight")
+                return SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded)
+            return real_import(name, globals, locals, fromlist, level)
+
+        real_import = __import__
+        monkeypatch.setattr("builtins.__import__", fake_import)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.ensure_hindsight_api_source_patches",
+            lambda: events.append("patch"),
+        )
+
+        p = HindsightMemoryProvider()
+        p._mode = "local_embedded"
+        p._config = {"profile": "hermes", "llm_provider": "openai", "llm_model": "test-model"}
+        p._llm_base_url = ""
+
+        p._get_client()
+
+        assert events[:2] == ["patch", "import-hindsight"]
+        assert "embedded-init" in events
 
 
 class TestPostSetup:
