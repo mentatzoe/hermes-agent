@@ -5,6 +5,7 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import asyncio
 import json
 import re
 import sys
@@ -38,6 +39,8 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_API_LLM_MODEL", "HINDSIGHT_API_LLM_PROVIDER",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
@@ -109,6 +112,86 @@ def provider(tmp_path, monkeypatch):
     p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
     p._client = _make_mock_client()
     return p
+
+
+
+class TestFactExtractionMetadataPatch:
+    def test_initialize_removes_hindsight_metadata_from_extraction_prompt(self, provider):
+        fe = pytest.importorskip("hindsight_api.engine.retain.fact_extraction")
+        sentinel = "SENTINEL_VALUE_DO_NOT_EXTRACT"
+
+        rendered = fe._build_user_message(
+            "User: remember this safe sentence",
+            0,
+            1,
+            None,
+            "conversation between Hermes Agent and the User",
+            {"sentinel_key": sentinel},
+            None,
+        )
+
+        assert "Metadata:" not in rendered
+        assert "sentinel_key" not in rendered
+        assert sentinel not in rendered
+
+    def test_metadata_sentinel_never_reaches_extracted_facts(self, provider):
+        fe = pytest.importorskip("hindsight_api.engine.retain.fact_extraction")
+        usage_mod = pytest.importorskip("hindsight_api.engine.response_models")
+        sentinel = "SENTINEL_VALUE_DO_NOT_EXTRACT"
+        captured_messages = []
+
+        class FakeLLM:
+            async def call(self, *, messages, **kwargs):
+                captured_messages.extend(messages)
+                rendered = "\n".join(str(m.get("content", "")) for m in messages)
+                assert sentinel not in rendered
+                assert "sentinel_key" not in rendered
+                return (
+                    {
+                        "facts": [
+                            {
+                                "what": "Hermes retained a safe probe sentence",
+                                "when": "Unknown",
+                                "who": "Hermes",
+                                "why": "regression coverage",
+                                "confidence": 1.0,
+                            }
+                        ]
+                    },
+                    usage_mod.TokenUsage(),
+                )
+
+        config = SimpleNamespace(
+            retain_extraction_mode="concise",
+            retain_extract_causal_links=False,
+            retain_custom_instructions=None,
+            retain_mission=None,
+            entity_labels=None,
+            entities_allow_free_form=True,
+            retain_llm_max_retries=None,
+            llm_max_retries=1,
+            retain_llm_initial_backoff=None,
+            llm_initial_backoff=0,
+            retain_llm_max_backoff=None,
+            llm_max_backoff=0,
+            retain_max_completion_tokens=512,
+        )
+
+        facts, _usage = asyncio.run(
+            fe._extract_facts_from_chunk(
+                "User: remember this safe sentence",
+                0,
+                1,
+                None,
+                "conversation between Hermes Agent and the User",
+                FakeLLM(),
+                config,
+                metadata={"sentinel_key": sentinel},
+            )
+        )
+
+        assert captured_messages
+        assert sentinel not in repr(facts)
 
 
 @pytest.fixture()

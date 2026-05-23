@@ -72,6 +72,69 @@ _PROVIDER_DEFAULT_MODELS = {
 }
 
 
+def _patch_hindsight_fact_extraction_metadata_prompt() -> bool:
+    """Keep Hindsight retain metadata out of the LLM extraction prompt.
+
+    Hindsight API 0.5.6/0.6.2 renders each retain item's metadata dict as a
+    literal ``Metadata:`` block in ``fact_extraction._build_user_message``.
+    Hermes metadata contains routing/session fields, so the extractor can
+    re-ingest those opaque JSONB values as user facts. Patch the imported
+    helper in-process by forcing ``metadata=None`` while leaving content,
+    context, event date, and the separate narrator argument untouched.
+    """
+    try:
+        fact_extraction = importlib.import_module(
+            "hindsight_api.engine.retain.fact_extraction"
+        )
+    except Exception as exc:
+        logger.debug("Hindsight fact-extraction metadata prompt patch unavailable: %s", exc)
+        return False
+
+    build_user_message = getattr(fact_extraction, "_build_user_message", None)
+    if build_user_message is None:
+        logger.debug("Hindsight fact-extraction metadata prompt patch unavailable: missing _build_user_message")
+        return False
+    if getattr(build_user_message, "_hermes_strips_metadata", False):
+        return True
+    try:
+        import inspect
+        signature = inspect.signature(build_user_message)
+        if "metadata" not in signature.parameters:
+            logger.debug(
+                "Hindsight fact-extraction metadata prompt patch skipped: "
+                "_build_user_message has no metadata parameter"
+            )
+            return False
+    except Exception as exc:
+        logger.debug("Hindsight fact-extraction metadata prompt patch skipped: %s", exc)
+        return False
+
+    def _build_user_message_without_metadata(
+        chunk: str,
+        chunk_index: int,
+        total_chunks: int,
+        event_date,
+        context: str,
+        metadata: dict[str, str] | None = None,
+        agent_name: str | None = None,
+    ) -> str:
+        return build_user_message(
+            chunk,
+            chunk_index,
+            total_chunks,
+            event_date,
+            context,
+            None,
+            agent_name,
+        )
+
+    _build_user_message_without_metadata._hermes_strips_metadata = True  # type: ignore[attr-defined]
+    _build_user_message_without_metadata._hermes_original = build_user_message  # type: ignore[attr-defined]
+    fact_extraction._build_user_message = _build_user_message_without_metadata
+    logger.info("Applied Hindsight fact-extraction prompt patch: retain metadata omitted")
+    return True
+
+
 def _parse_int_setting(value: Any, default: int) -> int:
     """Parse an integer config/env value, falling back on invalid input."""
     if value is None or value == "":
@@ -1058,6 +1121,7 @@ class HindsightMemoryProvider(MemoryProvider):
         return fallback_document_id, None
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        _patch_hindsight_fact_extraction_metadata_prompt()
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
 
