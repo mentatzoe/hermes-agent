@@ -5543,3 +5543,14 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+    def test_prefetch_all_uses_agent_session_id(self):
+        """Source-level check: warmed memory is consumed under the current session key."""
+        import inspect
+        import re
+        from agent.conversation_loop import run_conversation as _rc
+        src = inspect.getsource(_rc)
+        assert re.search(
+            r"prefetch_all\(\s*_query,\s*session_id=agent\.session_id or \"\",\s*\)",
+            src,
+        )

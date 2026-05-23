@@ -40,6 +40,9 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
+        "HINDSIGHT_API_LLM_PROVIDER", "HINDSIGHT_API_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_MODEL", "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_API_LOG_LEVEL", "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -581,14 +584,16 @@ class TestPrefetch:
 
     def test_prefetch_default_preamble(self, provider):
         provider._prefetch_result = "- some memory"
-        result = provider.prefetch("test")
+        provider._prefetch_key = ("test-session", "test")
+        result = provider.prefetch("test", session_id="test-session")
         assert "Hindsight Memory" in result
         assert "- some memory" in result
 
     def test_prefetch_custom_preamble(self, provider_with_config):
         p = provider_with_config(recall_prompt_preamble="Custom header:")
         p._prefetch_result = "- memory line"
-        result = p.prefetch("test")
+        p._prefetch_key = ("test-session", "test")
+        result = p.prefetch("test", session_id="test-session")
         assert result.startswith("Custom header:")
         assert "- memory line" in result
 
@@ -640,6 +645,70 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_prefetch_does_not_return_stale_queued_result_for_different_query(self, provider):
+        topic_a = "Topic A: Barcelona hotel recommendation"
+        topic_b = "Topic B: current session start time"
+        marker_a = "ALPHA_BARCELONA_PREFETCH_MARKER"
+
+        def _recall_for_a(**kwargs):
+            assert kwargs.get("query") == topic_a
+            return SimpleNamespace(results=[SimpleNamespace(text=f"Hotel notes {marker_a}")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall_for_a)
+
+        provider.queue_prefetch(topic_a, session_id="session-A")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch(topic_b, session_id="session-A")
+
+        assert marker_a not in injected
+        assert injected == ""
+
+    def test_prefetch_returns_cached_result_when_query_and_session_match(self, provider):
+        topic_a = "Topic A: Barcelona hotel recommendation"
+        marker_a = "ALPHA_BARCELONA_PREFETCH_MARKER"
+
+        def _recall_for_a(**kwargs):
+            return SimpleNamespace(results=[SimpleNamespace(text=f"Hotel notes {marker_a}")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall_for_a)
+
+        provider.queue_prefetch(topic_a, session_id="session-A")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch(topic_a, session_id="session-A")
+
+        assert marker_a in injected
+
+    def test_prefetch_does_not_return_cached_result_across_sessions(self, provider):
+        topic = "Topic A: Barcelona hotel recommendation"
+        marker_a = "ALPHA_BARCELONA_PREFETCH_MARKER"
+
+        def _recall(**kwargs):
+            return SimpleNamespace(results=[SimpleNamespace(text=f"Hotel notes {marker_a}")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+
+        provider.queue_prefetch(topic, session_id="session-A")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch(topic, session_id="session-B")
+
+        assert marker_a not in injected
+        assert injected == ""
+
+    def test_on_session_switch_clears_warmed_prefetch_key(self, provider):
+        provider._prefetch_result = "- stale memory"
+        provider._prefetch_key = ("old-session", "same query")
+
+        provider.on_session_switch("new-session", parent_session_id="old-session")
+
+        assert provider._prefetch_result == ""
+        assert provider._prefetch_key is None
 
 
 # ---------------------------------------------------------------------------
