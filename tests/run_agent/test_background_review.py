@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
@@ -193,6 +195,63 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
         captured_bg_callback[0]
     )
+
+
+def test_background_review_records_bounded_internal_memory_event(monkeypatch):
+    """Background review audit breadcrumbs go through the parent manager.
+
+    The fork itself must still use skip_memory=True (guarded below) so the
+    harness prompt cannot be recorded as a human turn. If a provider wants to
+    preserve internal chatter, it receives a bounded internal event from the
+    parent manager and can route it to an actor-correct peer.
+    """
+    import json
+
+    captured_kwargs: dict = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_bg",
+                    "content": json.dumps(
+                        {"success": True, "message": "Entry added", "target": "memory"}
+                    ),
+                }
+            ]
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent._memory_manager = MagicMock()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hi"}],
+        review_memory=True,
+    )
+
+    assert captured_kwargs.get("skip_memory") is True
+    agent._memory_manager.sync_internal_event_all.assert_called_once()
+    args, kwargs = agent._memory_manager.sync_internal_event_all.call_args
+    assert args == ("background_review", "review memory")
+    assert kwargs["assistant_content"] == "Memory updated"
+    assert kwargs["session_id"] == "test-session"
+    assert kwargs["metadata"]["source_kind"] == "hermes_internal_harness"
+    assert kwargs["metadata"]["human_authored"] is False
+    assert kwargs["metadata"]["promotion_policy"] == "quarantine_no_identity_promotion"
 
 
 def test_background_review_fork_skips_external_memory_plugins(monkeypatch):

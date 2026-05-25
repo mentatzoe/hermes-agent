@@ -33,6 +33,9 @@ class TestHonchoClientConfigDefaults:
         assert config.save_messages is True
         assert config.session_strategy == "per-directory"
         assert config.recall_mode == "hybrid"
+        assert config.background_review_memory == "off"
+        assert config.internal_peer == "hermes-harness"
+        assert config.internal_session == "hermes-internal"
         assert config.session_peer_prefix is False
         assert config.sessions == {}
 
@@ -107,6 +110,9 @@ class TestFromGlobalConfig:
             "enabled": True,
             "saveMessages": False,
             "contextTokens": 2000,
+            "backgroundReviewMemory": "internal-peer",
+            "internalPeer": "root-harness",
+            "internalSession": "root-internal",
             "sessionStrategy": "per-project",
             "sessionPeerPrefix": True,
             "sessions": {"/home/user/proj": "my-session"},
@@ -114,6 +120,9 @@ class TestFromGlobalConfig:
                 "hermes": {
                     "workspace": "override-ws",
                     "aiPeer": "override-ai",
+                    "backgroundReviewMemory": "off",
+                    "internalPeer": "host-harness",
+                    "internalSession": "host-internal",
                 }
             }
         }))
@@ -131,6 +140,40 @@ class TestFromGlobalConfig:
         assert config.save_messages is False
         assert config.session_strategy == "per-project"
         assert config.session_peer_prefix is True
+        assert config.background_review_memory == "off"
+        assert config.internal_peer == "host-harness"
+        assert config.internal_session == "host-internal"
+
+    def test_background_review_memory_host_block_wins(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "key",
+            "backgroundReviewMemory": "internal-peer",
+            "internalPeer": "root-harness",
+            "internalSession": "root-internal",
+            "hosts": {
+                "hermes": {
+                    "backgroundReviewMemory": "off",
+                    "internalPeer": "host-harness",
+                    "internalSession": "host-internal",
+                }
+            },
+        }))
+
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+        assert config.background_review_memory == "off"
+        assert config.internal_peer == "host-harness"
+        assert config.internal_session == "host-internal"
+
+    def test_invalid_background_review_memory_defaults_to_off(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "key",
+            "backgroundReviewMemory": "definitely-on",
+        }))
+
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+        assert config.background_review_memory == "off"
 
     def test_host_block_overrides_root(self, tmp_path):
         config_file = tmp_path / "config.json"
@@ -156,11 +199,17 @@ class TestFromGlobalConfig:
             "apiKey": "key",
             "workspace": "root-ws",
             "aiPeer": "root-ai",
+            "backgroundReviewMemory": "internal-peer",
+            "internalPeer": "root-harness",
+            "internalSession": "root-internal",
         }))
 
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.workspace_id == "root-ws"
         assert config.ai_peer == "root-ai"
+        assert config.background_review_memory == "internal-peer"
+        assert config.internal_peer == "root-harness"
+        assert config.internal_session == "root-internal"
 
     def test_session_strategy_default_from_global_config(self, tmp_path):
         """from_global_config with no sessionStrategy should match dataclass default."""

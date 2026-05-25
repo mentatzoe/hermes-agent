@@ -1150,6 +1150,46 @@ class HonchoMemoryProvider(MemoryProvider):
         )
         self._sync_thread.start()
 
+    def sync_internal_event(
+        self,
+        event_type: str,
+        content: str,
+        *,
+        assistant_content: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: str = "",
+    ) -> None:
+        """Record non-human internal chatter in a quarantined Honcho surface.
+
+        This is opt-in via ``backgroundReviewMemory: internal-peer``. It must
+        never fall back to ``sync_turn`` because the event's author is the
+        Hermes harness, not the human peer.
+        """
+        if self._cron_skipped:
+            return
+        if not self._manager or not self._config:
+            return
+        if getattr(self._config, "background_review_memory", "off") != "internal-peer":
+            return
+        if event_type != "background_review":
+            return
+
+        clean_content = sanitize_context(content or "").strip()
+        clean_assistant = sanitize_context(assistant_content or "").strip()
+        if not clean_content and not clean_assistant:
+            return
+
+        try:
+            self._manager.record_internal_event(
+                event_type,
+                clean_content,
+                assistant_content=clean_assistant,
+                metadata=metadata or {},
+                parent_session_id=session_id,
+            )
+        except Exception as e:
+            logger.debug("Honcho sync_internal_event failed: %s", e)
+
     def on_memory_write(
         self,
         action: str,

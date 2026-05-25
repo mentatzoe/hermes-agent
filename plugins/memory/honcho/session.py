@@ -385,6 +385,88 @@ class HonchoSessionManager:
                 self._cache[session.key] = session
             return False
 
+    def record_internal_event(
+        self,
+        event_type: str,
+        content: str,
+        *,
+        assistant_content: str = "",
+        metadata: dict[str, Any] | None = None,
+        parent_session_id: str = "",
+    ) -> bool:
+        """Record non-human internal chatter in a quarantined Honcho session.
+
+        The normal session path models messages as human ↔ assistant turns.
+        Background review prompts are authored by Hermes' harness, so this path
+        uses an internal peer with observation disabled and message-level config
+        that forbids reasoning/card promotion.
+        """
+        cfg = self._config
+        internal_peer_id = self._sanitize_id(
+            getattr(cfg, "internal_peer", "hermes-harness") if cfg else "hermes-harness"
+        )
+        assistant_peer_id = self._sanitize_id(
+            getattr(cfg, "ai_peer", "hermes-assistant") if cfg else "hermes-assistant"
+        )
+        internal_session_id = self._sanitize_id(
+            getattr(cfg, "internal_session", "hermes-internal") if cfg else "hermes-internal"
+        )
+
+        reserved_metadata: dict[str, Any] = {
+            "source_kind": "hermes_internal_harness",
+            "event_type": event_type,
+            "human_authored": False,
+            "promotion_policy": "quarantine_no_identity_promotion",
+        }
+        event_metadata = {
+            **(metadata or {}),
+            **reserved_metadata,
+        }
+        if parent_session_id:
+            event_metadata["parent_session_id"] = parent_session_id
+        event_metadata = {k: v for k, v in event_metadata.items() if v not in {None, ""}}
+        no_promotion_config = {
+            "reasoning": {"enabled": False},
+            "peer_card": {"create": False},
+        }
+
+        try:
+            from honcho.session import SessionPeerConfig
+
+            internal_peer = self._get_or_create_peer(internal_peer_id)
+            assistant_peer = self._get_or_create_peer(assistant_peer_id)
+            honcho_session = self.honcho.session(internal_session_id)
+            no_observe = SessionPeerConfig(observe_me=False, observe_others=False)
+            honcho_session.add_peers([
+                (internal_peer, no_observe),
+                (assistant_peer, no_observe),
+            ])
+            try:
+                honcho_session.set_metadata(event_metadata)
+            except Exception as e:
+                logger.debug("Honcho internal session set_metadata failed: %s", e)
+
+            messages = []
+            if content:
+                messages.append(internal_peer.message(
+                    content,
+                    metadata={**event_metadata, "actor_peer": internal_peer_id},
+                    configuration=no_promotion_config,
+                ))
+            if assistant_content:
+                messages.append(assistant_peer.message(
+                    assistant_content,
+                    metadata={**event_metadata, "actor_peer": assistant_peer_id},
+                    configuration=no_promotion_config,
+                ))
+            if not messages:
+                return True
+            honcho_session.add_messages(messages)
+            return True
+        except Exception as e:
+            logger.debug("Failed to record Honcho internal event: %s", e)
+            return False
+
     def _async_writer_loop(self) -> None:
         """Background daemon thread: drains the async write queue."""
         while True:

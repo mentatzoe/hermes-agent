@@ -379,6 +379,37 @@ class MemoryManager:
                     provider.name, e,
                 )
 
+    def sync_internal_event_all(
+        self,
+        event_type: str,
+        content: str,
+        *,
+        assistant_content: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: str = "",
+    ) -> None:
+        """Sync a non-human internal/harness event to interested providers.
+
+        This deliberately does not call ``sync_turn``: internal agent chatter
+        must not be persisted as if it were a human/assistant conversation.
+        Providers that cannot route the event to an actor-correct surface keep
+        the MemoryProvider default no-op.
+        """
+        for provider in self._providers:
+            try:
+                provider.sync_internal_event(
+                    event_type,
+                    content,
+                    assistant_content=assistant_content,
+                    metadata=metadata,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' sync_internal_event failed: %s",
+                    provider.name, e,
+                )
+
     # -- Tools ---------------------------------------------------------------
 
     def get_all_tool_schemas(self) -> List[Dict[str, Any]]:

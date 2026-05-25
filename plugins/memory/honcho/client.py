@@ -83,12 +83,21 @@ def resolve_config_path() -> Path:
 
 _RECALL_MODE_ALIASES = {"auto": "hybrid"}
 _VALID_RECALL_MODES = {"hybrid", "context", "tools"}
+_VALID_BACKGROUND_REVIEW_MEMORY_MODES = {"off", "internal-peer"}
 
 
 def _normalize_recall_mode(val: str) -> str:
     """Normalize legacy recall mode values (e.g. 'auto' → 'hybrid')."""
     val = _RECALL_MODE_ALIASES.get(val, val)
     return val if val in _VALID_RECALL_MODES else "hybrid"
+
+
+def _normalize_background_review_memory_mode(val: str | None) -> str:
+    """Normalize background-review external-memory handling mode."""
+    if not val:
+        return "off"
+    normalized = str(val).strip().lower().replace("_", "-")
+    return normalized if normalized in _VALID_BACKGROUND_REVIEW_MEMORY_MODES else "off"
 
 
 def _resolve_bool(host_val, root_val, *, default: bool) -> bool:
@@ -302,6 +311,12 @@ class HonchoClientConfig:
     # Eager init in tools mode — when true, initializes session during
     # initialize() instead of deferring to first tool call
     init_on_session_start: bool = False
+    # Background review internal-memory preservation. Default off means the
+    # review fork is external-memory silent; "internal-peer" stores a bounded
+    # audit event under ``internal_peer`` / ``internal_session``.
+    background_review_memory: str = "off"
+    internal_peer: str = "hermes-harness"
+    internal_session: str = "hermes-internal"
     # Observation mode: legacy string shorthand ("directional" or "unified").
     # Kept for backward compat; granular per-peer booleans below are preferred.
     observation_mode: str = "directional"
@@ -518,6 +533,21 @@ class HonchoClientConfig:
                 host_block.get("initOnSessionStart"),
                 raw.get("initOnSessionStart"),
                 default=False,
+            ),
+            background_review_memory=_normalize_background_review_memory_mode(
+                host_block.get("backgroundReviewMemory")
+                if host_block.get("backgroundReviewMemory") is not None
+                else raw.get("backgroundReviewMemory")
+            ),
+            internal_peer=(
+                host_block.get("internalPeer")
+                or raw.get("internalPeer")
+                or "hermes-harness"
+            ),
+            internal_session=(
+                host_block.get("internalSession")
+                or raw.get("internalSession")
+                or "hermes-internal"
             ),
             # Migration guard: existing configs without an explicit
             # observationMode keep the old "unified" default so users

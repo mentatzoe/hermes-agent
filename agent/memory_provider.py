@@ -17,6 +17,7 @@ Lifecycle (called by MemoryManager, wired in run_agent.py):
   system_prompt_block()  — static text for the system prompt
   prefetch(query)        — background recall before each turn
   sync_turn(user, asst)  — async write after each turn
+  sync_internal_event()  — optional actor-correct internal/harness audit write
   get_tool_schemas()     — tool schemas to expose to the model
   handle_tool_call()     — dispatch a tool call
   shutdown()             — clean exit
@@ -116,6 +117,22 @@ class MemoryProvider(ABC):
 
         Called after each turn. Should be non-blocking — queue for
         background processing if the backend has latency.
+        """
+
+    def sync_internal_event(
+        self,
+        event_type: str,
+        content: str,
+        *,
+        assistant_content: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: str = "",
+    ) -> None:
+        """Persist non-human internal/harness events to an actor-correct surface.
+
+        Providers should only override this when they can keep the event out
+        of the human peer's representation/card. The default is a no-op so
+        internal events are never written through ``sync_turn`` accidentally.
         """
 
     @abstractmethod

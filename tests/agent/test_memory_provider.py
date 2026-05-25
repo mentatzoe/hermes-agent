@@ -27,6 +27,7 @@ class FakeMemoryProvider(MemoryProvider):
         self.session_end_called = False
         self.pre_compress_called = False
         self.memory_writes = []
+        self.internal_events = []
         self.shutdown_called = False
         self._prefetch_result = ""
         self._prompt_block = ""
@@ -54,6 +55,19 @@ class FakeMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content, assistant_content, *, session_id=""):
         self.synced_turns.append((user_content, assistant_content))
+
+    def sync_internal_event(
+        self,
+        event_type,
+        content,
+        *,
+        assistant_content="",
+        metadata=None,
+        session_id="",
+    ):
+        self.internal_events.append(
+            (event_type, content, assistant_content, metadata or {}, session_id)
+        )
 
     def get_tool_schemas(self):
         return self._tools
@@ -235,6 +249,49 @@ class TestMemoryManager:
         mgr.sync_all("user msg", "assistant msg")
         assert p1.synced_turns == [("user msg", "assistant msg")]
         assert p2.synced_turns == [("user msg", "assistant msg")]
+
+    def test_sync_internal_event_all(self):
+        mgr = MemoryManager()
+        p1 = FakeMemoryProvider("builtin")
+        p2 = FakeMemoryProvider("external")
+        mgr.add_provider(p1)
+        mgr.add_provider(p2)
+
+        mgr.sync_internal_event_all(
+            "background_review",
+            "review prompt",
+            assistant_content="Memory updated",
+            metadata={"source_kind": "hermes_internal_harness"},
+            session_id="session-123",
+        )
+
+        expected = [(
+            "background_review",
+            "review prompt",
+            "Memory updated",
+            {"source_kind": "hermes_internal_harness"},
+            "session-123",
+        )]
+        assert p1.internal_events == expected
+        assert p2.internal_events == expected
+
+    def test_sync_internal_event_failure_doesnt_block_others(self):
+        mgr = MemoryManager()
+        p1 = FakeMemoryProvider("builtin")
+        p1.sync_internal_event = MagicMock(side_effect=RuntimeError("boom"))
+        p2 = FakeMemoryProvider("external")
+        mgr.add_provider(p1)
+        mgr.add_provider(p2)
+
+        mgr.sync_internal_event_all("background_review", "prompt")
+
+        assert p2.internal_events == [(
+            "background_review",
+            "prompt",
+            "",
+            {},
+            "",
+        )]
 
     def test_sync_failure_doesnt_block_others(self):
         """If one provider's sync fails, others still run."""

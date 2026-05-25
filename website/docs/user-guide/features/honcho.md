@@ -121,6 +121,9 @@ Honcho is configured in `~/.honcho/config.json` (global) or `$HERMES_HOME/honcho
 | `recallMode` | `'hybrid'` | `hybrid` (auto-inject + tools), `context` (inject only), `tools` (tools only) |
 | `writeFrequency` | `'async'` | When to flush messages: `async` (background thread), `turn` (sync), `session` (batch on end), or integer N |
 | `saveMessages` | `true` | Whether to persist messages to Honcho API |
+| `backgroundReviewMemory` | `'off'` | Background self-improvement review audit handling: `off` skips external-memory writes; `internal-peer` writes a bounded non-human event to `internalSession` using `internalPeer` |
+| `internalPeer` | `'hermes-harness'` | Peer ID for non-human internal/harness events when `backgroundReviewMemory` is `internal-peer` |
+| `internalSession` | `'hermes-internal'` | Session ID for non-human internal/harness events when `backgroundReviewMemory` is `internal-peer` |
 | `observationMode` | `'directional'` | `directional` (all on) or `unified` (shared pool). Override with `observation` object for granular control |
 | `messageMaxChars` | `25000` | Max chars per message sent via `add_messages()`. Chunked if exceeded |
 | `dialecticMaxInputChars` | `10000` | Max chars for dialectic query input to `peer.chat()` |

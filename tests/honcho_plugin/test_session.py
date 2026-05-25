@@ -191,6 +191,72 @@ class TestManagerCacheOps:
         assert s1_info["message_count"] == 1
 
 
+class TestInternalEventRecording:
+    def test_records_internal_event_under_non_observed_harness_peer(self):
+        cfg = SimpleNamespace(
+            write_frequency="turn",
+            dialectic_reasoning_level="low",
+            dialectic_dynamic=True,
+            dialectic_max_chars=600,
+            observation_mode="directional",
+            user_observe_me=True,
+            user_observe_others=True,
+            ai_observe_me=True,
+            ai_observe_others=True,
+            message_max_chars=25000,
+            dialectic_max_input_chars=10000,
+            ai_peer="Aleph",
+            internal_peer="hermes-harness",
+            internal_session="hermes-internal",
+        )
+        honcho = MagicMock()
+        session = MagicMock()
+        honcho.session.return_value = session
+
+        internal_peer = MagicMock()
+        internal_peer.id = "hermes-harness"
+        internal_peer.message.return_value = "internal-message"
+        assistant_peer = MagicMock()
+        assistant_peer.id = "Aleph"
+        assistant_peer.message.return_value = "assistant-message"
+        honcho.peer.side_effect = lambda peer_id: {
+            "hermes-harness": internal_peer,
+            "Aleph": assistant_peer,
+        }[peer_id]
+
+        mgr = HonchoSessionManager(honcho=honcho, config=cfg)
+
+        result = mgr.record_internal_event(
+            "background_review",
+            "review prompt",
+            assistant_content="Memory updated",
+            metadata={"source_kind": "hermes_internal_harness"},
+            parent_session_id="parent-session",
+        )
+
+        assert result is True
+        honcho.session.assert_called_once_with("hermes-internal")
+        peers = session.add_peers.call_args.args[0]
+        assert peers[0][0] is internal_peer
+        assert peers[0][1].observe_me is False
+        assert peers[0][1].observe_others is False
+        assert peers[1][0] is assistant_peer
+        assert peers[1][1].observe_me is False
+        assert peers[1][1].observe_others is False
+        session.set_metadata.assert_called_once()
+        assert session.set_metadata.call_args.args[0]["source_kind"] == "hermes_internal_harness"
+        assert session.set_metadata.call_args.args[0]["human_authored"] is False
+        assert session.add_messages.call_args.args[0] == ["internal-message", "assistant-message"]
+        internal_peer.message.assert_called_once()
+        assistant_peer.message.assert_called_once()
+        assert internal_peer.message.call_args.kwargs["configuration"] == {
+            "reasoning": {"enabled": False},
+            "peer_card": {"create": False},
+        }
+        assert internal_peer.message.call_args.kwargs["metadata"]["parent_session_id"] == "parent-session"
+        assert internal_peer.message.call_args.kwargs["metadata"]["promotion_policy"] == "quarantine_no_identity_promotion"
+
+
 class TestPeerLookupHelpers:
     def _make_cached_manager(self):
         mgr = HonchoSessionManager()
@@ -557,6 +623,40 @@ class TestConcludeToolDispatch:
 
         assert session.add_message.call_args_list[0].args == ("user", "hello")
         assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
+
+    def test_sync_internal_event_disabled_by_default(self):
+        provider = HonchoMemoryProvider()
+        provider._session_key = "discord:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(background_review_memory="off")
+
+        provider.sync_internal_event("background_review", "review prompt")
+
+        provider._manager.record_internal_event.assert_not_called()
+
+    def test_sync_internal_event_records_when_configured(self):
+        provider = HonchoMemoryProvider()
+        provider._session_key = "discord:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(background_review_memory="internal-peer")
+
+        provider.sync_internal_event(
+            "background_review",
+            "review prompt",
+            assistant_content="Memory updated",
+            metadata={"source_kind": "hermes_internal_harness"},
+            session_id="session-123",
+        )
+
+        provider._manager.record_internal_event.assert_called_once_with(
+            "background_review",
+            "review prompt",
+            assistant_content="Memory updated",
+            metadata={"source_kind": "hermes_internal_harness"},
+            parent_session_id="session-123",
+        )
 
 
 # ---------------------------------------------------------------------------

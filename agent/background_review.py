@@ -324,6 +324,46 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _record_background_review_internal_event(
+    agent: Any,
+    prompt: str,
+    actions: List[str],
+) -> None:
+    """Offer a bounded background-review audit event to memory providers.
+
+    The review fork itself is constructed with ``skip_memory=True`` to avoid
+    writing harness prompts as human chat. This parent-side hook is the only
+    opt-in path for providers that can preserve the audit breadcrumb under an
+    actor-correct internal peer.
+    """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager is None:
+        return
+    sync_internal = getattr(memory_manager, "sync_internal_event_all", None)
+    if not callable(sync_internal):
+        return
+
+    assistant_content = " · ".join(dict.fromkeys(actions)) if actions else "No durable action reported."
+    metadata = {
+        "source_kind": "hermes_internal_harness",
+        "event_type": "background_review",
+        "human_authored": False,
+        "promotion_policy": "quarantine_no_identity_promotion",
+        "parent_session_id": getattr(agent, "session_id", "") or "",
+        "platform": getattr(agent, "platform", "") or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+    }
+    try:
+        sync_internal(
+            "background_review",
+            prompt,
+            assistant_content=assistant_content,
+            metadata={k: v for k, v in metadata.items() if v not in {None, ""}},
+            session_id=getattr(agent, "session_id", "") or "",
+        )
+    except Exception as exc:
+        logger.debug("background review internal memory event failed: %s", exc)
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
@@ -508,6 +548,7 @@ def _run_review_in_thread(
             review_messages,
             messages_snapshot,
         )
+        _record_background_review_internal_event(agent, prompt, actions)
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))

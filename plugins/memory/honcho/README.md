@@ -141,6 +141,9 @@ For every key, resolution order is: **host block > root > env var > default**.
 |-----|------|---------|-------------|
 | `writeFrequency` | string/int | `"async"` | `"async"` (background), `"turn"` (sync per turn), `"session"` (batch on end), or integer N (every N turns) |
 | `saveMessages` | bool | `true` | Persist messages to Honcho API |
+| `backgroundReviewMemory` | string | `"off"` | How to handle background self-improvement review audit breadcrumbs. `"off"` skips external-memory writes; `"internal-peer"` writes a bounded non-human event to `internalSession` using `internalPeer` |
+| `internalPeer` | string | `"hermes-harness"` | Peer ID used for non-human internal/harness events when `backgroundReviewMemory` is `"internal-peer"` |
+| `internalSession` | string | `"hermes-internal"` | Session ID used for non-human internal/harness events when `backgroundReviewMemory` is `"internal-peer"` |
 
 ### Session Resolution
 
