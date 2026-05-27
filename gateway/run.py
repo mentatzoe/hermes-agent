@@ -5725,6 +5725,8 @@ class GatewayRunner:
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    chat_id=source.chat_id,
+                    parent_chat_id=source.parent_chat_id,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
@@ -8644,7 +8646,7 @@ class GatewayRunner:
         Returns False when:
         - voice_mode is off for this chat
         - response is empty or an error
-        - agent already called text_to_speech tool (dedup)
+        - agent already called a TTS tool or returned an audio MEDIA tag (dedup)
         - voice input and base adapter auto-TTS already handled it (skip_double)
           UNLESS streaming already consumed the response (already_sent=True),
           in which case the base adapter won't have text for auto-TTS so the
@@ -8664,16 +8666,39 @@ class GatewayRunner:
         if not should:
             return False
 
-        # Dedup: agent already called TTS tool
+        # Dedup: agent already produced (or is about to deliver) its own audio.
+        # The built-in Hermes TTS tool is named ``text_to_speech``; MCP TTS
+        # servers commonly expose a synthesize tool such as
+        # ``mcp_tts_local_synthesize`` (historically sometimes auto-repaired
+        # from ``tts_local_synthesize``). If we only check the built-in tool,
+        # gateway voice mode can generate the default configured TTS first and
+        # then deliver the MCP audio attachment afterwards — double audio.
+        agent_tts_tool_names = {
+            "text_to_speech",
+            "mcp_tts_local_synthesize",
+            "tts_local_synthesize",
+        }
         has_agent_tts = any(
             msg.get("role") == "assistant"
             and any(
-                tc.get("function", {}).get("name") == "text_to_speech"
+                tc.get("function", {}).get("name") in agent_tts_tool_names
                 for tc in (msg.get("tool_calls") or [])
             )
             for msg in agent_messages
         )
         if has_agent_tts:
+            return False
+
+        # The final response may contain an audio MEDIA tag even when the
+        # corresponding tool call is not visible in ``agent_messages`` (for
+        # example after streaming / tool-repair / MCP wrapper differences).
+        # Suppress the default voice path whenever the response already carries
+        # an audio attachment; media delivery below will send that file.
+        audio_media_pattern = re.compile(
+            r"MEDIA:\s*\S+\.(?:ogg|opus|mp3|wav|m4a|flac)(?=[\s`\"',;:)\]}]|$)",
+            re.IGNORECASE,
+        )
+        if "[[audio_as_voice]]" in response or audio_media_pattern.search(response):
             return False
 
         # Dedup: base adapter auto-TTS already handles voice input
@@ -11631,6 +11656,9 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
+        *,
+        chat_id: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
     ) -> str:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -11661,7 +11689,12 @@ class GatewayRunner:
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result = await asyncio.to_thread(
+                    transcribe_audio,
+                    path,
+                    chat_id=chat_id,
+                    parent_chat_id=parent_chat_id,
+                )
                 if result["success"]:
                     transcript = result["transcript"]
                     enriched_parts.append(

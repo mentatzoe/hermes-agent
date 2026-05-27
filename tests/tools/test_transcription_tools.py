@@ -49,6 +49,8 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("HUME_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
 
@@ -603,6 +605,187 @@ class TestTranscribeLocalExtended:
         assert mock_whisper_cls.call_count == 1
         assert result["success"] is False
         assert "CUDA out of memory" in result["error"]
+
+
+# ============================================================================
+# Hume affect overlay helpers
+# ============================================================================
+
+class TestAffectOverlay:
+    def test_resolve_affect_provider_respects_channel_gate(self):
+        from tools.transcription_tools import _resolve_affect_provider
+
+        cfg = {"affect_provider": "hume", "affect_channels": ["dm-1"]}
+
+        assert _resolve_affect_provider(cfg, chat_id="dm-1") == "hume"
+        assert _resolve_affect_provider(cfg, chat_id="other") is None
+        assert _resolve_affect_provider(cfg, chat_id=None) is None
+
+    def test_resolve_affect_provider_allows_thread_by_parent_channel(self):
+        from tools.transcription_tools import _resolve_affect_provider
+
+        cfg = {"affect_provider": "hume", "affect_channels": ["parent-channel"]}
+
+        assert _resolve_affect_provider(
+            cfg,
+            chat_id="thread-channel",
+            parent_chat_id="parent-channel",
+        ) == "hume"
+        assert _resolve_affect_provider(
+            cfg,
+            chat_id="thread-channel",
+            parent_chat_id="other-parent",
+        ) is None
+
+    def test_format_affect_tags_threshold_and_half_threshold_fallback(self):
+        from tools.transcription_tools import _format_affect_tags
+
+        emotions = [
+            {"name": "Calmness", "score": 0.28},
+            {"name": "Joy", "score": 0.12},
+        ]
+
+        assert _format_affect_tags(emotions, threshold=0.3, top_k=2) == "[Calmness 0.28]"
+        assert _format_affect_tags(emotions, threshold=0.8, top_k=2) == ""
+
+    def test_parse_hume_prediction_payload(self):
+        from tools.transcription_tools import _parse_hume_prediction_payload
+
+        payload = [
+            {
+                "results": {
+                    "predictions": [
+                        {
+                            "models": {
+                                "prosody": {
+                                    "grouped_predictions": [
+                                        {
+                                            "predictions": [
+                                                {
+                                                    "time": {"begin": 1.2, "end": 2.4},
+                                                    "emotions": [{"name": "Interest", "score": 0.51}],
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        assert _parse_hume_prediction_payload(payload) == [
+            {"begin": 1.2, "end": 2.4, "emotions": [{"name": "Interest", "score": 0.51}]}
+        ]
+
+    def test_merge_affect_overlay_dedupes_repeated_tags(self):
+        from tools.transcription_tools import _merge_affect_overlay
+
+        primary = {
+            "success": True,
+            "provider": "local",
+            "transcript": "hello world",
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "hello"},
+                {"start": 1.0, "end": 2.0, "text": "world"},
+            ],
+        }
+        affect = [
+            {"begin": 0.0, "end": 2.0, "emotions": [{"name": "Calmness", "score": 0.7}]},
+        ]
+
+        result = _merge_affect_overlay(
+            primary,
+            affect,
+            {"hume": {"affect_threshold": 0.3, "affect_top_k": 2}},
+        )
+
+        assert result["transcript"] == "[Calmness 0.70] hello world"
+        assert result["affect_provider"] == "hume"
+
+    def test_transcribe_audio_runs_hume_overlay_when_channel_allowed(self, sample_ogg):
+        cfg = {
+            "provider": "local",
+            "affect_provider": "hume",
+            "affect_channels": ["dm-1"],
+            "hume": {"affect_threshold": 0.3, "affect_top_k": 2},
+        }
+        primary = {
+            "success": True,
+            "provider": "local",
+            "transcript": "hello",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+        }
+        affect = {
+            "success": True,
+            "provider": "hume",
+            "segments": [{"begin": 0.0, "end": 1.0, "emotions": [{"name": "Interest", "score": 0.55}]}],
+        }
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._run_primary_transcription", return_value=primary) as mock_primary, \
+             patch("tools.transcription_tools._get_hume_affect_segments", return_value=affect) as mock_hume:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg, chat_id="dm-1")
+
+        assert result["success"] is True
+        assert result["transcript"] == "[Interest 0.55] hello"
+        assert result["affect_provider"] == "hume"
+        mock_primary.assert_called_once()
+        mock_hume.assert_called_once()
+
+    def test_transcribe_audio_runs_hume_overlay_when_parent_channel_allowed(self, sample_ogg):
+        cfg = {
+            "provider": "local",
+            "affect_provider": "hume",
+            "affect_channels": ["parent-channel"],
+            "hume": {"affect_threshold": 0.3, "affect_top_k": 2},
+        }
+        primary = {
+            "success": True,
+            "provider": "local",
+            "transcript": "hello",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+        }
+        affect = {
+            "success": True,
+            "provider": "hume",
+            "segments": [{"begin": 0.0, "end": 1.0, "emotions": [{"name": "Interest", "score": 0.55}]}],
+        }
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._run_primary_transcription", return_value=primary) as mock_primary, \
+             patch("tools.transcription_tools._get_hume_affect_segments", return_value=affect) as mock_hume:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(
+                sample_ogg,
+                chat_id="thread-channel",
+                parent_chat_id="parent-channel",
+            )
+
+        assert result["success"] is True
+        assert result["transcript"] == "[Interest 0.55] hello"
+        assert result["affect_provider"] == "hume"
+        mock_primary.assert_called_once()
+        mock_hume.assert_called_once()
+
+    def test_transcribe_audio_degrades_to_primary_when_affect_fails(self, sample_ogg):
+        cfg = {"provider": "local", "affect_provider": "hume", "affect_channels": ["dm-1"]}
+        primary = {"success": True, "provider": "local", "transcript": "hello", "segments": []}
+        affect = {"success": False, "segments": [], "error": "boom"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._run_primary_transcription", return_value=primary), \
+             patch("tools.transcription_tools._get_hume_affect_segments", return_value=affect):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg, chat_id="dm-1")
+
+        assert result == primary
 
 
 # ============================================================================

@@ -320,6 +320,30 @@ class TestResolveOpenaiAudioApiKey:
         monkeypatch.setenv("OPENAI_API_KEY", "general-key")
         assert resolve_openai_audio_api_key() == "general-key"
 
+    def test_reads_voice_key_from_hermes_env_file_helper(self, monkeypatch):
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda key: "voice-file-key" if key == "VOICE_TOOLS_OPENAI_KEY" else "general-file-key",
+        )
+        assert resolve_openai_audio_api_key() == "voice-file-key"
+
+    def test_reads_openai_key_from_hermes_env_file_helper(self, monkeypatch):
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value",
+            lambda key: "general-file-key" if key == "OPENAI_API_KEY" else "",
+        )
+        assert resolve_openai_audio_api_key() == "general-file-key"
+
+    def test_process_env_takes_priority_over_hermes_env_file_helper(self, monkeypatch):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "voice-env-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "general-env-key")
+        monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "file-key")
+        assert resolve_openai_audio_api_key() == "voice-env-key"
+
     def test_empty_voice_key_falls_back(self, monkeypatch):
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "")
         monkeypatch.setenv("OPENAI_API_KEY", "general-key")

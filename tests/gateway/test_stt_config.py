@@ -74,6 +74,32 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
 
 
 @pytest.mark.asyncio
+async def test_enrich_message_with_transcription_passes_parent_chat_id_for_thread_inheritance():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "hello from thread", "provider": "local"},
+    ) as mock_transcribe:
+        result = await runner._enrich_message_with_transcription(
+            "caption",
+            ["/tmp/voice.ogg"],
+            chat_id="thread-channel",
+            parent_chat_id="parent-channel",
+        )
+
+    assert "hello from thread" in result
+    mock_transcribe.assert_called_once_with(
+        "/tmp/voice.ogg",
+        chat_id="thread-channel",
+        parent_chat_id="parent-channel",
+    )
+
+
+@pytest.mark.asyncio
 async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     from gateway.run import GatewayRunner
 

@@ -261,6 +261,11 @@ class HonchoClientConfig:
     # Toggles
     enabled: bool = False
     save_messages: bool = True
+    # Native MEMORY.md/USER.md/SOUL.md upload is an explicit migration, not a
+    # per-session init side effect. Keep the legacy default True for existing
+    # setups; personal agents can set autoMigrateMemoryFiles=false to prevent
+    # native prompt-layer files from being ingested into Honcho.
+    auto_migrate_memory_files: bool = True
     # Write frequency: "async" (background thread), "turn" (sync per turn),
     # "session" (flush on session end), or int (every N turns)
     write_frequency: str | int = "async"
@@ -459,6 +464,11 @@ class HonchoClientConfig:
             ),
             enabled=enabled,
             save_messages=save_messages,
+            auto_migrate_memory_files=_resolve_bool(
+                host_block.get("autoMigrateMemoryFiles"),
+                raw.get("autoMigrateMemoryFiles"),
+                default=True,
+            ),
             write_frequency=write_frequency,
             context_tokens=_parse_context_tokens(
                 host_block.get("contextTokens"),

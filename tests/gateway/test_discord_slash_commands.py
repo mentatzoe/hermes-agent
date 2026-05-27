@@ -158,6 +158,43 @@ async def test_registers_native_restart_slash_command(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_registers_native_gen_slash_command_as_text_failsafe(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "gen" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["gen"](interaction, request="run the task")
+
+    # Leading space is deliberate: Discord native /gen must reach the agent as
+    # normal text so the accountability plugin's pre_llm_call sees /gen and
+    # arms the per-request failsafe instead of gateway command dispatch eating it.
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        " /gen run the task",
+    )
+
+
+@pytest.mark.asyncio
+async def test_registers_native_idea_slash_command_captures_without_llm(adapter):
+    adapter._capture_idea_inbox = MagicMock()
+    adapter._register_slash_commands()
+
+    assert "idea" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    await adapter._client.tree.commands["idea"](interaction, text="build a tiny moon")
+
+    adapter._capture_idea_inbox.assert_called_once_with("build a tiny moon")
+    interaction.response.send_message.assert_awaited_once_with(
+        "captured.", ephemeral=True
+    )
+
+
 # ------------------------------------------------------------------
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------

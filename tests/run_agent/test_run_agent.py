@@ -1726,6 +1726,43 @@ class TestExecuteToolCalls:
 
         mock_print.assert_not_called()
 
+    def test_pre_llm_call_hook_receives_gateway_chat_metadata(self, agent, monkeypatch):
+        captured = {}
+        api_messages = {}
+
+        def fake_invoke_hook(hook_name, **kwargs):
+            if hook_name == "pre_llm_call":
+                captured.update(kwargs)
+                return [{"context": "<status>thread context</status>"}]
+            return []
+
+        def fake_api_call(api_kwargs):
+            api_messages.update(api_kwargs)
+            return _mock_response(content="ok")
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        agent.session_id = "sess-thread"
+        agent.platform = "discord"
+        agent._user_id = "zoe"
+        agent._chat_id = "1507547558434574356"
+        agent._chat_name = "waffle swarm / #aleph-threads / Heartbeat tweak: make the status sidecar"
+        agent._chat_type = "thread"
+        agent._thread_id = "1507547558434574356"
+        agent._interruptible_api_call = fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+
+        result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert captured["chat_id"] == "1507547558434574356"
+        assert captured["chat_name"].endswith("Heartbeat tweak: make the status sidecar")
+        assert captured["chat_type"] == "thread"
+        assert captured["thread_id"] == "1507547558434574356"
+        sent_user = next(m for m in api_messages["messages"] if m.get("role") == "user")
+        assert "<status>thread context</status>" in sent_user["content"]
+
     def test_run_conversation_suppresses_retry_noise_in_parseable_quiet_mode(self, agent):
         class _RateLimitError(Exception):
             status_code = 429

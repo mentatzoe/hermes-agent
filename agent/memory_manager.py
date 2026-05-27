@@ -177,11 +177,21 @@ def build_memory_context_block(raw_context: str) -> str:
     clean = sanitize_context(raw_context)
     if clean != raw_context:
         logger.warning("memory provider returned pre-wrapped context; stripped")
+    # ALEPH-PATCH 2026-05-12: upstream commit aa88dcc57 ("salvage batch — ...
+    # memory authority...") changed this from "informational background data"
+    # to "authoritative reference data — ... should inform all responses." The
+    # "authoritative" framing is wrong for a semantic-recall layer that
+    # indexes the agent's OWN past confabulations alongside ground truth, and
+    # actively contradicts the read-source-not-listings discipline. Reverted
+    # to recall-framed neutral wording. The sanitize_context() regex already
+    # matches both old strings; not adding a third variant. If you (sibling-
+    # Aleph) are reading this after a `git pull` re-bloated it: re-apply.
+    # See ~/github/aleph-vault/threads/2026-05-12-pr10-walkthrough-and-migration.md
+    # ("Execution log") and threads/hindsight-venv-patches.md.
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        "NOT new user input. Treat as informational background data.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )

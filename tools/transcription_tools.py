@@ -26,12 +26,15 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -91,10 +94,16 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+HUME_BASE_URL = os.getenv("HUME_BASE_URL", "https://api.hume.ai/v0")
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+
+DEFAULT_HUME_AFFECT_THRESHOLD = 0.3
+DEFAULT_HUME_AFFECT_TOP_K = 2
+DEFAULT_HUME_POLL_INTERVAL_S = 0.5
+DEFAULT_HUME_POLL_TIMEOUT_S = 60.0
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
@@ -412,8 +421,8 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             transcribe_kwargs["language"] = _forced_lang
 
         try:
-            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+            segments_iter, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+            segments_list = list(segments_iter)
         except Exception as exc:
             # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
             # AFTER the model loaded successfully.  Evict the broken cached
@@ -432,15 +441,31 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             from faster_whisper import WhisperModel
             _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
             _local_model_name = model_name
-            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+            segments_iter, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+            segments_list = list(segments_iter)
+
+        timed_segments = []
+        transcript_parts = []
+        for segment in segments_list:
+            text = str(getattr(segment, "text", "")).strip()
+            if not text:
+                continue
+            transcript_parts.append(text)
+            timed_segments.append(
+                {
+                    "start": float(getattr(segment, "start", 0.0) or 0.0),
+                    "end": float(getattr(segment, "end", 0.0) or 0.0),
+                    "text": text,
+                }
+            )
+        transcript = " ".join(transcript_parts)
 
         logger.info(
             "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
             Path(file_path).name, model_name, info.language, info.duration,
         )
 
-        return {"success": True, "transcript": transcript, "provider": "local"}
+        return {"success": True, "transcript": transcript, "provider": "local", "segments": timed_segments}
 
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)
@@ -782,45 +807,254 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Affect overlay: Hume Expression Measurement
 # ---------------------------------------------------------------------------
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def _resolve_affect_provider(
+    stt_config: dict,
+    *,
+    chat_id: Optional[str] = None,
+    parent_chat_id: Optional[str] = None,
+    affect_provider: Optional[str] = None,
+) -> Optional[str]:
+    """Return the affect provider to run for this message, if any.
+
+    Affect calls are deliberately channel-gated because they add latency and
+    external API cost. Passing ``affect_provider`` explicitly lets tests or
+    callers opt in, but still respects ``stt.affect_channels`` when configured.
+    For Discord threads, ``chat_id`` is the thread ID and ``parent_chat_id`` is
+    the parent channel ID; either ID may satisfy the gate so parent-channel
+    config applies to subthreads.
     """
-    Transcribe an audio file using the configured STT provider.
+    provider = affect_provider if affect_provider is not None else stt_config.get("affect_provider")
+    if not provider:
+        return None
 
-    Provider priority:
-      1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local faster-whisper (free) > Groq (free tier) > OpenAI (paid)
+    channels = {str(c) for c in (stt_config.get("affect_channels") or [])}
+    candidate_ids = {str(c) for c in (chat_id, parent_chat_id) if c is not None}
+    if channels and not (candidate_ids & channels):
+        return None
 
-    Args:
-        file_path: Absolute path to the audio file to transcribe.
-        model:     Override the model. If None, uses config or provider default.
+    return str(provider).strip().lower() or None
 
-    Returns:
-        dict with keys:
-          - "success" (bool): Whether transcription succeeded
-          - "transcript" (str): The transcribed text (empty on failure)
-          - "error" (str, optional): Error message if success is False
-          - "provider" (str, optional): Which provider was used
+
+def _float_config(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_config(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_affect_tags(emotions: list[dict], threshold: float, top_k: int) -> str:
+    """Format Hume emotions as ``[Name 0.42, Other 0.38]``.
+
+    If no emotion crosses the threshold, emit the dominant emotion only when it
+    reaches half-threshold; otherwise return an empty tag for genuinely neutral
+    audio.
     """
-    # Validate input
-    error = _validate_audio_file(file_path)
-    if error:
-        return error
+    ranked = sorted(
+        (
+            {
+                "name": str(emo.get("name", "?")).strip() or "?",
+                "score": _float_config(emo.get("score"), 0.0),
+            }
+            for emo in (emotions or [])
+        ),
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    keep = [item for item in ranked if item["score"] >= threshold][: max(top_k, 1)]
+    if not keep and ranked and ranked[0]["score"] >= threshold * 0.5:
+        keep = [ranked[0]]
+    if not keep:
+        return ""
+    return "[" + ", ".join(f"{item['name']} {item['score']:.2f}" for item in keep) + "]"
 
-    # Load config and determine provider
-    stt_config = _load_stt_config()
-    if not is_stt_enabled(stt_config):
-        return {
-            "success": False,
-            "transcript": "",
-            "error": "STT is disabled in config.yaml (stt.enabled: false).",
+
+def _parse_hume_prediction_payload(payload: Any) -> list[dict]:
+    """Normalize Hume batch predictions into timed affect segments."""
+    roots = payload if isinstance(payload, list) else [payload]
+    segments: list[dict] = []
+
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        predictions = (root.get("results") or {}).get("predictions") or []
+        for prediction in predictions:
+            models = (prediction or {}).get("models") or {}
+            for model_payload in models.values():
+                grouped = (model_payload or {}).get("grouped_predictions") or []
+                for group in grouped:
+                    for utterance in (group or {}).get("predictions") or []:
+                        time_obj = utterance.get("time") or {}
+                        try:
+                            begin = float(time_obj.get("begin", 0.0) or 0.0)
+                            end = float(time_obj.get("end", begin) or begin)
+                        except (TypeError, ValueError):
+                            continue
+                        emotions = utterance.get("emotions") or utterance.get("emotions_top") or []
+                        segments.append({"begin": begin, "end": end, "emotions": emotions})
+
+    return sorted(segments, key=lambda seg: (seg.get("begin", 0.0), seg.get("end", 0.0)))
+
+
+def _get_hume_affect_segments(file_path: str, stt_config: dict) -> Dict[str, Any]:
+    """Run Hume Expression Measurement and return timed affect segments."""
+    api_key = get_env_value("HUME_API_KEY")
+    if not api_key:
+        return {"success": False, "segments": [], "error": "HUME_API_KEY not set"}
+
+    try:
+        import requests
+    except Exception:
+        return {"success": False, "segments": [], "error": "requests package not installed"}
+
+    hume_cfg = stt_config.get("hume", {}) or {}
+    model_name = str(hume_cfg.get("model") or "prosody")
+    poll_interval = _float_config(hume_cfg.get("poll_interval_s"), DEFAULT_HUME_POLL_INTERVAL_S)
+    poll_timeout = _float_config(hume_cfg.get("poll_timeout_s"), DEFAULT_HUME_POLL_TIMEOUT_S)
+    base_url = str(hume_cfg.get("base_url") or HUME_BASE_URL).rstrip("/")
+
+    request_json = {
+        "models": {
+            model_name: {
+                "granularity": "utterance",
+                "identify_speakers": False,
+            }
         }
+    }
+    headers = {"X-Hume-Api-Key": api_key}
 
-    provider = _get_provider(stt_config)
+    try:
+        with open(file_path, "rb") as audio_file:
+            submit = requests.post(
+                f"{base_url}/batch/jobs",
+                headers=headers,
+                files={"file": (Path(file_path).name, audio_file)},
+                data={"json": json.dumps(request_json)},
+                timeout=30,
+            )
+        if submit.status_code >= 400:
+            return {
+                "success": False,
+                "segments": [],
+                "error": f"Hume submit failed (HTTP {submit.status_code}): {submit.text[:300]}",
+            }
+        submit_payload = submit.json()
+        job_id = submit_payload.get("job_id") or submit_payload.get("id")
+        if not job_id:
+            return {"success": False, "segments": [], "error": "Hume submit response missing job_id"}
 
+        deadline = time.monotonic() + poll_timeout
+        while True:
+            status_resp = requests.get(f"{base_url}/batch/jobs/{job_id}", headers=headers, timeout=15)
+            if status_resp.status_code >= 400:
+                return {
+                    "success": False,
+                    "segments": [],
+                    "error": f"Hume poll failed (HTTP {status_resp.status_code}): {status_resp.text[:300]}",
+                }
+            status_payload = status_resp.json()
+            state = status_payload.get("state") or {}
+            status = str(state.get("status") or status_payload.get("status") or "").upper()
+            if status == "COMPLETED":
+                break
+            if status in {"FAILED", "CANCELED", "CANCELLED"}:
+                return {"success": False, "segments": [], "error": f"Hume job {job_id} ended with status {status}"}
+            if time.monotonic() >= deadline:
+                return {"success": False, "segments": [], "error": f"Hume job {job_id} timed out after {poll_timeout:.1f}s"}
+            time.sleep(max(poll_interval, 0.1))
+
+        predictions_resp = requests.get(f"{base_url}/batch/jobs/{job_id}/predictions", headers=headers, timeout=30)
+        if predictions_resp.status_code >= 400:
+            return {
+                "success": False,
+                "segments": [],
+                "error": f"Hume predictions failed (HTTP {predictions_resp.status_code}): {predictions_resp.text[:300]}",
+            }
+        segments = _parse_hume_prediction_payload(predictions_resp.json())
+        return {"success": True, "segments": segments, "provider": "hume", "job_id": job_id}
+    except PermissionError:
+        return {"success": False, "segments": [], "error": f"Permission denied: {file_path}"}
+    except Exception as exc:
+        logger.error("Hume affect overlay failed: %s", exc, exc_info=True)
+        return {"success": False, "segments": [], "error": f"Hume affect overlay failed: {exc}"}
+
+
+def _merge_affect_overlay(primary_result: Dict[str, Any], affect_segments: list[dict], stt_config: dict) -> Dict[str, Any]:
+    """Merge affect tags into the primary transcript by timestamp overlap."""
+    hume_cfg = stt_config.get("hume", {}) or {}
+    threshold = _float_config(hume_cfg.get("affect_threshold"), DEFAULT_HUME_AFFECT_THRESHOLD)
+    top_k = _int_config(hume_cfg.get("affect_top_k"), DEFAULT_HUME_AFFECT_TOP_K)
+
+    primary_segments = primary_result.get("segments") or []
+    if not primary_segments:
+        text = primary_result.get("transcript", "")
+        if not affect_segments:
+            return primary_result
+        head_tag = _format_affect_tags(affect_segments[0].get("emotions", []), threshold, top_k)
+        if head_tag:
+            primary_result = dict(primary_result)
+            primary_result["transcript"] = f"{head_tag} {text}".strip()
+        return primary_result
+
+    annotated_parts: list[str] = []
+    last_tag: Optional[str] = None
+    for segment in primary_segments:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        start = _float_config(segment.get("start"), 0.0)
+        end = _float_config(segment.get("end"), start)
+        overlapping_emotions: list[dict] = []
+        for affect_segment in affect_segments:
+            if _float_config(affect_segment.get("end"), 0.0) < start:
+                continue
+            if _float_config(affect_segment.get("begin"), 0.0) > end:
+                continue
+            overlapping_emotions.extend(affect_segment.get("emotions", []) or [])
+
+        tag = ""
+        if overlapping_emotions:
+            by_name: dict[str, float] = {}
+            for emotion in overlapping_emotions:
+                name = str(emotion.get("name", "?")).strip() or "?"
+                score = _float_config(emotion.get("score"), 0.0)
+                if score > by_name.get(name, 0.0):
+                    by_name[name] = score
+            tag = _format_affect_tags(
+                [{"name": name, "score": score} for name, score in by_name.items()],
+                threshold,
+                top_k,
+            )
+
+        emit_tag = tag if tag and tag != last_tag else ""
+        annotated_parts.append(f"{emit_tag} {text}".strip() if emit_tag else text)
+        if tag:
+            last_tag = tag
+
+    primary_result = dict(primary_result)
+    primary_result["transcript"] = " ".join(annotated_parts).strip() or primary_result.get("transcript", "")
+    primary_result["affect_provider"] = "hume"
+    return primary_result
+
+
+def _run_primary_transcription(
+    file_path: str,
+    *,
+    model: Optional[str],
+    stt_config: dict,
+    provider: str,
+) -> Dict[str, Any]:
+    """Dispatch to the configured primary STT provider."""
     if provider == "local":
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_model(
@@ -866,6 +1100,100 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    *,
+    chat_id: Optional[str] = None,
+    parent_chat_id: Optional[str] = None,
+    affect_provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Transcribe an audio file using the configured STT provider.
+
+    Provider priority:
+      1. User config (``stt.provider`` in config.yaml)
+      2. Auto-detect: local faster-whisper (free) > Groq (free tier) > OpenAI (paid)
+
+    When ``stt.affect_provider`` is configured and this ``chat_id`` is listed in
+    ``stt.affect_channels``, run the primary STT leg and the affect leg in
+    parallel, then merge Hume prosody tags into the primary transcript by
+    timestamp overlap. Affect failures degrade to the clean primary transcript.
+
+    Args:
+        file_path:        Absolute path to the audio file to transcribe.
+        model:            Override the model. If None, uses config or provider default.
+        chat_id:          Optional messaging channel/thread ID for affect gating.
+        parent_chat_id:   Optional parent channel ID for thread inheritance.
+        affect_provider:  Optional explicit affect provider override.
+
+    Returns:
+        dict with keys:
+          - "success" (bool): Whether transcription succeeded
+          - "transcript" (str): The transcribed text (empty on failure)
+          - "error" (str, optional): Error message if success is False
+          - "provider" (str, optional): Which primary provider was used
+          - "affect_provider" (str, optional): Which affect provider was merged
+    """
+    # Validate input
+    error = _validate_audio_file(file_path)
+    if error:
+        return error
+
+    # Load config and determine provider
+    stt_config = _load_stt_config()
+    if not is_stt_enabled(stt_config):
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "STT is disabled in config.yaml (stt.enabled: false).",
+        }
+
+    provider = _get_provider(stt_config)
+    resolved_affect_provider = _resolve_affect_provider(
+        stt_config,
+        chat_id=chat_id,
+        parent_chat_id=parent_chat_id,
+        affect_provider=affect_provider,
+    )
+
+    if resolved_affect_provider != "hume":
+        return _run_primary_transcription(
+            file_path,
+            model=model,
+            stt_config=stt_config,
+            provider=provider,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        primary_future = executor.submit(
+            _run_primary_transcription,
+            file_path,
+            model=model,
+            stt_config=stt_config,
+            provider=provider,
+        )
+        affect_future = executor.submit(_get_hume_affect_segments, file_path, stt_config)
+        primary_result = primary_future.result()
+        affect_result = affect_future.result()
+
+    if not primary_result.get("success"):
+        return primary_result
+
+    if not affect_result.get("success"):
+        logger.warning("Affect overlay failed: %s", affect_result.get("error"))
+        return primary_result
+
+    merged = _merge_affect_overlay(primary_result, affect_result.get("segments") or [], stt_config)
+    merged["affect_provider"] = "hume"
+    return merged
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:

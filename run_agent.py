@@ -10892,6 +10892,10 @@ class AIAgent:
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
                 sender_id=getattr(self, "_user_id", None) or "",
+                chat_id=getattr(self, "_chat_id", None) or "",
+                chat_name=getattr(self, "_chat_name", None) or "",
+                chat_type=getattr(self, "_chat_type", None) or "",
+                thread_id=getattr(self, "_thread_id", None) or "",
             )
             _ctx_parts: list[str] = []
             for r in _pre_results:

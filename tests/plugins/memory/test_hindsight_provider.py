@@ -5,10 +5,11 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import asyncio
 import json
 import re
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -38,8 +39,12 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_API_LLM_MODEL", "HINDSIGHT_API_LLM_PROVIDER",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
+        "HINDSIGHT_API_LOG_LEVEL", "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
+        "HINDSIGHT_EMBED_API_DATABASE_URL", "HINDSIGHT_SCRATCH_DATABASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -74,6 +79,7 @@ def _make_mock_client():
         return_value=SimpleNamespace(text="Synthesized answer")
     )
     client.aretain_batch = AsyncMock()
+    client.update_bank_config = MagicMock(return_value={"ok": True})
     client.aclose = AsyncMock()
     return client
 
@@ -109,6 +115,86 @@ def provider(tmp_path, monkeypatch):
     p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
     p._client = _make_mock_client()
     return p
+
+
+
+class TestFactExtractionMetadataPatch:
+    def test_initialize_removes_hindsight_metadata_from_extraction_prompt(self, provider):
+        fe = pytest.importorskip("hindsight_api.engine.retain.fact_extraction")
+        sentinel = "SENTINEL_VALUE_DO_NOT_EXTRACT"
+
+        rendered = fe._build_user_message(
+            "User: remember this safe sentence",
+            0,
+            1,
+            None,
+            "conversation between Hermes Agent and the User",
+            {"sentinel_key": sentinel},
+            None,
+        )
+
+        assert "Metadata:" not in rendered
+        assert "sentinel_key" not in rendered
+        assert sentinel not in rendered
+
+    def test_metadata_sentinel_never_reaches_extracted_facts(self, provider):
+        fe = pytest.importorskip("hindsight_api.engine.retain.fact_extraction")
+        usage_mod = pytest.importorskip("hindsight_api.engine.response_models")
+        sentinel = "SENTINEL_VALUE_DO_NOT_EXTRACT"
+        captured_messages = []
+
+        class FakeLLM:
+            async def call(self, *, messages, **kwargs):
+                captured_messages.extend(messages)
+                rendered = "\n".join(str(m.get("content", "")) for m in messages)
+                assert sentinel not in rendered
+                assert "sentinel_key" not in rendered
+                return (
+                    {
+                        "facts": [
+                            {
+                                "what": "Hermes retained a safe probe sentence",
+                                "when": "Unknown",
+                                "who": "Hermes",
+                                "why": "regression coverage",
+                                "confidence": 1.0,
+                            }
+                        ]
+                    },
+                    usage_mod.TokenUsage(),
+                )
+
+        config = SimpleNamespace(
+            retain_extraction_mode="concise",
+            retain_extract_causal_links=False,
+            retain_custom_instructions=None,
+            retain_mission=None,
+            entity_labels=None,
+            entities_allow_free_form=True,
+            retain_llm_max_retries=None,
+            llm_max_retries=1,
+            retain_llm_initial_backoff=None,
+            llm_initial_backoff=0,
+            retain_llm_max_backoff=None,
+            llm_max_backoff=0,
+            retain_max_completion_tokens=512,
+        )
+
+        facts, _usage = asyncio.run(
+            fe._extract_facts_from_chunk(
+                "User: remember this safe sentence",
+                0,
+                1,
+                None,
+                "conversation between Hermes Agent and the User",
+                FakeLLM(),
+                config,
+                metadata={"sentinel_key": sentinel},
+            )
+        )
+
+        assert captured_messages
+        assert sentinel not in repr(facts)
 
 
 @pytest.fixture()
@@ -182,6 +268,11 @@ class TestSchemas:
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
 
+    def test_tools_mode_keeps_recall_and_retain_tools(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        names = {schema["name"] for schema in p.get_tool_schemas()}
+        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+
 
 # ---------------------------------------------------------------------------
 # Config tests
@@ -213,7 +304,6 @@ class TestConfig:
             auto_recall=False,
             retain_every_n_turns=3,
             retain_context="custom-ctx",
-            bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
@@ -231,12 +321,142 @@ class TestConfig:
         assert p._auto_recall is False
         assert p._retain_every_n_turns == 3
         assert p._retain_context == "custom-ctx"
-        assert p._bank_retain_mission == "Extract key facts"
+        assert p._bank_retain_mission is None
         assert p._recall_max_tokens == 2048
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
+
+    def test_initialize_applies_configured_bank_retain_mission_once(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+            "bank_retain_mission": "Extract durable preference facts only",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        client = _make_mock_client()
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def update_bank_config(self, **kwargs):
+                return client.update_bank_config(**kwargs)
+
+        monkeypatch.setitem(sys.modules, "hindsight_client", SimpleNamespace(Hindsight=FakeHindsight))
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        client.update_bank_config.assert_called_once_with(
+            bank_id="test-bank",
+            retain_mission="Extract durable preference facts only",
+        )
+
+    def test_initialize_skips_bank_config_update_when_retain_mission_unset(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        client = _make_mock_client()
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def update_bank_config(self, **kwargs):
+                return client.update_bank_config(**kwargs)
+
+        monkeypatch.setitem(sys.modules, "hindsight_client", SimpleNamespace(Hindsight=FakeHindsight))
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        client.update_bank_config.assert_not_called()
+
+    def test_local_embedded_applies_retain_mission_after_daemon_start(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "local_embedded",
+            "profile": "test-profile",
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+            "llm_api_key": "test-key",
+            "bank_id": "test-bank",
+            "bank_retain_mission": "Extract local embedded durable facts only",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+
+        events = []
+
+        class FakeManager:
+            def is_running(self, profile):
+                events.append(("is_running", profile))
+                return False
+
+            def stop(self, profile):
+                events.append(("stop", profile))
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self._manager = FakeManager()
+
+            def _ensure_started(self):
+                events.append(("ensure_started", None))
+
+            def update_bank_config(self, **kwargs):
+                events.append(("update_bank_config", kwargs))
+                return {"ok": True}
+
+        class ImmediateThread:
+            def __init__(self, target, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        fake_embed_pkg = ModuleType("hindsight_embed")
+        fake_embed_pkg.__path__ = []
+        fake_embed_daemon = ModuleType("hindsight_embed.daemon_embed_manager")
+        fake_embed_daemon.console = None
+        fake_embed_daemon.DaemonEmbedManager = object
+        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setitem(sys.modules, "hindsight_embed", fake_embed_pkg)
+        monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", fake_embed_daemon)
+        monkeypatch.setattr("plugins.memory.hindsight.threading.Thread", ImmediateThread)
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        assert events.index(("ensure_started", None)) < events.index(
+            (
+                "update_bank_config",
+                {
+                    "bank_id": "test-bank",
+                    "retain_mission": "Extract local embedded durable facts only",
+                },
+            )
+        )
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
@@ -253,6 +473,38 @@ class TestConfig:
         assert cfg["apiKey"] == "env-key"
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
+
+    def test_initialize_patches_hindsight_api_before_runtime_import(self, tmp_path, monkeypatch):
+        events = []
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"mode": "local_embedded", "bank_id": "test-bank"}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in {"hindsight", "hindsight_embed.daemon_embed_manager"}:
+                events.append(f"import:{name}")
+                return SimpleNamespace()
+            return real_import(name, globals, locals, fromlist, level)
+
+        def fake_check_local_runtime():
+            events.append("runtime-check")
+            __import__("hindsight")
+            return True, None
+
+        real_import = __import__
+        monkeypatch.setattr("builtins.__import__", fake_import)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", fake_check_local_runtime)
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.ensure_hindsight_api_source_patches",
+            lambda: events.append("patch"),
+        )
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        assert events[:3] == ["patch", "runtime-check", "import:hindsight"]
+        assert p._mode == "local_embedded"
 
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
@@ -282,6 +534,7 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("plugins.memory.hindsight.ensure_hindsight_api_source_patches", lambda: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -299,6 +552,42 @@ class TestConfig:
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
 
+    def test_get_client_patches_hindsight_api_before_embedded_import(self, monkeypatch):
+        events = []
+
+        class FakeHindsightEmbedded:
+            def __init__(self, **kwargs):
+                events.append("embedded-init")
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "hindsight" and fromlist == ("HindsightEmbedded",):
+                events.append("import-hindsight")
+                return SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded)
+            return real_import(name, globals, locals, fromlist, level)
+
+        real_import = __import__
+        def fake_check_local_runtime():
+            events.append("runtime-check")
+            __import__("hindsight")
+            return True, ""
+
+        monkeypatch.setattr("builtins.__import__", fake_import)
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", fake_check_local_runtime)
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.ensure_hindsight_api_source_patches",
+            lambda: events.append("patch"),
+        )
+
+        p = HindsightMemoryProvider()
+        p._mode = "local_embedded"
+        p._config = {"profile": "hermes", "llm_provider": "openai", "llm_model": "test-model"}
+        p._llm_base_url = ""
+
+        p._get_client()
+
+        assert events[:3] == ["patch", "runtime-check", "import-hindsight"]
+        assert "embedded-init" in events
+
 
 class TestPostSetup:
     def test_local_embedded_setup_materializes_profile_env(self, tmp_path, monkeypatch):
@@ -315,6 +604,7 @@ class TestPostSetup:
         monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-local-test")
         saved_configs = []
         monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved_configs.append(cfg.copy()))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: hermes_home)
 
         provider = HindsightMemoryProvider()
         provider.post_setup(str(hermes_home), {"memory": {}})
@@ -443,7 +733,8 @@ class TestToolHandlers:
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"] == "Memory enqueued for storage (async)."
+        provider._retain_queue.join()
         provider._client.aretain.assert_called_once()
         call_kwargs = provider._client.aretain.call_args.kwargs
         assert call_kwargs["bank_id"] == "test-bank"
@@ -452,8 +743,16 @@ class TestToolHandlers:
     def test_retain_with_tags(self, provider_with_config):
         p = provider_with_config(retain_tags=["pref", "ui"])
         p.handle_tool_call("hindsight_retain", {"content": "likes dark mode"})
+        p._retain_queue.join()
         call_kwargs = p._client.aretain.call_args.kwargs
-        assert call_kwargs["tags"] == ["pref", "ui"]
+        assert call_kwargs["tags"] == [
+            "pref",
+            "ui",
+            "source_kind:cli",
+            "surface:terminal",
+            "speaker:user",
+            "source_handle:cli:test-session",
+        ]
 
     def test_retain_merges_per_call_tags_with_config_tags(self, provider_with_config):
         p = provider_with_config(retain_tags=["pref", "ui"])
@@ -461,13 +760,76 @@ class TestToolHandlers:
             "hindsight_retain",
             {"content": "likes dark mode", "tags": ["client:x", "ui"]},
         )
+        p._retain_queue.join()
         call_kwargs = p._client.aretain.call_args.kwargs
-        assert call_kwargs["tags"] == ["pref", "ui", "client:x"]
+        assert call_kwargs["tags"] == [
+            "pref",
+            "ui",
+            "source_kind:cli",
+            "surface:terminal",
+            "speaker:user",
+            "source_handle:cli:test-session",
+            "client:x",
+        ]
 
-    def test_retain_without_tags(self, provider):
+    def test_retain_cli_origin_adds_provenance_tags(self, tmp_path, monkeypatch):
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="cli-session", hermes_home=str(tmp_path), platform="cli", user_name="Zoe")
+        p._client = _make_mock_client()
+
+        p.handle_tool_call("hindsight_retain", {"content": "hello"})
+        p._retain_queue.join()
+        tags = p._client.aretain.call_args.kwargs["tags"]
+
+        assert "source_kind:cli" in tags
+        assert "surface:terminal" in tags
+        assert "speaker:zoe" in tags
+        assert "source_handle:cli:cli-session" in tags
+
+    def test_retain_gateway_telegram_origin_adds_provenance_tags(self, tmp_path, monkeypatch):
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="telegram-session",
+            hermes_home=str(tmp_path),
+            platform="telegram",
+            user_id="u-123",
+            user_name="Zoe",
+            chat_id="chat-456",
+            thread_id="topic-789",
+        )
+        p._client = _make_mock_client()
+
+        p.handle_tool_call("hindsight_retain", {"content": "hello"})
+        p._retain_queue.join()
+        tags = p._client.aretain.call_args.kwargs["tags"]
+
+        assert "source_kind:gateway" in tags
+        assert "surface:telegram" in tags
+        assert "speaker:zoe" in tags
+        assert "source_handle:telegram:chat-456:topic-789:u-123" in tags
+
+    def test_retain_without_config_tags_still_writes_provenance_tags(self, provider):
         provider.handle_tool_call("hindsight_retain", {"content": "hello"})
+        provider._retain_queue.join()
         call_kwargs = provider._client.aretain.call_args.kwargs
-        assert "tags" not in call_kwargs
+        assert call_kwargs["tags"] == [
+            "source_kind:cli",
+            "surface:terminal",
+            "speaker:user",
+            "source_handle:cli:test-session",
+        ]
 
     def test_retain_missing_content(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -481,6 +843,56 @@ class TestToolHandlers:
         ))
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
+
+    def test_recall_exposes_provenance_on_items(self, provider):
+        provider._client.arecall.return_value = SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    text="Memory 1",
+                    tags=[
+                        "source_kind:gateway",
+                        "surface:telegram",
+                        "speaker:zoe",
+                        "source_handle:telegram:chat-456:topic-789:u-123",
+                    ],
+                )
+            ]
+        )
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "dark mode"}
+        ))
+
+        assert result["items"] == [
+            {
+                "index": 1,
+                "text": "Memory 1",
+                "provenance": {
+                    "source_kind": "gateway",
+                    "surface": "telegram",
+                    "speaker": "zoe",
+                    "source_handle": "telegram:chat-456:topic-789:u-123",
+                },
+            }
+        ]
+        assert "source_kind=gateway" in result["result"]
+
+    def test_recall_older_units_without_provenance_render_safely(self, provider):
+        provider._client.arecall.return_value = SimpleNamespace(
+            results=[SimpleNamespace(text="Old memory without provenance")]
+        )
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "old"}
+        ))
+
+        assert result["result"] == "1. Old memory without provenance"
+        assert result["items"][0]["provenance"] == {
+            "source_kind": None,
+            "surface": None,
+            "speaker": None,
+            "source_handle": None,
+        }
 
     def test_recall_passes_max_tokens(self, provider_with_config):
         p = provider_with_config(recall_max_tokens=2048)
@@ -500,6 +912,60 @@ class TestToolHandlers:
         p.handle_tool_call("hindsight_recall", {"query": "test"})
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["types"] == ["world", "experience"]
+
+    def test_round_trip_retain_multiple_provenance_and_recall_by_tag(self, tmp_path, monkeypatch):
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        stored: list[dict] = []
+
+        async def _aretain(**kwargs):
+            stored.append(dict(kwargs))
+            return SimpleNamespace(ok=True)
+
+        async def _arecall(**kwargs):
+            wanted = set(kwargs.get("tags") or [])
+            matched = [
+                SimpleNamespace(text=item["content"], tags=item.get("tags", []))
+                for item in stored
+                if not wanted or wanted.issubset(set(item.get("tags", [])))
+            ]
+            return SimpleNamespace(results=matched)
+
+        fake_client = MagicMock()
+        fake_client.aretain = AsyncMock(side_effect=_aretain)
+        fake_client.arecall = AsyncMock(side_effect=_arecall)
+        fake_client.areflect = AsyncMock(return_value=SimpleNamespace(text=""))
+        fake_client.aretain_batch = AsyncMock()
+        fake_client.aclose = AsyncMock()
+
+        cli = HindsightMemoryProvider()
+        cli.initialize(session_id="cli-session", hermes_home=str(tmp_path), platform="cli", user_name="Zoe")
+        cli._client = fake_client
+        cli.handle_tool_call("hindsight_retain", {"content": "CLI memory"})
+        cli._retain_queue.join()
+
+        telegram = HindsightMemoryProvider()
+        telegram.initialize(
+            session_id="telegram-session",
+            hermes_home=str(tmp_path),
+            platform="telegram",
+            user_id="u-123",
+            user_name="Zoe",
+            chat_id="chat-456",
+        )
+        telegram._client = fake_client
+        telegram.handle_tool_call("hindsight_retain", {"content": "Telegram memory"})
+        telegram._retain_queue.join()
+
+        cli._recall_tags = ["surface:telegram"]
+        result = json.loads(cli.handle_tool_call("hindsight_recall", {"query": "memory"}))
+
+        assert [item["text"] for item in result["items"]] == ["Telegram memory"]
+        assert result["items"][0]["provenance"]["source_kind"] == "gateway"
+        assert result["items"][0]["provenance"]["surface"] == "telegram"
 
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
@@ -532,13 +998,16 @@ class TestToolHandlers:
         ))
         assert "error" in result
 
-    def test_retain_error_handling(self, provider):
+    def test_retain_error_handling(self, provider, caplog):
         provider._client.aretain.side_effect = RuntimeError("connection failed")
-        result = json.loads(provider.handle_tool_call(
-            "hindsight_retain", {"content": "test"}
-        ))
-        assert "error" in result
-        assert "connection failed" in result["error"]
+        with caplog.at_level("WARNING"):
+            result = json.loads(provider.handle_tool_call(
+                "hindsight_retain", {"content": "test"}
+            ))
+            provider._retain_queue.join()
+        assert result["result"] == "Memory enqueued for storage (async)."
+        assert "hindsight_retain background failed" in caplog.text
+        assert "connection failed" in caplog.text
 
     def test_recall_error_handling(self, provider):
         provider._client.arecall.side_effect = RuntimeError("timeout")
@@ -581,16 +1050,24 @@ class TestPrefetch:
 
     def test_prefetch_default_preamble(self, provider):
         provider._prefetch_result = "- some memory"
-        result = provider.prefetch("test")
+        provider._prefetch_key = ("test-session", "test")
+        result = provider.prefetch("test", session_id="test-session")
         assert "Hindsight Memory" in result
         assert "- some memory" in result
 
     def test_prefetch_custom_preamble(self, provider_with_config):
         p = provider_with_config(recall_prompt_preamble="Custom header:")
         p._prefetch_result = "- memory line"
-        result = p.prefetch("test")
+        p._prefetch_key = ("test-session", "test")
+        result = p.prefetch("test", session_id="test-session")
         assert result.startswith("Custom header:")
         assert "- memory line" in result
+
+    def test_prefetch_returns_empty_in_tools_mode_even_with_warmed_result(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        p._prefetch_result = "- stale warmed memory"
+        assert p.prefetch("test") == ""
+        assert p._prefetch_result == ""
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
@@ -641,6 +1118,70 @@ class TestPrefetch:
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
 
+    def test_prefetch_does_not_return_stale_queued_result_for_different_query(self, provider):
+        topic_a = "Topic A: Barcelona hotel recommendation"
+        topic_b = "Topic B: current session start time"
+        marker_a = "ALPHA_BARCELONA_PREFETCH_MARKER"
+
+        def _recall_for_a(**kwargs):
+            assert kwargs.get("query") == topic_a
+            return SimpleNamespace(results=[SimpleNamespace(text=f"Hotel notes {marker_a}")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall_for_a)
+
+        provider.queue_prefetch(topic_a, session_id="session-A")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch(topic_b, session_id="session-A")
+
+        assert marker_a not in injected
+        assert injected == ""
+
+    def test_prefetch_returns_cached_result_when_query_and_session_match(self, provider):
+        topic_a = "Topic A: Barcelona hotel recommendation"
+        marker_a = "ALPHA_BARCELONA_PREFETCH_MARKER"
+
+        def _recall_for_a(**kwargs):
+            return SimpleNamespace(results=[SimpleNamespace(text=f"Hotel notes {marker_a}")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall_for_a)
+
+        provider.queue_prefetch(topic_a, session_id="session-A")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch(topic_a, session_id="session-A")
+
+        assert marker_a in injected
+
+    def test_prefetch_does_not_return_cached_result_across_sessions(self, provider):
+        topic = "Topic A: Barcelona hotel recommendation"
+        marker_a = "ALPHA_BARCELONA_PREFETCH_MARKER"
+
+        def _recall(**kwargs):
+            return SimpleNamespace(results=[SimpleNamespace(text=f"Hotel notes {marker_a}")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+
+        provider.queue_prefetch(topic, session_id="session-A")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        injected = provider.prefetch(topic, session_id="session-B")
+
+        assert marker_a not in injected
+        assert injected == ""
+
+    def test_on_session_switch_clears_warmed_prefetch_key(self, provider):
+        provider._prefetch_result = "- stale memory"
+        provider._prefetch_key = ("old-session", "same query")
+
+        provider.on_session_switch("new-session", parent_session_id="old-session")
+
+        assert provider._prefetch_result == ""
+        assert provider._prefetch_key is None
+
 
 # ---------------------------------------------------------------------------
 # sync_turn tests
@@ -648,6 +1189,16 @@ class TestPrefetch:
 
 
 class TestSyncTurn:
+    def test_sync_turn_retains_in_tools_mode(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        p.sync_turn("hello", "hi there")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "hello" in item["content"]
+        assert "hi there" in item["content"]
+
     def test_sync_turn_retains_metadata_rich_turn(self, provider_with_config):
         p = provider_with_config(
             retain_tags=["conv", "session1"],
@@ -679,7 +1230,15 @@ class TestSyncTurn:
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
         assert item["context"] == "conversation between Hermes Agent and the User"
-        assert item["tags"] == ["conv", "session1", "session:session-1"]
+        assert item["tags"] == [
+            "conv",
+            "session1",
+            "source_kind:gateway",
+            "surface:discord",
+            "speaker:fakeusername",
+            "source_handle:discord:1485316232612941897:1491249007475949698:fakeusername-123",
+            "session:session-1",
+        ]
         content = json.loads(item["content"])
         assert len(content) == 1
         assert content[0][0]["role"] == "user"
@@ -1194,11 +1753,9 @@ class TestSystemPrompt:
         assert "context mode" in block
         assert "hindsight_recall" not in block
 
-    def test_tools_mode_prompt(self, provider_with_config):
+    def test_tools_mode_prompt_is_empty(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
-        block = p.system_prompt_block()
-        assert "tools mode" in block
-        assert "hindsight_recall" in block
+        assert p.system_prompt_block() == ""
 
 
 # ---------------------------------------------------------------------------

@@ -665,7 +665,7 @@ class TestPerSessionMigrateGuard:
     containing only <prior_memory_file> wrappers.
     """
 
-    def _make_provider_with_strategy(self, strategy, init_on_session_start=True):
+    def _make_provider_with_strategy(self, strategy, init_on_session_start=True, raw=None):
         """Create a HonchoMemoryProvider and track migrate_memory_files calls."""
         from plugins.memory.honcho.client import HonchoClientConfig
         from unittest.mock import patch, MagicMock
@@ -676,6 +676,8 @@ class TestPerSessionMigrateGuard:
             recall_mode="tools",
             init_on_session_start=init_on_session_start,
             session_strategy=strategy,
+            auto_migrate_memory_files=(raw or {}).get("autoMigrateMemoryFiles", True),
+            raw=raw or {},
         )
 
         provider = HonchoMemoryProvider()
@@ -696,6 +698,14 @@ class TestPerSessionMigrateGuard:
     def test_migrate_skipped_for_per_session(self):
         """per-session strategy must NOT call migrate_memory_files."""
         _, mock_manager = self._make_provider_with_strategy("per-session")
+        mock_manager.migrate_memory_files.assert_not_called()
+
+    def test_migrate_can_be_disabled_for_global_session(self):
+        """autoMigrateMemoryFiles=false must suppress native MEMORY/USER/SOUL uploads."""
+        _, mock_manager = self._make_provider_with_strategy(
+            "global",
+            raw={"autoMigrateMemoryFiles": False},
+        )
         mock_manager.migrate_memory_files.assert_not_called()
 
     def test_migrate_runs_for_per_directory(self):

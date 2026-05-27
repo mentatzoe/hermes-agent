@@ -29,6 +29,7 @@ class TestHonchoClientConfigDefaults:
         assert config.timeout is None
         assert config.enabled is False
         assert config.save_messages is True
+        assert config.auto_migrate_memory_files is True
         assert config.session_strategy == "per-directory"
         assert config.recall_mode == "hybrid"
         assert config.session_peer_prefix is False
@@ -104,6 +105,7 @@ class TestFromGlobalConfig:
             "aiPeer": "hermes-custom",
             "enabled": True,
             "saveMessages": False,
+            "autoMigrateMemoryFiles": False,
             "contextTokens": 2000,
             "sessionStrategy": "per-project",
             "sessionPeerPrefix": True,
@@ -127,6 +129,7 @@ class TestFromGlobalConfig:
         assert config.peer_name == "alice"
         assert config.enabled is True
         assert config.save_messages is False
+        assert config.auto_migrate_memory_files is False
         assert config.session_strategy == "per-project"
         assert config.session_peer_prefix is True
 

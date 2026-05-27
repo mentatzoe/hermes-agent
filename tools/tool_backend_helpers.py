@@ -100,12 +100,27 @@ def resolve_modal_backend_state(
     }
 
 
+def _get_env_or_config_value(key: str) -> str:
+    """Read a secret from process env, then Hermes' .env file when available."""
+    value = os.getenv(key)
+    if value is None:
+        try:
+            from hermes_cli.config import get_env_value
+
+            value = get_env_value(key)
+        except Exception:
+            value = None
+    return (value or "").strip()
+
+
 def resolve_openai_audio_api_key() -> str:
-    """Prefer the voice-tools key, but fall back to the normal OpenAI key."""
-    return (
-        os.getenv("VOICE_TOOLS_OPENAI_KEY", "")
-        or os.getenv("OPENAI_API_KEY", "")
-    ).strip()
+    """Prefer the voice-tools key, but fall back to the normal OpenAI key.
+
+    Consult both ``os.environ`` and ``~/.hermes/.env`` so gateway/tool code can
+    use the same credentials that ``hermes config`` reports. This mirrors the
+    FAL helper below and avoids requiring launchd to export audio keys directly.
+    """
+    return _get_env_or_config_value("VOICE_TOOLS_OPENAI_KEY") or _get_env_or_config_value("OPENAI_API_KEY")
 
 
 def prefers_gateway(config_section: str) -> bool:
