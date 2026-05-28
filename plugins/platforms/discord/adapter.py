@@ -2879,6 +2879,27 @@ class DiscordAdapter(BasePlatformAdapter):
         # Discord markdown is fairly standard, no special escaping needed
         return content
 
+    def _capture_idea_inbox(self, text: str) -> None:
+        """Append a native Discord /idea capture to Zoe's idea inbox.
+
+        This is intentionally boring and local: the accountability pilot's
+        anti-engrossment path must not round-trip through an LLM before the
+        capture is durable. Hindsight retention can be backfilled later from
+        the append-only file; the live safety property is disk-first capture.
+        """
+        body = (text or "").strip()
+        if not body:
+            raise ValueError("empty idea body")
+        state_dir = _Path.home() / ".hermes" / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        inbox_path = state_dir / "idea-inbox.md"
+        ts = datetime.now(timezone.utc).isoformat()
+        # Single-line append by design; the morning surface parser expects
+        # one idea per line with an em dash separator.
+        one_line = " ".join(body.splitlines()).strip()
+        with inbox_path.open("a", encoding="utf-8") as f:
+            f.write(f"{ts} — {one_line}\n")
+
     async def _run_simple_slash(
         self,
         interaction: discord.Interaction,
@@ -3077,6 +3098,55 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(prompt="The prompt to run in the background")
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
+
+        @tree.command(name="gen", description="Accountability failsafe: run this request through the gate")
+        @discord.app_commands.describe(request="The request to run under /gen failsafe")
+        async def slash_gen(interaction: discord.Interaction, request: str):
+            # Leading space is intentional: MessageEvent.is_command() checks
+            # startswith('/'), but the accountability plugin's pre_llm_call
+            # detects /gen after whitespace and arms the override. This makes
+            # native Discord /gen behave like a normal user message carrying
+            # the failsafe, not like a gateway slash command swallowed before
+            # the LLM turn.
+            body = (request or "").strip()
+            if not body:
+                await interaction.response.send_message(
+                    "Usage: /gen <request>", ephemeral=True
+                )
+                return
+            await self._run_simple_slash(interaction, f" /gen {body}")
+
+        @tree.command(name="genuine", description="Alias for /gen accountability failsafe")
+        @discord.app_commands.describe(request="The request to run under /gen failsafe")
+        async def slash_genuine(interaction: discord.Interaction, request: str):
+            body = (request or "").strip()
+            if not body:
+                await interaction.response.send_message(
+                    "Usage: /genuine <request>", ephemeral=True
+                )
+                return
+            await self._run_simple_slash(interaction, f" /genuine {body}")
+
+        @tree.command(name="idea", description="Capture an idea without starting a discussion")
+        @discord.app_commands.describe(text="Idea text to append to the inbox")
+        async def slash_idea(interaction: discord.Interaction, text: str):
+            if not await self._check_slash_authorization(interaction, "/idea"):
+                return
+            body = (text or "").strip()
+            if not body:
+                await interaction.response.send_message(
+                    "Usage: /idea <text>", ephemeral=True
+                )
+                return
+            try:
+                self._capture_idea_inbox(body)
+                await interaction.response.send_message(
+                    "captured.", ephemeral=True
+                )
+            except Exception as exc:
+                await interaction.response.send_message(
+                    f"failed to capture idea: {exc}", ephemeral=True
+                )
 
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
