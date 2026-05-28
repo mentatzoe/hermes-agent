@@ -1,0 +1,7 @@
+name: hume-affect
+version: 0.1.0
+description: "Hume Expression Measurement affect overlay STT provider. Runs a configured primary STT provider and merges timed prosody tags into the transcript."
+author: Aleph
+kind: backend
+requires_env:
+  - HUME_API_KEY
