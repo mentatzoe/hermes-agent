@@ -46,6 +46,94 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_stop_typing_returns_when_typing_task_ignores_cancellation(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_mod
+
+    monkeypatch.setattr(discord_mod, "_DISCORD_TYPING_STOP_TIMEOUT_SECONDS", 0.05)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    chat_id = "555"
+    keep_ignoring = True
+
+    async def stubborn_typing_task():
+        nonlocal keep_ignoring
+        while True:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                if keep_ignoring:
+                    continue
+                raise
+
+    task = asyncio.create_task(stubborn_typing_task())
+    adapter._typing_tasks[chat_id] = task
+    adapter._typing_tokens[chat_id] = object()
+
+    started = asyncio.get_running_loop().time()
+    await adapter.stop_typing(chat_id)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.5
+    assert chat_id not in adapter._typing_tasks
+    assert chat_id not in adapter._typing_tokens
+
+    keep_ignoring = False
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_send_typing_stale_loop_cannot_remove_newer_typing_task():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    chat_id = "555"
+    first_request_started = asyncio.Event()
+    release_first_request = asyncio.Event()
+    request_count = 0
+
+    async def fake_request(_route):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            first_request_started.set()
+            try:
+                await release_first_request.wait()
+            except asyncio.CancelledError:
+                # Simulate an underlying HTTP call that swallows cancellation
+                # briefly before returning control to the typing loop.
+                await release_first_request.wait()
+        return None
+
+    adapter._client = SimpleNamespace(http=SimpleNamespace(request=fake_request))
+
+    await adapter.send_typing(chat_id)
+    await asyncio.wait_for(first_request_started.wait(), timeout=0.5)
+    old_task = adapter._typing_tasks[chat_id]
+    old_token = adapter._typing_tokens[chat_id]
+
+    # Simulate stop_typing timing out and a later turn starting a fresh typing
+    # loop before the stale task's finally block runs.
+    adapter._typing_tokens.pop(chat_id, None)
+    adapter._typing_tasks.pop(chat_id, None)
+    old_task.cancel()
+    await adapter.send_typing(chat_id)
+    new_task = adapter._typing_tasks[chat_id]
+    new_token = adapter._typing_tokens[chat_id]
+
+    assert old_token is not new_token
+    assert new_task is not old_task
+
+    release_first_request.set()
+    await asyncio.wait_for(old_task, timeout=0.5)
+
+    assert adapter._typing_tasks[chat_id] is new_task
+    assert adapter._typing_tokens[chat_id] is new_token
+
+    adapter._typing_tokens.pop(chat_id, None)
+    new_task.cancel()
+    await new_task
+
+
+@pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_system_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
 

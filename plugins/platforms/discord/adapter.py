@@ -30,6 +30,7 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_TYPING_STOP_TIMEOUT_SECONDS = 1.0
 
 try:
     import discord
@@ -607,6 +608,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._typing_tokens: Dict[str, object] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
         # Dedup cache: prevents duplicate bot responses when Discord
@@ -923,6 +925,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._post_connect_task
             except asyncio.CancelledError:
                 pass
+
+        for chat_id in list(self._typing_tasks):
+            try:
+                await self.stop_typing(chat_id)
+            except Exception:
+                logger.debug("[%s] Failed to stop Discord typing task for %s during disconnect", self.name, chat_id)
 
         self._running = False
         self._client = None
@@ -2753,12 +2761,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return
         # Don't start a duplicate loop
-        if chat_id in self._typing_tasks:
+        existing_task = self._typing_tasks.get(chat_id)
+        if existing_task is not None and not existing_task.done():
             return
+        self._typing_tasks.pop(chat_id, None)
+
+        token = object()
+        task_ref: Dict[str, asyncio.Task] = {}
+        self._typing_tokens[chat_id] = token
 
         async def _typing_loop() -> None:
             try:
-                while True:
+                while self._typing_tokens.get(chat_id) is token:
                     try:
                         route = discord.http.Route(
                             "POST", "/channels/{channel_id}/typing",
@@ -2783,21 +2797,40 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
                         await asyncio.sleep(retry_after)
                         continue
+                    if self._typing_tokens.get(chat_id) is not token:
+                        return
                     await asyncio.sleep(12)
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                task = task_ref.get("task")
+                if task is not None and self._typing_tasks.get(chat_id) is task:
+                    self._typing_tasks.pop(chat_id, None)
+                if self._typing_tokens.get(chat_id) is token:
+                    self._typing_tokens.pop(chat_id, None)
 
-        self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
+        task = asyncio.create_task(_typing_loop())
+        task_ref["task"] = task
+        self._typing_tasks[chat_id] = task
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop the persistent typing indicator for a channel."""
+        self._typing_tokens.pop(chat_id, None)
         task = self._typing_tasks.pop(chat_id, None)
         if task:
             task.cancel()
             try:
-                await task
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_DISCORD_TYPING_STOP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] Discord typing task for %s did not stop within %.1fs; continuing delivery",
+                    self.name,
+                    chat_id,
+                    _DISCORD_TYPING_STOP_TIMEOUT_SECONDS,
+                )
             except (asyncio.CancelledError, Exception):
                 pass
 
