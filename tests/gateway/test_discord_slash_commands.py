@@ -96,6 +96,15 @@ class FakeTree:
         return [SimpleNamespace(name=n) for n in self.commands]
 
 
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    """Ensure no real Discord env vars leak into tests."""
+    import os
+    for key in list(os.environ.keys()):
+        if key.startswith("DISCORD_"):
+            monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture
 def adapter():
     config = PlatformConfig(enabled=True, token="***")
