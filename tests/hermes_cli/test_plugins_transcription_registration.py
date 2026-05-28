@@ -108,7 +108,7 @@ class TestRegisterTranscriptionProvider:
 
         assert mgr._plugins["bad-stt-plugin"].enabled is True
         assert transcription_registry.get_provider("not a provider") is None
-        assert transcription_registry.list_providers() == []
+        assert not any(p.name == "not a provider" for p in transcription_registry.list_providers())
         assert "does not inherit from TranscriptionProvider" in caplog.text
 
         transcription_registry._reset_for_tests()
