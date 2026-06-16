@@ -26,6 +26,24 @@ logger = logging.getLogger("gateway.run")
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _kanban_internal_wake_target(self, sub: dict) -> tuple[str, str] | None:
+        """Return (target_kind, target_value) for internal-wake subscriptions.
+
+        ``kanban_notify_subs.user_id`` historically carries platform-user
+        metadata and is otherwise unused by the notifier.  A value of
+        ``session:<session_key>`` or ``session_id:<session_id>`` opts a
+        subscription into the gateway-local wake primitive instead of platform
+        send loopback, while preserving the existing subscription schema.
+        """
+        marker = str(sub.get("user_id") or "").strip()
+        if marker.startswith("session_id:"):
+            target = marker.split(":", 1)[1].strip()
+            return ("session_id", target) if target else None
+        if marker.startswith("session:"):
+            target = marker.split(":", 1)[1].strip()
+            return ("session_key", target) if target else None
+        return None
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -299,14 +317,40 @@ class GatewayKanbanWatchersMixin:
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
+                        internal_wake_delivery = False
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
-                            )
+                            wake_target = self._kanban_internal_wake_target(sub)
+                            if wake_target is not None:
+                                internal_wake_delivery = True
+                                target_kind, target_value = wake_target
+                                dedupe_key = f"kanban:{board_slug or ''}:{sub['task_id']}:{ev.id}"
+                                wake_kwargs = {
+                                    "payload": msg,
+                                    "source_kind": "kanban",
+                                    "dedupe_key": dedupe_key,
+                                }
+                                if target_kind == "session_id":
+                                    wake_kwargs["session_id"] = target_value
+                                else:
+                                    wake_kwargs["session_key"] = target_value
+                                result = await self.wake_session(**wake_kwargs)
+                                if result.get("status") == "failure":
+                                    raise RuntimeError(result.get("error") or "internal wake failed")
+                                logger.debug(
+                                    "kanban notifier: internally woke %s for %s event on %s (receipt=%s)",
+                                    target_value,
+                                    kind,
+                                    sub["task_id"],
+                                    result.get("receipt_id"),
+                                )
+                            else:
+                                await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
+                                logger.debug(
+                                    "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                                    kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
@@ -316,7 +360,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and not internal_wake_delivery:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,

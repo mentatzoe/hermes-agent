@@ -581,12 +581,38 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_wake_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    requested_at REAL NOT NULL,
+    dispatched_at REAL,
+    responded_at REAL,
+    source_kind TEXT NOT NULL,
+    target_session_key TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    origin_snapshot TEXT,
+    payload_hash TEXT NOT NULL,
+    payload_preview TEXT,
+    payload_bytes INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    injected_message_id INTEGER,
+    assistant_message_id INTEGER,
+    error TEXT,
+    dedupe_key TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_wake_receipts_target
+    ON session_wake_receipts(target_session_key, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_wake_receipts_dedupe
+    ON session_wake_receipts(target_session_key, dedupe_key)
+    WHERE dedupe_key IS NOT NULL;
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -2361,6 +2387,122 @@ class SessionDB:
                 )
                 return content
         return content
+
+    def create_session_wake_receipt(
+        self,
+        *,
+        source_kind: str,
+        target_session_key: str,
+        target_session_id: str,
+        origin_snapshot: Optional[Dict[str, Any]],
+        payload_hash: str,
+        payload_preview: str,
+        payload_bytes: int,
+        dedupe_key: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Create a durable receipt for a gateway-internal session wake.
+
+        Returns ``(row, created)``.  When ``dedupe_key`` has already been used
+        for the same target session, no new row is inserted and the existing row
+        is returned with ``created=False``.
+        """
+        now = time.time()
+        origin_json = json.dumps(origin_snapshot, sort_keys=True) if origin_snapshot else None
+        dedupe_value = str(dedupe_key) if dedupe_key else None
+
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO session_wake_receipts (
+                    created_at, updated_at, requested_at, source_kind,
+                    target_session_key, target_session_id, origin_snapshot,
+                    payload_hash, payload_preview, payload_bytes, status,
+                    dedupe_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?)
+                """,
+                (
+                    now,
+                    now,
+                    now,
+                    source_kind,
+                    target_session_key,
+                    target_session_id,
+                    origin_json,
+                    payload_hash,
+                    payload_preview,
+                    payload_bytes,
+                    dedupe_value,
+                ),
+            )
+            created = cursor.rowcount > 0
+            if created:
+                row_id = cursor.lastrowid
+                row = conn.execute(
+                    "SELECT * FROM session_wake_receipts WHERE id = ?",
+                    (row_id,),
+                ).fetchone()
+            elif dedupe_value is not None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM session_wake_receipts
+                    WHERE target_session_key = ? AND dedupe_key = ?
+                    ORDER BY id LIMIT 1
+                    """,
+                    (target_session_key, dedupe_value),
+                ).fetchone()
+            else:
+                row = None
+            return (dict(row) if row else {}, created)
+
+        return self._execute_write(_do)
+
+    def update_session_wake_receipt(
+        self,
+        receipt_id: int,
+        *,
+        status: Optional[str] = None,
+        dispatched: bool = False,
+        responded: bool = False,
+        injected_message_id: Optional[int] = None,
+        assistant_message_id: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update a session wake receipt and return the updated row."""
+        now = time.time()
+
+        def _do(conn):
+            fields = ["updated_at = ?"]
+            values: List[Any] = [now]
+            if status is not None:
+                fields.append("status = ?")
+                values.append(status)
+            if dispatched:
+                fields.append("dispatched_at = COALESCE(dispatched_at, ?)")
+                values.append(now)
+            if responded:
+                fields.append("responded_at = COALESCE(responded_at, ?)")
+                values.append(now)
+            if injected_message_id is not None:
+                fields.append("injected_message_id = ?")
+                values.append(injected_message_id)
+            if assistant_message_id is not None:
+                fields.append("assistant_message_id = ?")
+                values.append(assistant_message_id)
+            if error is not None:
+                fields.append("error = ?")
+                values.append(error[:2000])
+            values.append(receipt_id)
+            conn.execute(
+                f"UPDATE session_wake_receipts SET {', '.join(fields)} WHERE id = ?",
+                tuple(values),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_wake_receipts WHERE id = ?",
+                (receipt_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+        return self._execute_write(_do)
 
     def append_message(
         self,

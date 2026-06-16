@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 
 from gateway.config import Platform
@@ -171,6 +172,47 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_internal_session_subscription_uses_wake_not_send(tmp_path, monkeypatch):
+    db_path = tmp_path / "internal-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wake task", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            user_id="session:agent:main:telegram:dm:lane-1",
+        )
+        kb.complete_task(
+            conn,
+            tid,
+            summary="wake me internally",
+            metadata={"artifacts": [str(tmp_path / "artifact.txt")]},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.wake_session = AsyncMock(return_value={"status": "agent_responded", "receipt_id": 99})
+    runner._deliver_kanban_artifacts = AsyncMock()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    runner._deliver_kanban_artifacts.assert_not_awaited()
+    runner.wake_session.assert_awaited_once()
+    kwargs = runner.wake_session.await_args.kwargs
+    assert kwargs["session_key"] == "agent:main:telegram:dm:lane-1"
+    assert kwargs["source_kind"] == "kanban"
+    assert kwargs["dedupe_key"].startswith(f"kanban:default:{tid}:")
+    assert "Kanban" in kwargs["payload"]
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):

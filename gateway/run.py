@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -4792,6 +4793,234 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+
+    def _lookup_session_entry_for_wake(
+        self,
+        *,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
+        """Resolve an existing SessionEntry for an internal wake request."""
+        if bool(session_key) == bool(session_id):
+            raise ValueError("provide exactly one of session_key or session_id")
+        if session_id:
+            return self.session_store.lookup_by_session_id(session_id)
+        if session_key is None:
+            raise ValueError("session_key is required when session_id is not provided")
+        return self.session_store.lookup_by_session_key(session_key)
+
+    def _wake_message_ids_after(
+        self,
+        session_id: str,
+        *,
+        previous_max_id: int,
+        payload: str,
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Best-effort lookup of the injected user row and assistant row."""
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return None, None
+        try:
+            messages = session_db.get_messages(session_id)
+        except Exception:
+            logger.debug("failed to inspect wake messages for %s", session_id, exc_info=True)
+            return None, None
+        new_messages = [m for m in messages if int(m.get("id") or 0) > previous_max_id]
+        injected_id: Optional[int] = None
+        assistant_id: Optional[int] = None
+        for msg in new_messages:
+            if injected_id is None and msg.get("role") == "user" and msg.get("content") == payload:
+                injected_id = int(msg["id"])
+                continue
+            if injected_id is not None and msg.get("role") == "assistant":
+                assistant_id = int(msg["id"])
+                break
+        if injected_id is None:
+            for msg in new_messages:
+                if msg.get("role") == "user":
+                    injected_id = int(msg["id"])
+                    break
+        if assistant_id is None:
+            for msg in new_messages:
+                if msg.get("role") == "assistant":
+                    assistant_id = int(msg["id"])
+                    break
+        return injected_id, assistant_id
+
+    async def wake_session(
+        self,
+        *,
+        payload: str,
+        source_kind: str,
+        session_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        dedupe_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Inject a trusted internal event into an existing gateway session.
+
+        This is a gateway-local primitive for cron/Kanban/control-plane callers:
+        it resolves an existing SessionEntry, reuses that entry's stored origin,
+        dispatches ``MessageEvent(..., internal=True)`` through the live adapter
+        pipeline, and records a bounded receipt in state.db.
+        """
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return {
+                "status": "failure",
+                "error": "session database unavailable for wake receipt",
+            }
+
+        try:
+            entry = self._lookup_session_entry_for_wake(
+                session_key=session_key,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            return {"status": "failure", "error": str(exc)}
+        if entry is None:
+            return {"status": "failure", "error": "target session not found"}
+        if entry.origin is None:
+            return {"status": "failure", "error": "target session has no stored origin"}
+
+        payload = str(payload or "")
+        payload_bytes = len(payload.encode("utf-8", errors="replace"))
+        payload_hash = hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+        payload_preview = payload[:500]
+        try:
+            origin_snapshot = entry.origin.to_dict()
+        except Exception:
+            origin_snapshot = None
+
+        receipt, created = session_db.create_session_wake_receipt(
+            source_kind=source_kind,
+            target_session_key=entry.session_key,
+            target_session_id=entry.session_id,
+            origin_snapshot=origin_snapshot,
+            payload_hash=payload_hash,
+            payload_preview=payload_preview,
+            payload_bytes=payload_bytes,
+            dedupe_key=dedupe_key,
+        )
+        if not created:
+            existing_status = str(receipt.get("status") or "")
+            if existing_status not in {"failure", "requested"}:
+                return {
+                    "status": "deduped",
+                    "receipt_id": receipt.get("id"),
+                    "target_session_key": entry.session_key,
+                    "target_session_id": entry.session_id,
+                }
+            # A prior attempt reserved the dedupe key but did not complete.
+            # Reuse that receipt so transient adapter/handler failures retry
+            # the wake instead of silently advancing the caller's cursor.
+            receipt = session_db.update_session_wake_receipt(
+                int(receipt["id"]),
+                status="requested",
+                error="",
+            ) or receipt
+
+        receipt_id = int(receipt["id"])
+        adapter = self.adapters.get(entry.origin.platform)
+        if adapter is None:
+            error = f"adapter unavailable for {entry.origin.platform.value}"
+            row = session_db.update_session_wake_receipt(
+                receipt_id,
+                status="failure",
+                error=error,
+            )
+            return {
+                "status": "failure",
+                "error": error,
+                "receipt_id": receipt_id,
+                "receipt": row,
+            }
+
+        before_max_id = 0
+        try:
+            existing_messages = session_db.get_messages(entry.session_id)
+            before_max_id = max((int(m.get("id") or 0) for m in existing_messages), default=0)
+        except Exception:
+            logger.debug("failed to snapshot pre-wake message id", exc_info=True)
+
+        event = MessageEvent(
+            text=payload,
+            message_type=MessageType.TEXT,
+            source=dataclasses.replace(entry.origin),
+            internal=True,
+            message_id=f"internal-wake:{receipt_id}",
+        )
+        try:
+            setattr(event, "_hermes_internal_wake_receipt_id", receipt_id)
+            if dedupe_key:
+                setattr(event, "_hermes_internal_wake_dedupe_key", dedupe_key)
+            setattr(event, "_hermes_internal_wake_source_kind", source_kind)
+        except Exception:
+            pass
+
+        try:
+            session_db.update_session_wake_receipt(
+                receipt_id,
+                status="dispatched",
+                dispatched=True,
+            )
+            await adapter.handle_message(event)
+            session_tasks = getattr(adapter, "_session_tasks", {})
+            task = None
+            if isinstance(session_tasks, dict):
+                task = session_tasks.get(entry.session_key)
+                if task is None:
+                    try:
+                        adapter_key = build_session_key(
+                            event.source,
+                            group_sessions_per_user=adapter.config.extra.get(
+                                "group_sessions_per_user", True
+                            ),
+                            thread_sessions_per_user=adapter.config.extra.get(
+                                "thread_sessions_per_user", False
+                            ),
+                        )
+                    except Exception:
+                        adapter_key = None
+                    if adapter_key:
+                        task = session_tasks.get(adapter_key)
+            if task is not None:
+                await asyncio.shield(task)
+            injected_id, assistant_id = self._wake_message_ids_after(
+                entry.session_id,
+                previous_max_id=before_max_id,
+                payload=payload,
+            )
+            status = "agent_responded" if assistant_id is not None else "dispatched"
+            row = session_db.update_session_wake_receipt(
+                receipt_id,
+                status=status,
+                responded=assistant_id is not None,
+                injected_message_id=injected_id,
+                assistant_message_id=assistant_id,
+            )
+            return {
+                "status": status,
+                "receipt_id": receipt_id,
+                "target_session_key": entry.session_key,
+                "target_session_id": entry.session_id,
+                "injected_message_id": injected_id,
+                "assistant_message_id": assistant_id,
+                "receipt": row,
+            }
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            row = session_db.update_session_wake_receipt(
+                receipt_id,
+                status="failure",
+                error=error,
+            )
+            logger.warning("internal wake failed for %s: %s", entry.session_key, error)
+            return {
+                "status": "failure",
+                "error": error,
+                "receipt_id": receipt_id,
+                "receipt": row,
+            }
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
