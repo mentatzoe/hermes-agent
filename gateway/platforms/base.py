@@ -3957,6 +3957,32 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # Gateway-local internal wakes are trusted control-plane events
+            # targeting this existing session.  When the target is already
+            # active, they must be queued for the next turn without going
+            # through command, clarify, or busy-session bypasses: the default
+            # live busy mode is ``interrupt``, and clarify/command bypasses
+            # are intended for human-authored foreground replies, not internal
+            # wake payloads.  The wake receipt id marker keeps this narrow to
+            # the production wake_session primitive rather than every internal
+            # event.
+            if getattr(event, "internal", False) and hasattr(
+                event,
+                "_hermes_internal_wake_receipt_id",
+            ):
+                logger.debug(
+                    "[%s] Queuing internal wake for active session %s without foreground bypass",
+                    self.name,
+                    session_key,
+                )
+                merge_pending_message_event(
+                    self._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=event.message_type == MessageType.TEXT,
+                )
+                return
+
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -4066,32 +4092,6 @@ class BasePlatformAdapter(ABC):
                             self.name, e, exc_info=True,
                         )
                     return
-
-            # Gateway-local internal wakes are trusted control-plane events
-            # targeting this existing session.  When the target is already
-            # active, they must be queued for the next turn without going
-            # through the normal busy handler: the default live mode is
-            # ``interrupt``, and interrupting the current agent from an
-            # internal wake defeats the purpose of a non-disruptive wake
-            # receipt.  The wake receipt id marker keeps this narrow to the
-            # production wake_session primitive rather than every internal
-            # event.
-            if getattr(event, "internal", False) and hasattr(
-                event,
-                "_hermes_internal_wake_receipt_id",
-            ):
-                logger.debug(
-                    "[%s] Queuing internal wake for active session %s without busy interrupt",
-                    self.name,
-                    session_key,
-                )
-                merge_pending_message_event(
-                    self._pending_messages,
-                    session_key,
-                    event,
-                    merge_text=event.message_type == MessageType.TEXT,
-                )
-                return
 
             if self._busy_session_handler is not None:
                 try:

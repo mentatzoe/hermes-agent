@@ -332,3 +332,133 @@ def test_internal_wake_queues_active_base_adapter_without_interrupting_running_a
     assert rows[0]["status"] == "queued"
     assert rows[0]["dispatched_at"] is not None
     assert rows[0]["responded_at"] is None
+
+
+def test_internal_wake_queues_active_base_adapter_without_resolving_pending_clarify(monkeypatch, tmp_path):
+    runner, calls = _runner(monkeypatch, tmp_path)
+    adapter = RestartTestAdapter()
+    adapter.set_message_handler(runner._handle_message)
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._is_user_authorized = lambda source: True
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    entry = runner.session_store.get_or_create_session(_origin("lane-clarify-active"))
+
+    interrupt_calls = []
+
+    class RunningAgent:
+        def interrupt(self, reason):
+            interrupt_calls.append(reason)
+
+        def get_activity_summary(self):
+            return {}
+
+    from tools import clarify_gateway as clarify_mod
+
+    clarify_id = "internal-wake-clarify-active"
+    clarify_entry = clarify_mod.register(
+        clarify_id,
+        entry.session_key,
+        "Human answer?",
+        None,
+    )
+
+    async def scenario():
+        never_done = asyncio.Event()
+        running_task = asyncio.create_task(never_done.wait())
+        adapter._active_sessions[entry.session_key] = asyncio.Event()
+        adapter._session_tasks[entry.session_key] = running_task
+        runner._running_agents[entry.session_key] = RunningAgent()
+        try:
+            return await asyncio.wait_for(
+                runner.wake_session(
+                    session_key=entry.session_key,
+                    payload="INTERNAL_WAKE_TEST_CLARIFY_ACTIVE_QUEUE",
+                    source_kind="send_message",
+                    dedupe_key="clarify-active-queue-marker",
+                ),
+                timeout=0.2,
+            )
+        finally:
+            running_task.cancel()
+            await asyncio.gather(running_task, return_exceptions=True)
+
+    try:
+        result = asyncio.run(scenario())
+
+        assert result["status"] == "queued"
+        assert calls == []
+        assert interrupt_calls == []
+        assert clarify_entry.response is None
+        pending = adapter._pending_messages[entry.session_key]
+        assert pending.internal is True
+        assert pending.text == "INTERNAL_WAKE_TEST_CLARIFY_ACTIVE_QUEUE"
+        assert adapter.sent == []
+
+        rows = _receipt_rows(runner, entry.session_key)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "queued"
+        assert rows[0]["dispatched_at"] is not None
+        assert rows[0]["responded_at"] is None
+    finally:
+        clarify_mod.clear_session(entry.session_key)
+
+
+def test_internal_wake_queues_active_base_adapter_even_with_slash_command_payload(monkeypatch, tmp_path):
+    runner, calls = _runner(monkeypatch, tmp_path)
+    adapter = RestartTestAdapter()
+    message_handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(message_handler)
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._is_user_authorized = lambda source: True
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    entry = runner.session_store.get_or_create_session(_origin("lane-command-active"))
+
+    interrupt_calls = []
+
+    class RunningAgent:
+        def interrupt(self, reason):
+            interrupt_calls.append(reason)
+
+        def get_activity_summary(self):
+            return {}
+
+    async def scenario():
+        never_done = asyncio.Event()
+        running_task = asyncio.create_task(never_done.wait())
+        adapter._active_sessions[entry.session_key] = asyncio.Event()
+        adapter._session_tasks[entry.session_key] = running_task
+        runner._running_agents[entry.session_key] = RunningAgent()
+        try:
+            return await asyncio.wait_for(
+                runner.wake_session(
+                    session_key=entry.session_key,
+                    payload="/status INTERNAL_WAKE_TEST_COMMAND_ACTIVE_QUEUE",
+                    source_kind="send_message",
+                    dedupe_key="command-active-queue-marker",
+                ),
+                timeout=0.2,
+            )
+        finally:
+            running_task.cancel()
+            await asyncio.gather(running_task, return_exceptions=True)
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "queued"
+    assert calls == []
+    assert interrupt_calls == []
+    message_handler.assert_not_awaited()
+    pending = adapter._pending_messages[entry.session_key]
+    assert pending.internal is True
+    assert pending.text == "/status INTERNAL_WAKE_TEST_COMMAND_ACTIVE_QUEUE"
+    assert adapter.sent == []
+
+    rows = _receipt_rows(runner, entry.session_key)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "queued"
+    assert rows[0]["dispatched_at"] is not None
+    assert rows[0]["responded_at"] is None
