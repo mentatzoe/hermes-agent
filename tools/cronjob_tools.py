@@ -277,12 +277,19 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
                 "Cron origin captured thread_id=%s for %s:%s",
                 thread_id, origin_platform, origin_chat_id,
             )
-        return {
+        origin = {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
             "thread_id": thread_id,
         }
+        session_key = get_session_env("HERMES_SESSION_KEY") or None
+        session_id = get_session_env("HERMES_SESSION_ID") or None
+        if session_key:
+            origin["session_key"] = session_key
+        if session_id:
+            origin["session_id"] = session_id
+        return origin
     return None
 
 

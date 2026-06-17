@@ -1,8 +1,10 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import asyncio
 import json
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -612,7 +614,7 @@ class TestDeliverResultWrapping:
         media_path = self._safe_media_path(tmp_path, monkeypatch, "cron-voice.mp3")
 
         adapter = AsyncMock()
-        adapter.send.return_value = MagicMock(success=True)
+        adapter.send.return_value = MagicMock(success=True, raw_response=None)
         adapter.send_voice.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
@@ -664,7 +666,7 @@ class TestDeliverResultWrapping:
         media_path = self._safe_media_path(tmp_path, monkeypatch, "chart.png")
 
         adapter = AsyncMock()
-        adapter.send.return_value = MagicMock(success=True)
+        adapter.send.return_value = MagicMock(success=True, raw_response=None)
         adapter.send_image_file.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
@@ -752,7 +754,7 @@ class TestDeliverResultWrapping:
         from concurrent.futures import Future
 
         adapter = AsyncMock()
-        adapter.send.return_value = MagicMock(success=True)
+        adapter.send.return_value = MagicMock(success=True, raw_response=None)
 
         pconfig = MagicMock()
         pconfig.enabled = True
@@ -835,6 +837,212 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
+
+
+class TestDeliverResultInternalWake:
+    """Cron delivery wake is a gateway-local internal wake after visible delivery."""
+
+    @staticmethod
+    def _immediate_threadsafe(coro, _loop):
+        from concurrent.futures import Future
+
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:  # pragma: no cover - mirrors real Future failure shape
+            future.set_exception(exc)
+        return future
+
+    @staticmethod
+    def _enabled_discord_config():
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+        return mock_cfg
+
+    @staticmethod
+    def _entry(session_key="agent:main:discord:thread:chan:thread", session_id="session-123"):
+        from gateway.config import Platform
+
+        origin = SimpleNamespace(
+            platform=Platform.DISCORD,
+            chat_id="chan",
+            thread_id="thread",
+        )
+        return SimpleNamespace(
+            session_key=session_key,
+            session_id=session_id,
+            origin=origin,
+            updated_at="2026-06-17T13:00:00",
+        )
+
+    def test_successful_delivery_wakes_existing_session_when_gate_enabled(self):
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True, message_id="msg-1", raw_response=None)
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        entry = self._entry()
+        runner = SimpleNamespace()
+        runner.session_store = SimpleNamespace(list_sessions=MagicMock(return_value=[entry]))
+        wake_calls = []
+
+        async def wake_session(**kwargs):
+            wake_calls.append(kwargs)
+            return {"status": "queued", "receipt_id": 77}
+
+        runner.wake_session = wake_session
+        job = {
+            "id": "cron-wake-job",
+            "name": "cron wake job",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "chan", "thread_id": "thread"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._enabled_discord_config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "wake_agent_on_delivery": True}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=self._immediate_threadsafe):
+            error = _deliver_result(
+                job,
+                "Cron output marker CRON_WAKE_TEST",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+                runner=runner,
+            )
+
+        assert error is None
+        adapter.send.assert_called_once()
+        assert wake_calls == [
+            {
+                "session_key": entry.session_key,
+                "payload": (
+                    "Internal wake from cron delivery: cron job 'cron wake job' "
+                    "(id: cron-wake-job) delivered output into this existing "
+                    "discord session. Consume the delivered cron result and "
+                    "continue if follow-through is needed.\n\n"
+                    "Delivered content:\nCron output marker CRON_WAKE_TEST"
+                ),
+                "source_kind": "cron_delivery",
+                "dedupe_key": "cron_delivery:cron-wake-job:discord:chan:thread:32b9a9f001ff2649fd610c0526870c8e559c7e0936bb9ee2229364537e888f65",
+            }
+        ]
+
+    def test_origin_session_key_is_not_used_for_explicit_different_delivery_target(self):
+        from cron.scheduler import _resolve_cron_wake_target
+
+        origin_entry = self._entry(session_key="origin-session", session_id="origin-id")
+        target_entry = self._entry(session_key="target-session", session_id="target-id")
+        target_entry.origin.chat_id = "other-chan"
+        runner = SimpleNamespace(
+            session_store=SimpleNamespace(list_sessions=MagicMock(return_value=[origin_entry, target_entry]))
+        )
+        job = {
+            "id": "cron-explicit-target",
+            "deliver": "discord:other-chan:thread",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "chan",
+                "thread_id": "thread",
+                "session_key": "origin-session",
+            },
+        }
+        target = {"platform": "discord", "chat_id": "other-chan", "thread_id": "thread"}
+
+        assert _resolve_cron_wake_target(job, target, runner) == {"session_key": "target-session"}
+
+    def test_gate_false_delivers_without_wake_attempt(self):
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True, raw_response=None)
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        runner = SimpleNamespace(
+            session_store=SimpleNamespace(list_sessions=MagicMock(return_value=[self._entry()])),
+            wake_session=AsyncMock(return_value={"status": "queued"}),
+        )
+        job = {
+            "id": "cron-no-wake",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "chan", "thread_id": "thread"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._enabled_discord_config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "wake_agent_on_delivery": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=self._immediate_threadsafe):
+            error = _deliver_result(
+                job,
+                "visible only",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+                runner=runner,
+            )
+
+        assert error is None
+        adapter.send.assert_called_once()
+        runner.wake_session.assert_not_called()
+
+    def test_failed_delivery_does_not_attempt_wake(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+        runner = SimpleNamespace(wake_session=AsyncMock())
+        job = {
+            "id": "cron-failed-delivery",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "chan", "thread_id": "thread"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "wake_agent_on_delivery": True}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"error": "network down"})):
+            error = _deliver_result(job, "undelivered", runner=runner)
+
+        assert error is not None
+        assert "network down" in error
+        runner.wake_session.assert_not_called()
+
+    def test_unavailable_target_does_not_break_visible_delivery(self, caplog):
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True, raw_response=None)
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        runner = SimpleNamespace(
+            session_store=SimpleNamespace(list_sessions=MagicMock(return_value=[])),
+            wake_session=AsyncMock(return_value={"status": "queued"}),
+        )
+        job = {
+            "id": "cron-no-session",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "chan", "thread_id": "thread"},
+        }
+
+        with caplog.at_level(logging.INFO, logger="cron.scheduler"), \
+             patch("gateway.config.load_gateway_config", return_value=self._enabled_discord_config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "wake_agent_on_delivery": True}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=self._immediate_threadsafe):
+            error = _deliver_result(
+                job,
+                "delivered without session",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+                runner=runner,
+            )
+
+        assert error is None
+        adapter.send.assert_called_once()
+        runner.wake_session.assert_not_called()
+        assert "wake skipped" in caplog.text
 
 
 class TestDeliverResultErrorReturns:
@@ -2487,7 +2695,7 @@ class TestDeliverResultTimeoutCancelsFuture:
 
         # Live adapter whose send() coroutine never resolves within the budget
         adapter = AsyncMock()
-        adapter.send.return_value = MagicMock(success=True)
+        adapter.send.return_value = MagicMock(success=True, raw_response=None)
 
         pconfig = MagicMock()
         pconfig.enabled = True

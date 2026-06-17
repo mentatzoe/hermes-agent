@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Coroutine, List, Optional, cast
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -656,7 +657,168 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _cron_wake_on_delivery_enabled(cfg: dict | None) -> bool:
+    """Whether a successful cron delivery should wake the target session."""
+    cron_cfg = (cfg or {}).get("cron", {}) if isinstance(cfg, dict) else {}
+    return bool(cron_cfg.get("wake_agent_on_delivery", False))
+
+
+def _platform_value(value: Any) -> str:
+    if hasattr(value, "value"):
+        return str(value.value).lower()
+    return str(value or "").lower()
+
+
+def _blankish(value: Any) -> str:
+    return str(value or "")
+
+
+def _entry_matches_delivery_target(entry: Any, target: dict) -> bool:
+    origin = getattr(entry, "origin", None)
+    if origin is None:
+        return False
+    if _platform_value(getattr(origin, "platform", "")) != str(target.get("platform") or "").lower():
+        return False
+    if _blankish(getattr(origin, "chat_id", "")) != _blankish(target.get("chat_id")):
+        return False
+    return _blankish(getattr(origin, "thread_id", "")) == _blankish(target.get("thread_id"))
+
+
+def _origin_dict_matches_delivery_target(origin: dict, target: dict) -> bool:
+    if str(origin.get("platform") or "").lower() != str(target.get("platform") or "").lower():
+        return False
+    if _blankish(origin.get("chat_id")) != _blankish(target.get("chat_id")):
+        return False
+    return _blankish(origin.get("thread_id")) == _blankish(target.get("thread_id"))
+
+
+def _resolve_cron_wake_target(job: dict, target: dict, runner: Any) -> dict | None:
+    """Resolve cron delivery to an existing gateway session key/id.
+
+    Newer cron jobs may persist the originating session_key/session_id in
+    origin. Older jobs only have platform/chat/thread origin metadata, so while
+    running inside the gateway we search the live SessionStore for an entry with
+    the same stored origin. We never synthesize a cron-scheduler identity here:
+    if no existing session resolves, cron delivery remains visible-only.
+    """
+    origin_value = job.get("origin")
+    origin = origin_value if isinstance(origin_value, dict) else {}
+    # A stored origin session key/id is only the delivery target for origin-like
+    # delivery.  If the job is explicitly delivering elsewhere, resolve by the
+    # delivered platform/chat/thread below instead of waking the creator lane.
+    if _origin_dict_matches_delivery_target(origin, target):
+        for key in ("session_key", "gateway_session_key"):
+            value = str(origin.get(key) or "").strip()
+            if value:
+                return {"session_key": value}
+        for key in ("session_id", "gateway_session_id"):
+            value = str(origin.get(key) or "").strip()
+            if value:
+                return {"session_id": value}
+
+    store = getattr(runner, "session_store", None)
+    if store is None:
+        return None
+    entries = []
+    try:
+        entries = list(store.list_sessions())
+    except TypeError:
+        try:
+            entries = list(store.list_sessions(active_minutes=None))
+        except Exception:
+            entries = []
+    except Exception:
+        entries = []
+    for entry in entries:
+        if _entry_matches_delivery_target(entry, target):
+            session_key = str(getattr(entry, "session_key", "") or "").strip()
+            if session_key:
+                return {"session_key": session_key}
+            session_id = str(getattr(entry, "session_id", "") or "").strip()
+            if session_id:
+                return {"session_id": session_id}
+    return None
+
+
+def _schedule_cron_delivery_wake(
+    *,
+    job: dict,
+    target: dict,
+    delivered_content: str,
+    runner: Any,
+    loop: Any,
+) -> dict:
+    """Best-effort internal wake after successful cron delivery.
+
+    Returns a status dict for logging/tests. Failures are deliberately non-fatal
+    to visible delivery: a delivery notification reaching Discord/Telegram must
+    not be rolled back because the optional wake path could not resolve a live
+    gateway session.
+    """
+    if runner is None:
+        return {"status": "skipped", "reason": "runner unavailable"}
+    wake_fn = getattr(runner, "wake_session", None)
+    if not callable(wake_fn):
+        return {"status": "skipped", "reason": "wake_session unavailable"}
+    if loop is None or not getattr(loop, "is_running", lambda: False)():
+        return {"status": "skipped", "reason": "gateway loop unavailable"}
+
+    wake_target = _resolve_cron_wake_target(job, target, runner)
+    if not wake_target:
+        return {"status": "skipped", "reason": "target session unavailable"}
+
+    platform_name = str(target.get("platform") or "").lower()
+    chat_id = str(target.get("chat_id") or "")
+    thread_id = str(target.get("thread_id") or "")
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job_id or "cron job")
+    dedupe_material = "\0".join([job_id, platform_name, chat_id, thread_id, delivered_content])
+    dedupe_hash = hashlib.sha256(dedupe_material.encode("utf-8", errors="replace")).hexdigest()
+    payload = (
+        f"Internal wake from cron delivery: cron job '{job_name}' "
+        f"(id: {job_id}) delivered output into this existing "
+        f"{platform_name} session. Consume the delivered cron result and "
+        "continue if follow-through is needed.\n\n"
+        f"Delivered content:\n{delivered_content}"
+    )
+    dedupe_key = f"cron_delivery:{job_id}:{platform_name}:{chat_id}:{thread_id}:{dedupe_hash}"
+
+    wake_coro = cast(Coroutine[Any, Any, Any], wake_fn(
+        **wake_target,
+        payload=payload,
+        source_kind="cron_delivery",
+        dedupe_key=dedupe_key,
+    ))
+    scheduled = False
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+        future = safe_schedule_threadsafe(
+            wake_coro,
+            loop,
+            logger=logger,
+            log_message="Cron delivery wake scheduling error",
+        )
+        if future is None:
+            try:
+                wake_coro.close()
+            except Exception:
+                pass
+            return {"status": "skipped", "reason": "gateway loop unavailable"}
+        scheduled = True
+        result = future.result(timeout=60)
+        if isinstance(result, dict):
+            return result
+        return {"status": "unknown", "result": result}
+    except Exception as exc:
+        if not scheduled:
+            try:
+                wake_coro.close()
+            except Exception:
+                pass
+        return {"status": "failure", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, runner=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -682,9 +844,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
     wrap_response = True
+    wake_on_delivery = False
     try:
         user_cfg = load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        wake_on_delivery = _cron_wake_on_delivery_enabled(user_cfg)
     except Exception:
         pass
 
@@ -845,6 +1009,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            delivered = True
+
+        if delivered and wake_on_delivery:
+            wake_result = _schedule_cron_delivery_wake(
+                job=job,
+                target=target,
+                delivered_content=delivery_content,
+                runner=runner,
+                loop=loop,
+            )
+            wake_status = str(wake_result.get("status") or "")
+            if wake_status in {"skipped", "unavailable"}:
+                logger.info(
+                    "Job '%s': cron delivery wake skipped for %s:%s (%s)",
+                    job["id"], platform_name, chat_id, wake_result.get("reason") or wake_status,
+                )
+            elif wake_status == "failure":
+                logger.warning(
+                    "Job '%s': cron delivery wake failed for %s:%s (%s)",
+                    job["id"], platform_name, chat_id, wake_result.get("error") or "unknown error",
+                )
+            else:
+                logger.info(
+                    "Job '%s': cron delivery wake status=%s receipt=%s for %s:%s",
+                    job["id"], wake_status, wake_result.get("receipt_id"), platform_name, chat_id,
+                )
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -1967,7 +2157,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(verbose: bool = True, adapters=None, loop=None, runner=None, sync: bool = True) -> int:
     """
     Check and run all due jobs.
     
@@ -2068,7 +2258,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop, runner=runner)
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
