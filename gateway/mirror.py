@@ -149,6 +149,21 @@ def _find_session_id(
     return best_entry.get("session_id")
 
 
+def find_session_id(
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Public lookup helper for callers that need the mirrored target.
+
+    ``mirror_to_session`` intentionally returns a bool for backward
+    compatibility. Internal wake callers need the same exact target-session
+    resolution without duplicating the sessions-index matching rules, so expose
+    a narrow wrapper around the existing private lookup.
+    """
+    return _find_session_id(platform, chat_id, thread_id=thread_id, user_id=user_id)
+
 
 def _append_to_sqlite(session_id: str, message: dict) -> None:
     """Append a message to the SQLite session database."""

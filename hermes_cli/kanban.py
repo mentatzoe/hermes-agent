@@ -686,6 +686,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nsub.add_argument("--chat-id", required=True)
     p_nsub.add_argument("--thread-id", default=None)
     p_nsub.add_argument("--user-id", default=None)
+    target = p_nsub.add_mutually_exclusive_group()
+    target.add_argument(
+        "--session-key",
+        default=None,
+        help="Wake this existing gateway session key instead of visible platform delivery",
+    )
+    target.add_argument(
+        "--session-id",
+        default=None,
+        help="Wake this existing gateway session id instead of visible platform delivery",
+    )
     p_nsub.add_argument(
         "--notifier-profile", default=None,
         help="Profile gateway that owns/delivers this subscription (default: active profile)",
@@ -2417,6 +2428,24 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+    wake_user_id = args.user_id
+    if args.session_key:
+        if args.user_id:
+            print(
+                "notify-subscribe: pass either --user-id or --session-key/--session-id, not both",
+                file=sys.stderr,
+            )
+            return 2
+        wake_user_id = f"session:{args.session_key}"
+    elif args.session_id:
+        if args.user_id:
+            print(
+                "notify-subscribe: pass either --user-id or --session-key/--session-id, not both",
+                file=sys.stderr,
+            )
+            return 2
+        wake_user_id = f"session_id:{args.session_id}"
+
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -2424,7 +2453,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
-            thread_id=args.thread_id, user_id=args.user_id,
+            thread_id=args.thread_id, user_id=wake_user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"

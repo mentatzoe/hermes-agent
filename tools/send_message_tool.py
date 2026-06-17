@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -439,24 +440,80 @@ def _handle_send(args):
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
-        # Mirror the sent message into the target's gateway session
+        # Mirror the sent message into the target's gateway session, then wake
+        # that live session when this tool is executing inside the gateway
+        # process.  The mirror preserves the visible outbound delivery record;
+        # the internal wake is the deliberate control-plane event that causes
+        # the target lane's agent to actually consume the new context.
         if isinstance(result, dict) and result.get("success") and mirror_text:
             try:
-                from gateway.mirror import mirror_to_session
+                from gateway.mirror import find_session_id, mirror_to_session
                 from gateway.session_context import get_session_env
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-                if mirror_to_session(
+                mirrored = mirror_to_session(
                     platform_name,
                     chat_id,
                     mirror_text,
                     source_label=source_label,
                     thread_id=thread_id,
                     user_id=user_id,
-                ):
+                )
+                if mirrored:
                     result["mirrored"] = True
+                    target_session_id = find_session_id(
+                        platform_name,
+                        chat_id,
+                        thread_id=thread_id,
+                        user_id=user_id,
+                    )
+                    runner = None
+                    try:
+                        from gateway.run import _gateway_runner_ref
+                        runner = _gateway_runner_ref()
+                    except Exception:
+                        runner = None
+                    wake_fn = getattr(runner, "wake_session", None) if runner is not None else None
+                    if target_session_id and callable(wake_fn):
+                        message_id = str(result.get("message_id") or "")
+                        dedupe_material = "\0".join([
+                            platform_name,
+                            str(chat_id),
+                            str(thread_id or ""),
+                            message_id,
+                            mirror_text,
+                        ])
+                        dedupe_hash = hashlib.sha256(
+                            dedupe_material.encode("utf-8", errors="replace")
+                        ).hexdigest()
+                        wake_payload = (
+                            "Internal wake from send_message: an outbound message "
+                            f"was delivered into this existing {platform_name} session "
+                            f"by {source_label}. Consume the mirrored transcript "
+                            "context and continue if follow-through is needed.\n\n"
+                            f"Sent content:\n{mirror_text}"
+                        )
+                        wake_result = _run_async(wake_fn(
+                            session_id=target_session_id,
+                            payload=wake_payload,
+                            source_kind="send_message",
+                            dedupe_key=(
+                                f"send_message:{platform_name}:{chat_id}:"
+                                f"{thread_id or ''}:{dedupe_hash}"
+                            ),
+                        ))
+                        if isinstance(wake_result, dict):
+                            result["wake_agent_status"] = wake_result.get("status")
+                            if wake_result.get("receipt_id") is not None:
+                                result["wake_receipt_id"] = wake_result.get("receipt_id")
+                            if wake_result.get("status") != "failure":
+                                result["woke_agent"] = True
+                            elif wake_result.get("error"):
+                                result["wake_error"] = _sanitize_error_text(wake_result["error"])
+                    elif target_session_id:
+                        result["wake_agent_status"] = "unavailable"
             except Exception:
-                pass
+                logger.debug("send_message mirror/internal wake failed", exc_info=True)
 
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])

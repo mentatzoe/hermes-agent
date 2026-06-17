@@ -363,6 +363,21 @@ class GatewaySlashCommandsMixin:
                     chat_id = str(getattr(source, "chat_id", "") or "")
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    # Prefer a gateway-local wake subscription for tasks
+                    # created from an existing lane/session. The notifier still
+                    # stores platform/chat for ownership and adapter lookup, but
+                    # ``user_id=session:<session_key>`` routes terminal events
+                    # through wake_session instead of visible platform send
+                    # loopback. Fall back to the historical user_id metadata if
+                    # a partial test runner lacks a session_store.
+                    try:
+                        store = getattr(self, "session_store", None)
+                        entry = store.get_or_create_session(source) if store is not None else None
+                        session_key = getattr(entry, "session_key", None)
+                        if session_key:
+                            user_id = f"session:{session_key}"
+                    except Exception:
+                        pass
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb

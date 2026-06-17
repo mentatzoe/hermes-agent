@@ -240,6 +240,53 @@ class TestSendMessageTool:
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
 
+    def test_successful_mirror_schedules_internal_wake_on_live_gateway(self):
+        config, telegram_cfg = _make_config()
+        wake_session = AsyncMock(return_value={"status": "agent_responded", "receipt_id": 42})
+        runner = SimpleNamespace(wake_session=wake_session)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True, "message_id": "m-1"}),
+             ) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock, \
+             patch("gateway.mirror.find_session_id", return_value="target-session-id"), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": "wake the existing lane",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["mirrored"] is True
+        assert result["woke_agent"] is True
+        assert result["wake_receipt_id"] == 42
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "12345",
+            "wake the existing lane",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+        mirror_mock.assert_called_once()
+        wake_session.assert_awaited_once()
+        assert wake_session.await_args is not None
+        wake_kwargs = wake_session.await_args.kwargs
+        assert wake_kwargs["session_id"] == "target-session-id"
+        assert wake_kwargs["source_kind"] == "send_message"
+        assert wake_kwargs["dedupe_key"].startswith("send_message:telegram:12345:")
+        assert "wake the existing lane" in wake_kwargs["payload"]
+
     def test_resolved_telegram_topic_name_preserves_thread_id(self):
         config, telegram_cfg = _make_config()
 

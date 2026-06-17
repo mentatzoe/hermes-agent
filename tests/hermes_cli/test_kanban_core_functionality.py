@@ -868,6 +868,27 @@ def test_cli_notify_subscribe_and_list(kanban_home):
     assert "Unsubscribed" in rm
 
 
+def test_cli_notify_subscribe_can_target_existing_session_wake(kanban_home):
+    tid = run_slash("create 'x' --json")
+    tid = json.loads(tid)["id"]
+
+    out = run_slash(
+        f"notify-subscribe {tid} --platform telegram --chat-id 999 "
+        "--session-key agent:main:telegram:dm:user-1",
+    )
+
+    assert "Subscribed" in out
+    lst = run_slash("notify-list --json")
+    subs = json.loads(lst)
+    assert any(
+        s["task_id"] == tid
+        and s["platform"] == "telegram"
+        and s["chat_id"] == "999"
+        and s["user_id"] == "session:agent:main:telegram:dm:user-1"
+        for s in subs
+    )
+
+
 def test_cli_log_missing_task(kanban_home):
     # No such task → exit-style (no log for...) message on stderr, returned
     # in combined output.
