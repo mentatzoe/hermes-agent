@@ -287,6 +287,76 @@ class TestSendMessageTool:
         assert wake_kwargs["dedupe_key"].startswith("send_message:telegram:12345:")
         assert "wake the existing lane" in wake_kwargs["payload"]
 
+    def test_successful_mirror_same_active_session_wake_returns_queued_without_blocking(self, monkeypatch, tmp_path):
+        import hermes_state
+        from gateway.config import GatewayConfig, PlatformConfig
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        config, telegram_cfg = _make_config()
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        runner = GatewayRunner(
+            GatewayConfig(
+                platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="test-token")}
+            )
+        )
+        entry = runner.session_store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="12345",
+                chat_type="dm",
+                user_id="zoe",
+                user_name="Zoe",
+                is_bot=False,
+            )
+        )
+
+        class _NotAwaitableRunningTask:
+            def done(self):
+                return False
+
+        class _ActiveAdapter:
+            config = telegram_cfg
+
+            def __init__(self):
+                self._active_sessions = {entry.session_key: asyncio.Event()}
+                self._session_tasks = {entry.session_key: _NotAwaitableRunningTask()}
+                self._pending_messages = {}
+
+            async def handle_message(self, event):
+                self._pending_messages[entry.session_key] = event
+
+        adapter = _ActiveAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True, "message_id": "m-1"}),
+             ), \
+             patch("gateway.mirror.mirror_to_session", return_value=True), \
+             patch("gateway.mirror.find_session_id", return_value=entry.session_id), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": "queue wake for active lane",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["mirrored"] is True
+        assert result["woke_agent"] is True
+        assert result["wake_agent_status"] == "queued"
+        assert adapter._pending_messages[entry.session_key].internal is True
+        assert adapter._pending_messages[entry.session_key].text.startswith(
+            "Internal wake from send_message:"
+        )
+
     def test_resolved_telegram_topic_name_preserves_thread_id(self):
         config, telegram_cfg = _make_config()
 

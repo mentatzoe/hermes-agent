@@ -4942,6 +4942,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("failed to snapshot pre-wake message id", exc_info=True)
 
+        adapter_key = None
+        try:
+            adapter_config = getattr(adapter, "config", None)
+            adapter_extra = getattr(adapter_config, "extra", {}) or {}
+            adapter_key = build_session_key(
+                entry.origin,
+                group_sessions_per_user=adapter_extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=adapter_extra.get("thread_sessions_per_user", False),
+            )
+        except Exception:
+            adapter_key = None
+        target_keys = [entry.session_key]
+        if adapter_key and adapter_key not in target_keys:
+            target_keys.append(adapter_key)
+
+        active_sessions = getattr(adapter, "_active_sessions", {})
+        session_tasks = getattr(adapter, "_session_tasks", {})
+        current_task = asyncio.current_task()
+        target_already_active = False
+        if isinstance(active_sessions, dict):
+            target_already_active = any(key in active_sessions for key in target_keys)
+        if not target_already_active and isinstance(session_tasks, dict):
+            for key in target_keys:
+                task = session_tasks.get(key)
+                if task is None:
+                    continue
+                done = getattr(task, "done", None)
+                if task is current_task or not (done and done()):
+                    target_already_active = True
+                    break
+
         event = MessageEvent(
             text=payload,
             message_type=MessageType.TEXT,
@@ -4964,26 +4995,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 dispatched=True,
             )
             await adapter.handle_message(event)
+            if target_already_active:
+                row = session_db.update_session_wake_receipt(
+                    receipt_id,
+                    status="queued",
+                    dispatched=True,
+                )
+                return {
+                    "status": "queued",
+                    "receipt_id": receipt_id,
+                    "target_session_key": entry.session_key,
+                    "target_session_id": entry.session_id,
+                    "receipt": row,
+                }
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = None
             if isinstance(session_tasks, dict):
-                task = session_tasks.get(entry.session_key)
-                if task is None:
-                    try:
-                        adapter_key = build_session_key(
-                            event.source,
-                            group_sessions_per_user=adapter.config.extra.get(
-                                "group_sessions_per_user", True
-                            ),
-                            thread_sessions_per_user=adapter.config.extra.get(
-                                "thread_sessions_per_user", False
-                            ),
-                        )
-                    except Exception:
-                        adapter_key = None
-                    if adapter_key:
-                        task = session_tasks.get(adapter_key)
-            if task is not None:
+                for key in target_keys:
+                    task = session_tasks.get(key)
+                    if task is not None:
+                        break
+            if task is not None and task is not asyncio.current_task():
                 await asyncio.shield(task)
             injected_id, assistant_id = self._wake_message_ids_after(
                 entry.session_id,

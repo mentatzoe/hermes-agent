@@ -23,6 +23,20 @@ class WakeAdapter:
         return None
 
 
+class ActiveWakeAdapter(WakeAdapter):
+    def __init__(self, runner):
+        super().__init__(runner)
+        self._active_sessions = {}
+
+    async def handle_message(self, event: MessageEvent):
+        self.events.append(event)
+        session_key = self.runner.session_store.get_or_create_session(event.source).session_key
+        if session_key in self._active_sessions:
+            self._pending_messages[session_key] = event
+            return None
+        return await self.runner._handle_message(event)
+
+
 def _runner(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     runner = GatewayRunner(
@@ -219,3 +233,42 @@ def test_internal_wake_can_target_by_session_id(monkeypatch, tmp_path):
     assert result["status"] == "agent_responded"
     assert calls[0]["session_id"] == entry.session_id
     assert calls[0]["source"] == entry.origin
+
+
+def test_internal_wake_queues_for_active_session_without_awaiting_running_task(monkeypatch, tmp_path):
+    runner, calls = _runner(monkeypatch, tmp_path)
+    adapter = ActiveWakeAdapter(runner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    entry = runner.session_store.get_or_create_session(_origin("lane-active"))
+
+    async def scenario():
+        never_done = asyncio.Event()
+        running_task = asyncio.create_task(never_done.wait())
+        adapter._active_sessions[entry.session_key] = asyncio.Event()
+        adapter._session_tasks[entry.session_key] = running_task
+        try:
+            return await asyncio.wait_for(
+                runner.wake_session(
+                    session_key=entry.session_key,
+                    payload="INTERNAL_WAKE_TEST_ACTIVE_QUEUE",
+                    source_kind="send_message",
+                    dedupe_key="active-queue-marker",
+                ),
+                timeout=0.2,
+            )
+        finally:
+            running_task.cancel()
+            await asyncio.gather(running_task, return_exceptions=True)
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "queued"
+    assert calls == []
+    assert adapter.events[0].internal is True
+    assert adapter._pending_messages[entry.session_key].text == "INTERNAL_WAKE_TEST_ACTIVE_QUEUE"
+
+    rows = _receipt_rows(runner, entry.session_key)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "queued"
+    assert rows[0]["dispatched_at"] is not None
+    assert rows[0]["responded_at"] is None

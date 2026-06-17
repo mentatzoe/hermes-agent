@@ -7282,6 +7282,34 @@ def add_notify_sub(
             """,
             (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
         )
+        if user_id:
+            # ``INSERT OR IGNORE`` preserves idempotency on the subscription
+            # identity (task/platform/chat/thread).  A later explicit
+            # session-targeted subscribe must still upgrade an older visible
+            # platform notification row so terminal events wake the lane
+            # instead of continuing to post platform noise.  Do not downgrade
+            # an existing session-targeted row back to a plain visible user.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET user_id = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (
+                        user_id IS NULL OR user_id = ''
+                        OR ? LIKE 'session:%'
+                        OR ? LIKE 'session_id:%'
+                   )
+                """,
+                (
+                    user_id,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                    user_id,
+                    user_id,
+                ),
+            )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
             # backfilling only when the existing value is unset.

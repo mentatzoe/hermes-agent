@@ -889,6 +889,29 @@ def test_cli_notify_subscribe_can_target_existing_session_wake(kanban_home):
     )
 
 
+def test_cli_notify_subscribe_session_target_upgrades_existing_visible_sub(kanban_home):
+    tid = run_slash("create 'x' --json")
+    tid = json.loads(tid)["id"]
+
+    visible = run_slash(
+        f"notify-subscribe {tid} --platform telegram --chat-id 999 --user-id zoe",
+    )
+    internal = run_slash(
+        f"notify-subscribe {tid} --platform telegram --chat-id 999 "
+        "--session-key agent:main:telegram:dm:user-1",
+    )
+
+    assert "Subscribed" in visible
+    assert "Subscribed" in internal
+    lst = run_slash("notify-list --json")
+    subs = [
+        s for s in json.loads(lst)
+        if s["task_id"] == tid and s["platform"] == "telegram" and s["chat_id"] == "999"
+    ]
+    assert len(subs) == 1
+    assert subs[0]["user_id"] == "session:agent:main:telegram:dm:user-1"
+
+
 def test_cli_log_missing_task(kanban_home):
     # No such task → exit-style (no log for...) message on stderr, returned
     # in combined output.
