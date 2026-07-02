@@ -3,7 +3,7 @@ import json
 from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 import hermes_state
@@ -462,3 +462,78 @@ def test_internal_wake_queues_active_base_adapter_even_with_slash_command_payloa
     assert rows[0]["status"] == "queued"
     assert rows[0]["dispatched_at"] is not None
     assert rows[0]["responded_at"] is None
+
+
+def _make_internal_wake_event(text, source, receipt_id):
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        message_id=f"internal-wake:{receipt_id}",
+    )
+    setattr(event, "_hermes_internal_wake_receipt_id", receipt_id)
+    return event
+
+
+def test_merging_pending_internal_wakes_preserves_all_receipt_ids():
+    source = _origin("lane-merged-receipt-ids")
+    pending = {}
+    first = _make_internal_wake_event("WAKE_ONE", source, 101)
+    second = _make_internal_wake_event("WAKE_TWO", source, 102)
+
+    merge_pending_message_event(pending, "session-key", first, merge_text=True)
+    merge_pending_message_event(pending, "session-key", second, merge_text=True)
+
+    merged = pending["session-key"]
+    assert merged.text == "WAKE_ONE\nWAKE_TWO"
+    assert getattr(merged, "_hermes_internal_wake_receipt_ids") == [101, 102]
+
+
+def test_finalize_queued_internal_wake_receipts_updates_all_merged_receipts(monkeypatch, tmp_path):
+    runner, _calls = _runner(monkeypatch, tmp_path)
+    entry = runner.session_store.get_or_create_session(_origin("lane-finalize-queued"))
+
+    def create_queued_receipt(payload, source_kind, dedupe_key):
+        receipt, created = runner._session_db.create_session_wake_receipt(
+            source_kind=source_kind,
+            target_session_key=entry.session_key,
+            target_session_id=entry.session_id,
+            origin_snapshot=entry.origin.to_dict(),
+            payload_hash="hash-" + dedupe_key,
+            payload_preview=payload,
+            payload_bytes=len(payload),
+            dedupe_key=dedupe_key,
+        )
+        assert created is True
+        runner._session_db.update_session_wake_receipt(
+            int(receipt["id"]),
+            status="queued",
+            dispatched=True,
+        )
+        return int(receipt["id"])
+
+    first_id = create_queued_receipt("WAKE_ONE", "send_message", "wake-one")
+    second_id = create_queued_receipt("WAKE_TWO", "cron_delivery", "wake-two")
+
+    runner._session_db.append_message(entry.session_id, "assistant", "original turn response")
+    before_followup = max(m["id"] for m in runner._session_db.get_messages(entry.session_id))
+    injected_id = runner._session_db.append_message(entry.session_id, "user", "WAKE_ONE\nWAKE_TWO")
+    assistant_id = runner._session_db.append_message(entry.session_id, "assistant", "follow-up ack")
+
+    event = _make_internal_wake_event("WAKE_ONE", entry.origin, first_id)
+    merge_pending_message_event({entry.session_key: event}, entry.session_key, _make_internal_wake_event("WAKE_TWO", entry.origin, second_id), merge_text=True)
+
+    runner._finalize_queued_internal_wake_receipts(
+        event,
+        session_id=entry.session_id,
+        previous_max_id=before_followup,
+        payload="WAKE_ONE\nWAKE_TWO",
+    )
+
+    rows = _receipt_rows(runner, entry.session_key)
+    assert [row["id"] for row in rows] == [first_id, second_id]
+    assert {row["status"] for row in rows} == {"agent_responded"}
+    assert {row["injected_message_id"] for row in rows} == {injected_id}
+    assert {row["assistant_message_id"] for row in rows} == {assistant_id}
+    assert all(row["responded_at"] is not None for row in rows)

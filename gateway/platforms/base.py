@@ -1629,8 +1629,40 @@ def merge_pending_message_event(
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
     """
+
+    def _internal_wake_receipt_ids(candidate: MessageEvent) -> list[int]:
+        ids: list[int] = []
+        raw_many = getattr(candidate, "_hermes_internal_wake_receipt_ids", None)
+        if isinstance(raw_many, (list, tuple)):
+            for value in raw_many:
+                try:
+                    receipt_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if receipt_id not in ids:
+                    ids.append(receipt_id)
+        raw_one = getattr(candidate, "_hermes_internal_wake_receipt_id", None)
+        try:
+            receipt_id = int(raw_one) if raw_one is not None else None
+        except (TypeError, ValueError):
+            receipt_id = None
+        if receipt_id is not None and receipt_id not in ids:
+            ids.append(receipt_id)
+        return ids
+
+    def _preserve_internal_wake_receipts(target: MessageEvent, incoming: MessageEvent) -> None:
+        receipt_ids = _internal_wake_receipt_ids(target)
+        for receipt_id in _internal_wake_receipt_ids(incoming):
+            if receipt_id not in receipt_ids:
+                receipt_ids.append(receipt_id)
+        if receipt_ids:
+            setattr(target, "_hermes_internal_wake_receipt_ids", receipt_ids)
+            if not hasattr(target, "_hermes_internal_wake_receipt_id"):
+                setattr(target, "_hermes_internal_wake_receipt_id", receipt_ids[0])
+
     existing = pending_messages.get(session_key)
     if existing:
+        _preserve_internal_wake_receipts(existing, event)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -1670,6 +1702,7 @@ def merge_pending_message_event(
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
 
+    _preserve_internal_wake_receipts(event, event)
     pending_messages[session_key] = event
 
 

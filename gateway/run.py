@@ -4847,6 +4847,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
         return injected_id, assistant_id
 
+    @staticmethod
+    def _internal_wake_receipt_ids_for_event(event: Any) -> list[int]:
+        """Return every wake receipt id carried by a pending internal wake event."""
+        receipt_ids: list[int] = []
+        raw_many = getattr(event, "_hermes_internal_wake_receipt_ids", None)
+        if isinstance(raw_many, (list, tuple)):
+            for value in raw_many:
+                try:
+                    receipt_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if receipt_id not in receipt_ids:
+                    receipt_ids.append(receipt_id)
+        raw_one = getattr(event, "_hermes_internal_wake_receipt_id", None)
+        try:
+            receipt_id = int(raw_one) if raw_one is not None else None
+        except (TypeError, ValueError):
+            receipt_id = None
+        if receipt_id is not None and receipt_id not in receipt_ids:
+            receipt_ids.append(receipt_id)
+        return receipt_ids
+
+    def _finalize_queued_internal_wake_receipts(
+        self,
+        event: Any,
+        *,
+        session_id: str,
+        previous_max_id: int,
+        payload: str,
+    ) -> None:
+        """Mark active-session queued wake receipts once their follow-up turn runs."""
+        receipt_ids = self._internal_wake_receipt_ids_for_event(event)
+        if not receipt_ids:
+            return
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        injected_id, assistant_id = self._wake_message_ids_after(
+            session_id,
+            previous_max_id=previous_max_id,
+            payload=payload,
+        )
+        status = "agent_responded" if assistant_id is not None else "dispatched"
+        for receipt_id in receipt_ids:
+            try:
+                session_db.update_session_wake_receipt(
+                    receipt_id,
+                    status=status,
+                    responded=assistant_id is not None,
+                    injected_message_id=injected_id,
+                    assistant_message_id=assistant_id,
+                )
+            except Exception:
+                logger.debug(
+                    "failed to finalize queued internal wake receipt %s",
+                    receipt_id,
+                    exc_info=True,
+                )
+
     async def wake_session(
         self,
         *,
@@ -4982,6 +5041,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         try:
             setattr(event, "_hermes_internal_wake_receipt_id", receipt_id)
+            setattr(event, "_hermes_internal_wake_receipt_ids", [receipt_id])
             if dedupe_key:
                 setattr(event, "_hermes_internal_wake_dedupe_key", dedupe_key)
             setattr(event, "_hermes_internal_wake_source_kind", source_kind)
@@ -16314,6 +16374,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+                queued_wake_event = None
+                queued_wake_previous_max_id = 0
+                if pending_event is not None and self._internal_wake_receipt_ids_for_event(pending_event):
+                    queued_wake_event = pending_event
+                    session_db = getattr(self, "_session_db", None)
+                    if session_db is not None:
+                        try:
+                            existing_messages = session_db.get_messages(session_id)
+                            queued_wake_previous_max_id = max(
+                                (int(m.get("id") or 0) for m in existing_messages),
+                                default=0,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "failed to snapshot queued wake pre-follow-up message id",
+                                exc_info=True,
+                            )
+
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -16326,6 +16404,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                 )
+                if queued_wake_event is not None:
+                    followup_session_id = followup_result.get("session_id") or session_id
+                    self._finalize_queued_internal_wake_receipts(
+                        queued_wake_event,
+                        session_id=followup_session_id,
+                        previous_max_id=(
+                            queued_wake_previous_max_id
+                            if followup_session_id == session_id
+                            else 0
+                        ),
+                        payload=next_message or "",
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
