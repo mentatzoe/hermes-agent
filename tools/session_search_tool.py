@@ -86,6 +86,52 @@ def _resolve_to_parent(db, session_id: str) -> str:
     return cur
 
 
+def _session_search_invocation_ids(db, message_ids: List[int]) -> set[int]:
+    """Find blank assistant rows that echo session-search invocations.
+
+    The FTS index deliberately includes structured tool-call arguments so
+    low-level searches can find them. Conversational discovery has a narrower
+    contract: return past conversation, not its own prior query payloads.
+    Prose-bearing rows stay visible. Classification fails open on DB/JSON
+    errors so a real conversation hit is never hidden by this filter.
+    """
+    ids = list(dict.fromkeys(mid for mid in message_ids if mid is not None))
+    if not ids:
+        return set()
+
+    placeholders = ",".join("?" for _ in ids)
+    sql = f"""
+        SELECT DISTINCT m.id
+        FROM messages AS m,
+             json_each(
+                 CASE WHEN json_valid(m.tool_calls)
+                      THEN m.tool_calls ELSE '[]' END
+             ) AS call
+        WHERE m.id IN ({placeholders})
+          AND trim(COALESCE(m.content, '')) = ''
+          AND m.tool_calls LIKE '%session_search%'
+          AND (
+              json_extract(call.value, '$.function.name') = 'session_search'
+              OR (
+                  json_extract(call.value, '$.function.name') = 'tool_call'
+                  AND json_valid(
+                      json_extract(call.value, '$.function.arguments')
+                  )
+                  AND json_extract(
+                      json_extract(call.value, '$.function.arguments'), '$.name'
+                  ) = 'session_search'
+              )
+          )
+    """
+    try:
+        with db._lock:
+            rows = db._conn.execute(sql, ids).fetchall()
+    except Exception:
+        logging.debug("session-search echo lookup failed", exc_info=True)
+        return set()
+    return {row[0] for row in rows}
+
+
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
     entry = {
@@ -298,15 +344,42 @@ def _discover(
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
 
+    candidate_ids = [
+        int(row["id"]) for row in raw_results if row.get("id") is not None
+    ]
+    invocation_echo_ids = _session_search_invocation_ids(db, candidate_ids)
+    if invocation_echo_ids:
+        raw_results = [
+            row for row in raw_results if row.get("id") not in invocation_echo_ids
+        ]
+
     if not raw_results:
-        return json.dumps({
+        if invocation_echo_ids:
+            message = (
+                "Matches came only from prior session_search invocation payloads, "
+                "which conversational discovery ignores. The index is responding "
+                "normally; broaden or rephrase the query to find conversation text."
+            )
+        else:
+            message = (
+                "No matching sessions found. FTS5 ANDs all terms by default — "
+                "broaden with OR (`alpha OR beta`), exact-match with quoted "
+                "phrases, exclude with NOT, or prefix-match with `deploy*`."
+            )
+        payload = {
             "success": True,
             "mode": "discover",
             "query": query,
             "results": [],
             "count": 0,
-            "message": "No matching sessions found.",
-        }, ensure_ascii=False)
+            "sessions_searched": 0,
+            "message": message,
+        }
+        if invocation_echo_ids:
+            payload["filtered"] = {
+                "invocation_echo": len(invocation_echo_ids),
+            }
+        return json.dumps(payload, ensure_ascii=False)
 
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
 
@@ -314,13 +387,16 @@ def _discover(
     # row — only that pairs validly with the FTS5 match id for the anchored
     # window. parent_session_id is exposed separately when different.
     seen_sessions = {}
+    current_session_filtered = 0
     for r in raw_results:
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
+            current_session_filtered += 1
             continue
         if current_session_id and raw_sid == current_session_id:
+            current_session_filtered += 1
             continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
@@ -364,6 +440,21 @@ def _discover(
         if lineage_root and lineage_root != hit_sid:
             entry["parent_session_id"] = lineage_root
         results.append(entry)
+
+    if not results and current_session_filtered:
+        return json.dumps({
+            "success": True,
+            "mode": "discover",
+            "query": query,
+            "results": [],
+            "count": 0,
+            "sessions_searched": 0,
+            "message": (
+                "Matches were only in the current session lineage "
+                "(already in your active context). The index is responding normally."
+            ),
+            "filtered": {"current_session": current_session_filtered},
+        }, ensure_ascii=False)
 
     return json.dumps({
         "success": True,
