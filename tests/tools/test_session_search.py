@@ -205,6 +205,159 @@ class TestDiscoveryShape:
         assert "s_newest" not in sids
 
 
+class TestSessionSearchInvocationEcho:
+    """Discovery must not return its own prior query payloads as conversation."""
+
+    @pytest.mark.parametrize("deferred", [False, True])
+    def test_blank_invocation_row_is_filtered(self, db, deferred):
+        nonce = "wumpus-brindle-echo-token"
+        db.create_session("s_old", source="cli")
+        if deferred:
+            function = {
+                "name": "tool_call",
+                "arguments": json.dumps({
+                    "name": "session_search",
+                    "arguments": {"query": nonce},
+                }),
+            }
+        else:
+            function = {
+                "name": "session_search",
+                "arguments": json.dumps({"query": nonce}),
+            }
+        db.append_message(
+            "s_old",
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "call_old", "type": "function", "function": function}],
+        )
+        db.create_session("s_now", source="cli")
+
+        result = json.loads(session_search(
+            query=nonce, db=db, current_session_id="s_now",
+        ))
+
+        assert result["count"] == 0
+        assert result["results"] == []
+        assert result["filtered"]["invocation_echo"] == 1
+        assert "index is responding normally" in result["message"]
+
+    def test_conversation_content_wins_over_invocation_echo(self, db):
+        nonce = "wumpus-brindle-content-token"
+        db.create_session("s_old", source="cli")
+        content_mid = db.append_message(
+            "s_old", role="user", content=f"Remember the {nonce} decision",
+        )
+        db.append_message(
+            "s_old",
+            role="assistant",
+            content="",
+            tool_calls=[{
+                "id": "call_old",
+                "type": "function",
+                "function": {
+                    "name": "session_search",
+                    "arguments": json.dumps({"query": nonce}),
+                },
+            }],
+        )
+        db.create_session("s_now", source="cli")
+
+        result = json.loads(session_search(
+            query=nonce, db=db, current_session_id="s_now",
+        ))
+
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "s_old"
+        assert result["results"][0]["match_message_id"] == content_mid
+        assert result["results"][0]["matched_role"] == "user"
+
+    def test_prose_bearing_row_remains_discoverable(self, db):
+        nonce = "wumpus-brindle-prose-token"
+        db.create_session("s_old", source="cli")
+        prose_mid = db.append_message(
+            "s_old",
+            role="assistant",
+            content=f"The session_search diagnosis found {nonce}",
+            tool_calls=[{
+                "id": "call_old",
+                "type": "function",
+                "function": {
+                    "name": "session_search",
+                    "arguments": json.dumps({"query": nonce}),
+                },
+            }],
+        )
+        db.create_session("s_now", source="cli")
+
+        result = json.loads(session_search(
+            query=nonce, db=db, current_session_id="s_now",
+        ))
+
+        assert result["count"] == 1
+        assert result["results"][0]["match_message_id"] == prose_mid
+
+    def test_mixed_blank_tool_batch_is_classified_as_invocation_echo(self, db):
+        """A blank tool-use turn is machinery even when calls are batched."""
+        nonce = "wumpus-brindle-mixed-token"
+        db.create_session("s_old", source="cli")
+        db.append_message(
+            "s_old",
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "session_search",
+                        "arguments": json.dumps({"query": nonce}),
+                    },
+                },
+                {
+                    "id": "call_terminal",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": json.dumps({"command": f"printf {nonce}"}),
+                    },
+                },
+            ],
+        )
+        db.create_session("s_now", source="cli")
+
+        result = json.loads(session_search(
+            query=nonce, db=db, current_session_id="s_now",
+        ))
+
+        assert result["count"] == 0
+        assert result["filtered"]["invocation_echo"] == 1
+
+    def test_genuine_miss_explains_implicit_and(self, db):
+        db.create_session("s_old", source="cli")
+        db.append_message("s_old", role="user", content="only alpha appears")
+
+        result = json.loads(session_search(query="alpha beta", db=db))
+
+        assert result["count"] == 0
+        assert "ANDs all terms" in result["message"]
+
+    def test_current_session_only_hit_explains_filtered_result(self, db):
+        db.create_session("s_now", source="cli")
+        db.append_message(
+            "s_now", role="user", content="crystal golem private route",
+        )
+
+        result = json.loads(session_search(
+            query="crystal golem", db=db, current_session_id="s_now",
+        ))
+
+        assert result["count"] == 0
+        assert result["filtered"]["current_session"] == 1
+        assert "already in your active context" in result["message"]
+        assert "index is responding normally" in result["message"]
+
+
 class TestDiscoverySort:
     def test_sort_newest_orders_by_recency(self, db):
         _seed_modpack_sessions(db)
