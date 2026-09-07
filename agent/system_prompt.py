@@ -1036,10 +1036,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full system prompt from all layers.
 
-    Called once per session (cached on ``agent._cached_system_prompt``) and
-    only rebuilt after context compression events. This ensures the system
-    prompt is stable across all turns in a session, maximizing prefix cache
-    hits.
+    Cached on ``agent._cached_system_prompt`` and reused between caller-led
+    rebuilds, including context compression and session restoration. Keeping
+    unchanged leading content stable across rebuilds supports prefix-cache
+    reuse; this function does not itself control the rebuild lifecycle.
 
     Layers are ordered cache-friendly: stable identity/guidance first,
     then session-stable context files, then per-call volatile content

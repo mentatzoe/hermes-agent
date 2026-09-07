@@ -1251,6 +1251,18 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    # SOUL.md is included for every child: the operator wants continuity of
+    # identity and operator boundaries across delegated instances, not a
+    # bare worker. (Upstream skips it; this is a deliberate fork difference.)
+    try:
+        from agent.prompt_builder import load_soul_md
+
+        _soul = load_soul_md()
+    except Exception:
+        logger.debug("subagent: SOUL.md load failed", exc_info=True)
+        _soul = ""
+    if _soul and _soul.strip():
+        parts.append("\n" + _soul.strip())
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
