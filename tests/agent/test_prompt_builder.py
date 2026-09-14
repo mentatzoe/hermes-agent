@@ -266,6 +266,44 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    @pytest.mark.parametrize("from_snapshot", [False, True])
+    @pytest.mark.parametrize("available_tools", [None, {"terminal"}])
+    def test_skill_selection_policy_is_task_specific(
+        self, monkeypatch, tmp_path, from_snapshot, available_tools
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        if from_snapshot:
+            build_skills_system_prompt(available_tools=available_tools)
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            clear_skills_system_prompt_cache(clear_snapshot=False)
+
+        result = build_skills_system_prompt(available_tools=available_tools)
+
+        assert result.startswith("## Skills\n")
+        assert (
+            "Load skills explicitly selected for this task and those whose procedure "
+            "or boundary bears on the work; vocabulary overlap alone is not a reason "
+            "to load one."
+        ) in result
+        assert "Read linked detail when its condition applies." in result
+        assert "Keep skill maintenance within the authorized task scope." in result
+        assert "load the `hermes-agent` skill first" in result
+        assert "    - python-debug: Debug Python scripts\n" in result
+        for obsolete_policy in (
+            "even partially relevant",
+            "Err on the side of loading",
+            "always better to have context",
+            "fix it with skill_manage",
+            "update it before finishing",
+            "Only proceed without loading",
+        ):
+            assert obsolete_policy not in result
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
