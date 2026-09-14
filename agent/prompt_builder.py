@@ -147,8 +147,8 @@ MEMORY_GUIDANCE = (
     "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
     "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
     "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "When skill maintenance is within the authorized task scope, save reusable "
-    "procedures as skills rather than memory.\n"
+    "Reusable procedures belong in skills rather than memory; maintain them "
+    "in the task's intended target.\n"
     "Write memories as declarative facts, not instructions to yourself. "
     "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
     "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
@@ -164,10 +164,10 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "Create or maintain skills only within the authorized task scope. "
-    "When maintenance is in scope, use skill_manage to preserve reusable methods "
-    "and repair verified defects. Otherwise route the finding through the "
-    "authorized maintenance path rather than changing the live library."
+    "Use skills to retain useful methods and verified corrections when maintaining "
+    "the library is part of the work. Improve or remove guidance that no longer helps. "
+    "For a review copy or other scoped artifact, edit that target; changes to the "
+    "live library belong in its maintenance task."
 )
 
 KANBAN_GUIDANCE = (
@@ -1176,11 +1176,10 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills\n"
-            "Use the skill catalog to find task-specific methods, conventions and constraints. "
-            "Load skills explicitly selected for this task and those whose procedure or "
-            "boundary bears on the work; vocabulary overlap alone is not a reason to load one. "
-            "Read linked detail when its condition applies. "
-            "Keep skill maintenance within the authorized task scope.\n"
+            "Use the catalog to find knowledge that helps with the task. "
+            "Load explicitly selected skills and others that add useful methods or context. "
+            "Apply them with judgment in light of the conversation and intended outcome. "
+            "Read supporting files as the work needs them.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "

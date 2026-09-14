@@ -71,8 +71,10 @@ class TestGuidanceConstants:
             pass_session_id=False,
         )
         stable = system_prompt.build_system_prompt_parts(state)["stable"]
-        assert "Create or maintain skills only within the authorized task scope." in stable
-        assert "route the finding through the authorized maintenance path" in stable
+        assert "when maintaining the library is part of the work" in stable
+        assert "changes to the live library belong in its maintenance task" in stable
+        assert "Improve or remove guidance that no longer helps." in stable
+        assert ("maintain them in the task's intended target" in stable) is with_memory
         assert ("<available_skills>" in stable) is not empty_catalog
         assert "load the `hermes-agent` skill" in stable
         assert "patch it immediately" not in stable
@@ -327,12 +329,10 @@ class TestBuildSkillsSystemPrompt:
 
         assert result.startswith("## Skills\n")
         assert (
-            "Load skills explicitly selected for this task and those whose procedure "
-            "or boundary bears on the work; vocabulary overlap alone is not a reason "
-            "to load one."
+            "Load explicitly selected skills and others that add useful methods or context."
         ) in result
-        assert "Read linked detail when its condition applies." in result
-        assert "Keep skill maintenance within the authorized task scope." in result
+        assert "Apply them with judgment in light of the conversation and intended outcome." in result
+        assert "Read supporting files as the work needs them." in result
         assert "load the `hermes-agent` skill first" in result
         assert "    - python-debug: Debug Python scripts\n" in result
         for obsolete_policy in (
