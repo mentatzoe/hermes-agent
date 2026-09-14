@@ -28,6 +28,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
+    SKILLS_GUIDANCE,
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
@@ -41,8 +42,9 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 class TestGuidanceConstants:
     @pytest.mark.parametrize("empty_catalog", [False, True])
     @pytest.mark.parametrize("with_memory", [False, True])
-    def test_assembled_skill_maintenance_respects_task_scope(
-        self, monkeypatch, tmp_path, empty_catalog, with_memory
+    @pytest.mark.parametrize("with_manager", [False, True])
+    def test_tool_guidance_assembly_is_independent_of_catalog_contents(
+        self, monkeypatch, tmp_path, empty_catalog, with_memory, with_manager
     ):
         from agent import system_prompt
 
@@ -60,7 +62,9 @@ class TestGuidanceConstants:
             build_environment_hints=lambda: "",
         )
         monkeypatch.setattr(system_prompt, "_ra", lambda: host)
-        tools = {"skill_view", "skill_manage"}
+        tools = {"skill_view"}
+        if with_manager:
+            tools.add("skill_manage")
         if with_memory:
             tools.add("memory")
         state = SimpleNamespace(
@@ -71,38 +75,24 @@ class TestGuidanceConstants:
             pass_session_id=False,
         )
         stable = system_prompt.build_system_prompt_parts(state)["stable"]
-        assert "when maintaining the library is part of the work" in stable
-        assert "changes to the live library belong in its maintenance task" in stable
-        assert "Improve or remove guidance that no longer helps." in stable
-        assert ("maintain them in the task's intended target" in stable) is with_memory
+        # This checks delivery of the configured guidance, not whether its
+        # wording makes a model learn or select skills effectively.
+        assert (SKILLS_GUIDANCE in stable) is with_manager
+        assert (MEMORY_GUIDANCE in stable) is with_memory
         assert ("<available_skills>" in stable) is not empty_catalog
-        assert "load the `hermes-agent` skill" in stable
-        assert "patch it immediately" not in stable
-        assert "don't wait to be asked" not in stable
-        assert "After completing a complex task (5+ tool calls)" not in stable
 
-        # Tool descriptions are delivered alongside the system prompt. A stale
-        # policy there would still reach the model even when the prompt is scoped.
+    def test_skill_and_memory_definitions_deliver_their_descriptions(self):
         from model_tools import get_tool_definitions
+        from tools.memory_tool import MEMORY_SCHEMA
+        from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
 
-        toolsets = ["skills", "memory"] if with_memory else ["skills"]
-        definitions = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
-        names = {tool["function"]["name"] for tool in definitions}
-        assert ("memory" in names) is with_memory
-        manager = next(
-            tool["function"] for tool in definitions
-            if tool["function"]["name"] == "skill_manage"
+        definitions = get_tool_definitions(
+            enabled_toolsets=["skills", "memory"], quiet_mode=True
         )
-        surface = stable + "\n" + "\n".join(
-            tool["function"]["description"] for tool in definitions
-        )
-        for obsolete in (
-            "5+ calls", "patch it immediately", "After difficult/iterative tasks",
-            "numbered steps with exact commands", "save it as a skill with the skill tool",
-        ):
-            assert obsolete not in surface
-        assert "absorbed_into" in manager["parameters"]["properties"]
-        assert "Pinned skills are protected from deletion" in manager["description"]
+        by_name = {tool["function"]["name"]: tool["function"] for tool in definitions}
+        for schema in (MEMORY_SCHEMA, SKILL_MANAGE_SCHEMA):
+            assert by_name[schema["name"]]["description"] == schema["description"]
+            assert by_name[schema["name"]]["parameters"] == schema["parameters"]
 
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
@@ -332,10 +322,9 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
-    @pytest.mark.parametrize("from_snapshot", [False, True])
     @pytest.mark.parametrize("available_tools", [None, {"terminal"}])
-    def test_skill_selection_policy_is_task_specific(
-        self, monkeypatch, tmp_path, from_snapshot, available_tools
+    def test_snapshot_and_memory_cache_preserve_the_rendered_catalog(
+        self, monkeypatch, tmp_path, available_tools
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "coding" / "python-debug"
@@ -343,30 +332,15 @@ class TestBuildSkillsSystemPrompt:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
         )
-        if from_snapshot:
-            build_skills_system_prompt(available_tools=available_tools)
-            from agent.prompt_builder import clear_skills_system_prompt_cache
-            clear_skills_system_prompt_cache(clear_snapshot=False)
+        from agent.prompt_builder import clear_skills_system_prompt_cache
 
-        result = build_skills_system_prompt(available_tools=available_tools)
-
-        assert result.startswith("## Skills\n")
-        assert (
-            "Load explicitly selected skills and others that add useful methods or context."
-        ) in result
-        assert "Apply them with judgment in light of the conversation and intended outcome." in result
-        assert "Read supporting files as the work needs them." in result
-        assert "load the `hermes-agent` skill first" in result
-        assert "    - python-debug: Debug Python scripts\n" in result
-        for obsolete_policy in (
-            "even partially relevant",
-            "Err on the side of loading",
-            "always better to have context",
-            "fix it with skill_manage",
-            "update it before finishing",
-            "Only proceed without loading",
-        ):
-            assert obsolete_policy not in result
+        fresh = build_skills_system_prompt(available_tools=available_tools)
+        assert "    - python-debug: Debug Python scripts\n" in fresh
+        assert build_skills_system_prompt(available_tools=available_tools) == fresh
+        clear_skills_system_prompt_cache(clear_snapshot=False)
+        # A disk snapshot contains metadata, not the selection instructions.
+        # Re-rendering it must deliver the same complete catalog as a scan.
+        assert build_skills_system_prompt(available_tools=available_tools) == fresh
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

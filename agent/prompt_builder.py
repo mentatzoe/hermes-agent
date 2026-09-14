@@ -147,8 +147,8 @@ MEMORY_GUIDANCE = (
     "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
     "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
     "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "Reusable procedures belong in skills rather than memory; maintain them "
-    "in the task's intended target.\n"
+    "When you discover a reusable procedure, save it as a skill with skill_manage "
+    "rather than putting the steps in memory.\n"
     "Write memories as declarative facts, not instructions to yourself. "
     "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
     "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
@@ -164,10 +164,13 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "Use skills to retain useful methods and verified corrections when maintaining "
-    "the library is part of the work. Improve or remove guidance that no longer helps. "
-    "For a review copy or other scoped artifact, edit that target; changes to the "
-    "live library belong in its maintenance task."
+    "When you discover a non-trivial workflow, resolve a tricky failure, or learn "
+    "a reusable correction from the user, save the working approach with skill_manage "
+    "so you can reuse it next time. Improve an existing skill when it covers the "
+    "lesson; create one when it doesn't.\n"
+    "When a skill you use is outdated, incomplete, or wrong, verify the correction "
+    "and update it with skill_manage before finishing. Preserve useful methods and "
+    "the user's conventions while removing guidance that no longer helps."
 )
 
 KANBAN_GUIDANCE = (
@@ -1176,8 +1179,13 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills\n"
-            "Use the catalog to find knowledge that helps with the task. "
-            "Load explicitly selected skills and others that add useful methods or context. "
+            "Before replying, scan the catalog and load explicitly selected skills and "
+            "skills relevant to the task's methods, context, or user preferences with skill_view(name). "
+            "Skills provide specialized knowledge, proven workflows, and the user's "
+            "preferred approach, conventions, and quality standards. Load relevant skills "
+            "even for tasks you already know how to do: general knowledge does not replace "
+            "the user's established way of working. Choose by that contribution, not just "
+            "shared topic words. "
             "Apply them with judgment in light of the conversation and intended outcome. "
             "Read supporting files as the work needs them.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
