@@ -85,15 +85,20 @@ class TestGuidanceConstants:
         # policy there would still reach the model even when the prompt is scoped.
         from model_tools import get_tool_definitions
 
-        definitions = get_tool_definitions(enabled_toolsets=["skills"], quiet_mode=True)
+        toolsets = ["skills", "memory"] if with_memory else ["skills"]
+        definitions = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+        names = {tool["function"]["name"] for tool in definitions}
+        assert ("memory" in names) is with_memory
         manager = next(
             tool["function"] for tool in definitions
             if tool["function"]["name"] == "skill_manage"
         )
-        surface = stable + "\n" + manager["description"]
+        surface = stable + "\n" + "\n".join(
+            tool["function"]["description"] for tool in definitions
+        )
         for obsolete in (
             "5+ calls", "patch it immediately", "After difficult/iterative tasks",
-            "numbered steps with exact commands",
+            "numbered steps with exact commands", "save it as a skill with the skill tool",
         ):
             assert obsolete not in surface
         assert "absorbed_into" in manager["parameters"]["properties"]
