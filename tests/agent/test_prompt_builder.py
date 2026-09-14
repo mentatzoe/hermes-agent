@@ -81,6 +81,24 @@ class TestGuidanceConstants:
         assert "don't wait to be asked" not in stable
         assert "After completing a complex task (5+ tool calls)" not in stable
 
+        # Tool descriptions are delivered alongside the system prompt. A stale
+        # policy there would still reach the model even when the prompt is scoped.
+        from model_tools import get_tool_definitions
+
+        definitions = get_tool_definitions(enabled_toolsets=["skills"], quiet_mode=True)
+        manager = next(
+            tool["function"] for tool in definitions
+            if tool["function"]["name"] == "skill_manage"
+        )
+        surface = stable + "\n" + manager["description"]
+        for obsolete in (
+            "5+ calls", "patch it immediately", "After difficult/iterative tasks",
+            "numbered steps with exact commands",
+        ):
+            assert obsolete not in surface
+        assert "absorbed_into" in manager["parameters"]["properties"]
+        assert "Pinned skills are protected from deletion" in manager["description"]
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
