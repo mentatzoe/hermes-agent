@@ -147,8 +147,8 @@ MEMORY_GUIDANCE = (
     "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
     "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
     "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
+    "When skill maintenance is within the authorized task scope, save reusable "
+    "procedures as skills rather than memory.\n"
     "Write memories as declarative facts, not instructions to yourself. "
     "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
     "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
@@ -164,12 +164,10 @@ SESSION_SEARCH_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Create or maintain skills only within the authorized task scope. "
+    "When maintenance is in scope, use skill_manage to preserve reusable methods "
+    "and repair verified defects. Otherwise route the finding through the "
+    "authorized maintenance path rather than changing the live library."
 )
 
 KANBAN_GUIDANCE = (

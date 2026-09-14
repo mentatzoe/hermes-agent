@@ -4,6 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +39,46 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    @pytest.mark.parametrize("empty_catalog", [False, True])
+    @pytest.mark.parametrize("with_memory", [False, True])
+    def test_assembled_skill_maintenance_respects_task_scope(
+        self, monkeypatch, tmp_path, empty_catalog, with_memory
+    ):
+        from agent import system_prompt
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        if not empty_catalog:
+            root = tmp_path / "skills" / "fixture"
+            root.mkdir(parents=True)
+            (root / "SKILL.md").write_text(
+                "---\nname: fixture\ndescription: Fixture method\n---\nBody\n"
+            )
+        host = SimpleNamespace(
+            build_skills_system_prompt=build_skills_system_prompt,
+            get_toolset_for_tool=lambda name: "skills" if name.startswith("skill") else None,
+            build_nous_subscription_prompt=lambda names: "",
+            build_environment_hints=lambda: "",
+        )
+        monkeypatch.setattr(system_prompt, "_ra", lambda: host)
+        tools = {"skill_view", "skill_manage"}
+        if with_memory:
+            tools.add("memory")
+        state = SimpleNamespace(
+            load_soul_identity=False, skip_context_files=True,
+            valid_tool_names=tools, _kanban_worker_guidance="",
+            _tool_use_enforcement=False, model="fixture", provider="fixture",
+            platform="", _memory_store=None, _memory_manager=None,
+            pass_session_id=False,
+        )
+        stable = system_prompt.build_system_prompt_parts(state)["stable"]
+        assert "Create or maintain skills only within the authorized task scope." in stable
+        assert "route the finding through the authorized maintenance path" in stable
+        assert ("<available_skills>" in stable) is not empty_catalog
+        assert "load the `hermes-agent` skill" in stable
+        assert "patch it immediately" not in stable
+        assert "don't wait to be asked" not in stable
+        assert "After completing a complex task (5+ tool calls)" not in stable
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
