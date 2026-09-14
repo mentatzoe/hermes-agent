@@ -922,6 +922,8 @@ SKILL_MANAGE_SCHEMA = {
         "Good skills explain when they apply, the working method, relevant pitfalls, "
         "and how to verify the result. Use skill_view() to read the current skill "
         "and see format examples.\n\n"
+        "Confirm with the user before deleting a skill unless its removal is "
+        "already authorized.\n\n"
         "Pinned skills are protected from deletion only — skill_manage(action='delete') "
         "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
         "Patches and edits go through on pinned skills so you can still improve them as "
