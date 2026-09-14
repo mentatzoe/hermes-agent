@@ -4,6 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
+    SKILLS_GUIDANCE,
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
@@ -38,6 +40,60 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    @pytest.mark.parametrize("empty_catalog", [False, True])
+    @pytest.mark.parametrize("with_memory", [False, True])
+    @pytest.mark.parametrize("with_manager", [False, True])
+    def test_tool_guidance_assembly_is_independent_of_catalog_contents(
+        self, monkeypatch, tmp_path, empty_catalog, with_memory, with_manager
+    ):
+        from agent import system_prompt
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        if not empty_catalog:
+            root = tmp_path / "skills" / "fixture"
+            root.mkdir(parents=True)
+            (root / "SKILL.md").write_text(
+                "---\nname: fixture\ndescription: Fixture method\n---\nBody\n"
+            )
+        host = SimpleNamespace(
+            build_skills_system_prompt=build_skills_system_prompt,
+            get_toolset_for_tool=lambda name: "skills" if name.startswith("skill") else None,
+            build_nous_subscription_prompt=lambda names: "",
+            build_environment_hints=lambda: "",
+        )
+        monkeypatch.setattr(system_prompt, "_ra", lambda: host)
+        tools = {"skill_view"}
+        if with_manager:
+            tools.add("skill_manage")
+        if with_memory:
+            tools.add("memory")
+        state = SimpleNamespace(
+            load_soul_identity=False, skip_context_files=True,
+            valid_tool_names=tools, _kanban_worker_guidance="",
+            _tool_use_enforcement=False, model="fixture", provider="fixture",
+            platform="", _memory_store=None, _memory_manager=None,
+            pass_session_id=False,
+        )
+        stable = system_prompt.build_system_prompt_parts(state)["stable"]
+        # This checks delivery of the configured guidance, not whether its
+        # wording makes a model learn or select skills effectively.
+        assert (SKILLS_GUIDANCE in stable) is with_manager
+        assert (MEMORY_GUIDANCE in stable) is with_memory
+        assert ("<available_skills>" in stable) is not empty_catalog
+
+    def test_skill_and_memory_definitions_deliver_their_descriptions(self):
+        from model_tools import get_tool_definitions
+        from tools.memory_tool import MEMORY_SCHEMA
+        from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
+
+        definitions = get_tool_definitions(
+            enabled_toolsets=["skills", "memory"], quiet_mode=True
+        )
+        by_name = {tool["function"]["name"]: tool["function"] for tool in definitions}
+        for schema in (MEMORY_SCHEMA, SKILL_MANAGE_SCHEMA):
+            assert by_name[schema["name"]]["description"] == schema["description"]
+            assert by_name[schema["name"]]["parameters"] == schema["parameters"]
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -265,6 +321,26 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    @pytest.mark.parametrize("available_tools", [None, {"terminal"}])
+    def test_snapshot_and_memory_cache_preserve_the_rendered_catalog(
+        self, monkeypatch, tmp_path, available_tools
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        fresh = build_skills_system_prompt(available_tools=available_tools)
+        assert "    - python-debug: Debug Python scripts\n" in fresh
+        assert build_skills_system_prompt(available_tools=available_tools) == fresh
+        clear_skills_system_prompt_cache(clear_snapshot=False)
+        # A disk snapshot contains metadata, not the selection instructions.
+        # Re-rendering it must deliver the same complete catalog as a scan.
+        assert build_skills_system_prompt(available_tools=available_tools) == fresh
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
