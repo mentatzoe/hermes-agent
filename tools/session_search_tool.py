@@ -129,6 +129,28 @@ def _is_compaction_summary(content: str) -> bool:
     return any(stripped.startswith(p) for p in _COMPACTION_PREFIXES)
 
 
+def _strip_embedded_compaction(content: Any) -> Any:
+    """Cut a compaction handoff appended INSIDE an ordinary message.
+
+    The gateway can deliver the user's real words followed by a
+    ``[CONTEXT COMPACTION ...]`` payload in the same row. The prefix check
+    above only catches rows that *start* with the marker, so recall results
+    were dominated by tens of KB of machine summary instead of the
+    conversation (local fix, Zoe 2026-09-28). Keep the human text; drop
+    the handoff; say that it was dropped.
+    """
+    if not isinstance(content, str) or not content:
+        return content
+    cut = -1
+    for p in _COMPACTION_PREFIXES:
+        i = content.find(p)
+        if i > 0 and (cut == -1 or i < cut):
+            cut = i
+    if cut == -1:
+        return content
+    return content[:cut].rstrip() + f"\n[compaction handoff omitted: {len(content) - cut} chars]"
+
+
 def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     """Walk parent_session_id chain to the lineage root.
 
@@ -295,6 +317,33 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     )
 
 
+def _slim_tool_calls(tool_calls: Any, max_content_len: Optional[int]) -> Any:
+    """Bound tool-call argument payloads the same way content is bounded.
+
+    A single write_file call can carry 100+ KB of arguments; recall needs to
+    know which tool was called and roughly with what, not the whole file
+    (local fix, Zoe 2026-09-28: one discovery returned 110 KB of arguments).
+    """
+    if not max_content_len or not isinstance(tool_calls, list):
+        return tool_calls
+    limit = max(200, max_content_len // 2)
+    slim = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            slim.append(call)
+            continue
+        fn = call.get("function")
+        if not isinstance(fn, dict):
+            slim.append(call)
+            continue
+        args = fn.get("arguments")
+        if isinstance(args, str) and len(args) > limit:
+            new_fn: Dict[str, Any] = {**fn, "arguments": args[:limit] + f"… [{len(args) - limit} more chars]"}
+            call = {**call, "function": new_fn}
+        slim.append(call)
+    return slim
+
+
 def _shape_message(
     m: Dict[str, Any],
     anchor_id: Optional[int] = None,
@@ -313,6 +362,10 @@ def _shape_message(
         from tools.ansi_strip import strip_ansi
 
         raw_content = strip_ansi(raw_content)
+    if isinstance(raw_content, str) and _is_compaction_summary(raw_content):
+        raw_content = f"[compaction handoff omitted: {len(raw_content)} chars]"
+    else:
+        raw_content = _strip_embedded_compaction(raw_content)
     if max_content_len and raw_content and len(raw_content) > max_content_len:
         content = raw_content[:max_content_len] + "…"
         truncated = True
@@ -330,7 +383,7 @@ def _shape_message(
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        entry["tool_calls"] = _slim_tool_calls(m.get("tool_calls"), max_content_len)
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
