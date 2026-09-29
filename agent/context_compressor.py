@@ -1087,6 +1087,7 @@ def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
     """
     collected: list[str] = []
     used = 0
+    seen: set = set()
     for msg in reversed(turns):
         if msg.get("role") != "user":
             continue
@@ -1096,6 +1097,12 @@ def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
         if _synthetic_user_row(content):
             continue
         text = content.strip()
+        # The same platform message can appear twice in a region (a compaction
+        # tail carried forward and then re-archived). Quote it once.
+        key = (msg.get("platform_message_id") or msg.get("timestamp") or "", text)
+        if key in seen:
+            continue
+        seen.add(key)
         if len(text) > _LEAN_USER_MESSAGE_MAX_CHARS:
             text = text[:_LEAN_USER_MESSAGE_MAX_CHARS].rstrip() + " …[truncated]"
         remaining = _LEAN_USER_MESSAGES_BUDGET_CHARS - used
@@ -4563,7 +4570,19 @@ class ContextCompressor(ContextEngine):
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
-        return "\n\n".join(parts)
+        serialized = "\n\n".join(parts)
+        # Companion mode: speak about people by name, not by role.
+        _companion = getattr(self, "_companion", None)
+        if _companion is not None and getattr(_companion, "enabled", False):
+            _user = getattr(_companion, "user_name", "") or "USER"
+            _me = getattr(_companion, "agent_name", "") or "ASSISTANT"
+            serialized = serialized.replace("\n\n[USER]: ", f"\n\n[{_user.upper()}]: ")
+            serialized = serialized.replace("\n\n[ASSISTANT]: ", f"\n\n[{_me.upper()}]: ")
+            if serialized.startswith("[USER]: "):
+                serialized = f"[{_user.upper()}]: " + serialized[len("[USER]: "):]
+            elif serialized.startswith("[ASSISTANT]: "):
+                serialized = f"[{_me.upper()}]: " + serialized[len("[ASSISTANT]: "):]
+        return serialized
 
     def _build_static_fallback_summary(
         self,
@@ -4832,6 +4851,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
             if IDENTITY_HEADING in summary:
                 return summary
+            summary = companion.name_people(summary)
+            companion.session_id = getattr(self, "_session_id", "") or ""
             header = _redact_compaction_text(companion.identity_header(memory_context))
             return header + summary
         except Exception as exc:  # never block compaction on the header

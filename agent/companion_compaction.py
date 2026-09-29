@@ -42,6 +42,18 @@ def _expand(path: str) -> Path:
     return Path(os.path.expanduser(os.path.expandvars(str(path))))
 
 
+def _dedupe_card_lines(text: str) -> str:
+    """Drop exact-duplicate lines (the two cards repeat facts)."""
+    seen, out = set(), []
+    for line in text.splitlines():
+        k = line.strip().lower()
+        if k and k in seen:
+            continue
+        seen.add(k)
+        out.append(line)
+    return "\n".join(out)
+
+
 def _read_bounded(path: str, limit: int = _FILE_MAX_CHARS) -> str:
     try:
         p = _expand(path)
@@ -63,12 +75,50 @@ class CompanionConfig:
         raw = raw if isinstance(raw, dict) else {}
         self.enabled = bool(raw.get("enabled", False))
         self.agent_name = str(raw.get("agent_name") or "the agent").strip()
+        self.user_name = str(raw.get("user_name") or "").strip()
         self.people = [str(p).strip() for p in (raw.get("people") or []) if str(p).strip()]
         self.identity_files = [str(p) for p in (raw.get("identity_files") or []) if str(p).strip()]
         self.letter_budget_tokens = int(raw.get("letter_budget_tokens") or 2_500)
         self.appendix_budget_tokens = int(raw.get("appendix_budget_tokens") or 1_500)
         lanes = raw.get("lanes") or []
         self.lanes = [l for l in lanes if isinstance(l, dict) and l.get("note")]
+        self.session_id = ""
+
+    # ------------------------------------------------------ other conversations
+    def other_conversations(self) -> str:
+        """Fresh list of my other recently active conversations (same query as the
+        sibling-sessions plugin). Empty on any failure."""
+        if not self.session_id:
+            return ""
+        try:
+            import importlib.util
+
+            p = Path(os.path.expanduser("~/.hermes/plugins/sibling-sessions/__init__.py"))
+            spec = importlib.util.spec_from_file_location("_companion_sib", p)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            sibs = mod.find_siblings(mod._db_path(), self.session_id)
+            return mod.render(sibs).strip() if sibs else ""
+        except Exception as exc:
+            logger.debug("companion: other conversations unavailable (%s)", exc)
+            return ""
+
+    # ------------------------------------------------------------------ names
+    def name_people(self, summary: str) -> str:
+        """Replace role words in the deterministic scaffolding with names."""
+        u = self.user_name
+        if not u:
+            return summary
+        swaps = (
+            ("## User Messages (verbatim, newest first)", f"## {u}'s Messages (verbatim, newest first)"),
+            ("(Every real user message from the compacted region, quoted verbatim. These are the user's actual words",
+             f"(Every real message from {u} in the compacted region, quoted verbatim. These are {u}'s actual words"),
+            ("User asked (deterministic, from compacted turns):", f"{u} asked (deterministic, from compacted turns):"),
+            ("User asked:", f"{u} asked:"),
+        )
+        for old, new in swaps:
+            summary = summary.replace(old, new)
+        return summary
 
     # ------------------------------------------------------------------ lanes
     def lane_note(self, origin: Optional[Dict[str, Any]]) -> str:
@@ -103,10 +153,12 @@ class CompanionConfig:
             if len(body) > _FILE_MAX_CHARS:
                 body = body[:_FILE_MAX_CHARS].rsplit("\n", 1)[0] + "\n…[truncated at compaction; read the file for the rest]"
             if body:
-                parts.append(f"### From `{spec}`\n{body}")
+                parts.append(body)
         if memory_context and memory_context.strip():
-            parts.append("### From long-term memory (provider context at compaction time)\n"
-                         + memory_context.strip()[:_FILE_MAX_CHARS])
+            parts.append(_dedupe_card_lines(memory_context.strip())[:_FILE_MAX_CHARS])
+        others = self.other_conversations()
+        if others:
+            parts.append(others)
         text = "\n\n".join(parts)
         if len(text) > _IDENTITY_MAX_CHARS:
             text = text[:_IDENTITY_MAX_CHARS].rsplit("\n", 1)[0] + "\n…[identity header capped]"
@@ -136,7 +188,13 @@ the new turns; never nest or quote earlier letters. Cover, in this order of impo
 - Fiction/roleplay: say what happened in the story and mark it clearly as fiction; characters
   are not the people. Keep canonical scene state if a scene is live.
 - What I'd want to remember about myself from this stretch.
-Use the correct names and pronouns above. No task-log formatting in the letter.]
+Use the correct names and pronouns above. Say names, not "the user". Write it as a letter, in
+paragraphs; no bullet lists and no task-log formatting in the letter.]
+
+## In Flight
+[Agreements, promises and authorisations made in THIS conversation that are not finished yet —
+between us, not just tasks. One line each: what was agreed, who owes it, and its state. Include
+things waiting on the other person. Drop anything already done. Write "None." if nothing.]
 
 {APPENDIX_HEADING}
 [Tight bullets, up to ~{self.appendix_budget_tokens} tokens. PRESERVE EXACTLY every retrieval
