@@ -35,13 +35,20 @@ logger = logging.getLogger(__name__)
 # must never become durable personal memory. Keep this deliberately anchored:
 # a human discussing one of these strings mid-message is still valid input.
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
-    r"^\s*(?:"
+    # Shared channels prefix the speaker ("[Zoe] "); allow one such tag first.
+    # Local (Zoe 2026-09-29): 332 machinery turns had been filed under Zoe
+    # because the prefix and several notice shapes slipped past this filter.
+    r"^\s*(?:\[[^\]\n]{1,40}\]\s+)?(?:"
     r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
     r"\[CONTEXT COMPACTION[^\]]*\]|"
     r"\[CONTEXT SUMMARY\]:?|"
     r"\[PRIOR CONTEXT[^\]]*\]|"
     r"\[Your active task list was preserved across context compression\]|"
-    r"\[IMPORTANT: Background process \d+ matched watch pattern[^\n]*|"
+    r"\[(?:IMPORTANT|SYSTEM): Background process \S+ "
+    r"(?:matched watch pattern|completed|exited|was killed|timed out)[^\n]*|"
+    r"\[System note: (?:Your|The) previous turn[^\n]*interrupted[^\n]*|"
+    r"Internal safety-net (?:handoff|return)[^\n]*|"
+    r"[⏸⏱✅❌▶️🔁]\ufe0f?\s*@\S+ Kanban t_\w+ (?:blocked|timed out|completed|failed|started|done)\b[^\n]*|"
     r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
     r"A background subagent you dispatched earlier has finished\."
     r")",
