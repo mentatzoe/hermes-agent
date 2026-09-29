@@ -289,18 +289,23 @@ def _jobs_lock():
     Nested calls in the same thread reuse the held lock so legacy callers that
     invoke save_jobs() inside a broader mutation section don't deadlock or try
     to reacquire the advisory file lock.
+
+    Yields whether cross-process locking succeeded. Safety-sensitive callers
+    can refuse the historical process-local fallback instead of writing under
+    it. Nested calls report the outer section's actual protection.
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
         _jobs_lock_state.depth = depth + 1
         try:
-            yield
+            yield getattr(_jobs_lock_state, "cross_process_locked", False)
         finally:
             _jobs_lock_state.depth -= 1
         return
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_locked = False
         # Stamp of jobs.json as of this section's load_jobs() (#80703's
         # fast-path, credit @JoaoMarcos44): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed since this
@@ -332,6 +337,7 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            _jobs_lock_state.cross_process_locked = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
@@ -352,13 +358,14 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _jobs_lock_state.cross_process_locked = True
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
             try:
-                yield
+                yield _jobs_lock_state.cross_process_locked
             finally:
                 if lock_fd is not None:
                     try:
@@ -372,6 +379,7 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process_locked = False
             _jobs_lock_state.load_stamp = None
 
 
@@ -3769,13 +3777,12 @@ def _sweep_completed_oneshots(
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
-    with _fire_job_lock(job_id) as acquired:
-        if not acquired:
-            return False
-        return _heartbeat_fire_claim_locked(
-            job_id,
-            expected_owner=expected_owner,
-        )
+    # Renewal changes only the current owner's timestamp, not ownership or
+    # external effects. Require the jobs lock's cross-process protection for
+    # the compare-and-update. Do not take the delivery fence here:
+    # a long delivery holds it on another thread and would starve its own
+    # heartbeat, falsely reporting ownership loss after the lock timeout.
+    return _heartbeat_fire_claim_locked(job_id, expected_owner=expected_owner)
 
 
 def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
@@ -3787,7 +3794,11 @@ def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
     owner copied at dispatch prevents a stale runner from refreshing a claim
     that has since been recovered by another process.
     """
-    with _jobs_lock():
+    with _jobs_lock() as cross_process_locked:
+        if not cross_process_locked:
+            # Unknown ownership is not a definitive claim loss. Let the
+            # scheduler's existing transient-error grace/retry handle it.
+            raise TimeoutError("Cannot safely renew fire claim without the jobs lock")
         jobs = load_jobs()
         for job in jobs:
             if job.get("id") != job_id:
