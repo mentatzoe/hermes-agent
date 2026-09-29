@@ -188,7 +188,9 @@ the new turns; never nest or quote earlier letters. Cover, in this order of impo
 - Fiction/roleplay: say what happened in the story and mark it clearly as fiction; characters
   are not the people. Keep canonical scene state if a scene is live.
 - What I'd want to remember about myself from this stretch.
-Use the correct names and pronouns above. Say names, not "the user". Write it as a letter, in
+Use the correct names and pronouns above. Say names, not "the user". Attribute every quote
+and every joke to the person who actually said it; if the turns don't make the speaker clear,
+say that instead of guessing. Write it as a letter, in
 paragraphs; no bullet lists and no task-log formatting in the letter.]
 
 ## In Flight
