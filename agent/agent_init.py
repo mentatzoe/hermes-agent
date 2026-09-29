@@ -2875,6 +2875,14 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
+    # Companion-mode compaction (compression.companion) — identity header,
+    # letter template, lane notes. Disabled unless explicitly enabled.
+    try:
+        from agent.companion_compaction import load_companion_config
+
+        agent.context_compressor._companion = load_companion_config(_compression_cfg)
+    except Exception:
+        pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)

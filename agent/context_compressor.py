@@ -4822,6 +4822,22 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             logger.info("Lean tail: demoted %d stale tool result(s)", demoted)
         return result
 
+    def _companion_prepend_identity(self, summary: str, memory_context: str = "") -> str:
+        """Companion mode: prepend the deterministic, re-sourced identity header."""
+        companion = getattr(self, "_companion", None)
+        if companion is None or not getattr(companion, "enabled", False):
+            return summary
+        try:
+            from agent.companion_compaction import IDENTITY_HEADING
+
+            if IDENTITY_HEADING in summary:
+                return summary
+            header = _redact_compaction_text(companion.identity_header(memory_context))
+            return header + summary
+        except Exception as exc:  # never block compaction on the header
+            logger.warning("companion identity header failed (%s)", exc)
+            return summary
+
     def _augment_summary_lean(
         self, summary: str, turns_to_summarize: List[Dict[str, Any]],
     ) -> str:
@@ -4997,6 +5013,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             focus_topic = _redact_compaction_text(focus_topic)
         if self._previous_summary:
             self._previous_summary = _redact_compaction_text(self._previous_summary)
+            try:
+                from agent.companion_compaction import strip_identity_header
+
+                self._previous_summary = strip_identity_header(self._previous_summary)
+            except Exception:
+                pass
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
@@ -5244,6 +5266,26 @@ Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_secti
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
+        # Companion mode (compression.companion.enabled): replace the coding
+        # task-log template with identity-aware letter + factual appendix.
+        _companion = getattr(self, "_companion", None)
+        if _companion is not None and getattr(_companion, "enabled", False):
+            try:
+                from agent.companion_compaction import session_origin as _origin_of
+
+                _lane = _companion.lane_note(
+                    _origin_of(getattr(self, "_session_db", None), getattr(self, "_session_id", ""))
+                )
+                _template_sections = _companion.template_sections(
+                    HISTORICAL_TASK_HEADING,
+                    _historical_task_instructions,
+                    _PRUNED_SKILLS_SECTION_HEADING,
+                    _lane,
+                    _today_str,
+                )
+            except Exception as _exc:  # companion must never block compaction
+                logger.warning("companion compaction template failed; using stock template (%s)", _exc)
+
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress.
             # Bound the previous-summary block with the same aggregate cap as
@@ -5420,8 +5462,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
-            # Store for iterative updates on next compaction
+            # Store for iterative updates on next compaction. Companion mode
+            # stores the body WITHOUT the identity header so the header is
+            # re-sourced fresh every time instead of being re-summarized.
             self._previous_summary = summary
+            summary = self._companion_prepend_identity(summary, memory_context)
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
             self._last_summary_error = None
