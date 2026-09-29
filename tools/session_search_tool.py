@@ -317,6 +317,25 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     )
 
 
+def _load_speaker_names() -> Dict[str, str]:
+    """role -> name, from compression.companion (user_name / agent_name). Empty if unset."""
+    try:
+        from hermes_cli.config import load_config
+
+        comp = ((load_config() or {}).get("compression") or {}).get("companion") or {}
+        out = {}
+        if comp.get("user_name"):
+            out["user"] = str(comp["user_name"])
+        if comp.get("agent_name"):
+            out["assistant"] = str(comp["agent_name"])
+        return out
+    except Exception:
+        return {}
+
+
+_SPEAKER_NAMES: Dict[str, str] = _load_speaker_names()
+
+
 def _slim_tool_calls(tool_calls: Any, max_content_len: Optional[int]) -> Any:
     """Bound tool-call argument payloads the same way content is bounded.
 
@@ -380,6 +399,11 @@ def _shape_message(
         "content": content,
         "timestamp": m.get("timestamp"),
     }
+    # Speak about people by name (Zoe, 2026-09-29): "speaker" rides alongside the
+    # role, which stays for tooling. Names come from compression.companion config.
+    _speaker = _SPEAKER_NAMES.get(m.get("role") or "")
+    if _speaker:
+        entry["speaker"] = _speaker
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):

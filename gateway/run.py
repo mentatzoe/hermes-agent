@@ -3611,6 +3611,56 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def _voice_words(text: str) -> set:
+    text = re.sub(r"\[[A-Z][a-z]+ \d\.\d\d(?:, [A-Z][a-z]+ \d\.\d\d)*\]\s*", "", text or "")
+    return set(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split())
+
+
+def _is_agents_own_voice(path: str, transcript: str) -> bool:
+    """True when an incoming voice note is a copy of the agent's own recent TTS reply.
+
+    Local fix (Zoe 2026-09-29): forwarded agent recordings were attributed to the user.
+    Checks the tts-local output dir (recent reply-*.ogg sidecars) and recent TTS text
+    recorded in state.db tool calls; conservative thresholds, never raises.
+    """
+    try:
+        words = _voice_words(transcript)
+        if len(words) < 12:
+            return False
+        import sqlite3 as _sq
+        from hermes_constants import get_hermes_home as _ghh
+
+        db = _sq.connect(f"file:{_ghh()}/state.db?mode=ro", uri=True, timeout=5)
+        try:
+            rows = db.execute(
+                "select tool_calls from messages where role='assistant' and tool_calls is not null "
+                "and timestamp > strftime('%s','now') - 60*60*24*30 "
+                "and (tool_calls like '%synthesize%' or tool_calls like '%text_to_speech%') "
+                "order by id desc limit 400"
+            ).fetchall()
+        finally:
+            db.close()
+        for (tc,) in rows:
+            try:
+                calls = json.loads(tc)
+            except Exception:
+                continue
+            for call in calls or []:
+                fn = (call or {}).get("function", {}) if isinstance(call, dict) else {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    continue
+                said = _voice_words(args.get("text") or "") if isinstance(args, dict) else set()
+                if len(said) >= 12:
+                    overlap = len(words & said)
+                    if overlap / len(words) >= 0.85 and overlap / len(said) >= 0.6:
+                        return True
+    except Exception as exc:
+        logger.debug("own-voice check skipped: %s", exc)
+    return False
+
+
 async def _probe_audio_duration(path: str) -> Optional[str]:
     """Best-effort duration probe. Returns formatted MM:SS / HH:MM:SS, or None on failure."""
     ext = os.path.splitext(path)[1].lower()
@@ -27229,6 +27279,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # what they said: ...") read as a meta-instruction and made
                     # the LLM volunteer commentary about voice mode rather than
                     # reply to the content.
+                    # Local (Zoe 2026-09-29): a forwarded copy of the agent's own
+                    # TTS reply must not be attributed to the user.
+                    if _is_agents_own_voice(path, transcript):
+                        enriched_parts.append(
+                            "[This recording is Aleph's own earlier voice reply, sent back — "
+                            f'the words are Aleph\'s, not the sender\'s.] "{transcript}"'
+                        )
+                        continue
                     enriched_parts.append(f'"{transcript}"')
                 else:
                     error = result.get("error", "unknown error")
