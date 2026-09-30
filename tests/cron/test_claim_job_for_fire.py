@@ -7,6 +7,8 @@ claim for a given fire. Single-machine deployments always win (unaffected).
 These exercise the real store against a temp HERMES_HOME (no mocks) per the
 E2E-over-mocks discipline for file-touching code.
 """
+import subprocess
+import sys
 import threading
 import time
 
@@ -205,6 +207,56 @@ def test_fire_claim_fence_serializes_terminal_revocation(temp_home):
 
     thread.join(timeout=1)
     assert terminal_done.is_set() is True
+
+
+def test_fire_claim_heartbeat_progresses_during_delivery_fence(temp_home, monkeypatch):
+    """Delivery must not make the owner's renewal thread report claim loss."""
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="slow-delivery")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.05)
+    result = {}
+
+    def renew():
+        result["renewed"] = jobs.heartbeat_fire_claim(job["id"], expected_owner=owner)
+
+    with jobs.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
+        assert owns_claim is True
+        thread = threading.Thread(target=renew)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert result["renewed"] is True
+        persisted = jobs.get_job(job["id"])
+        assert persisted is not None
+        refreshed = persisted["fire_claim"]
+        assert refreshed["by"] == owner
+        assert refreshed["at"] != claimed["fire_claim"]["at"]
+
+
+def test_fire_claim_heartbeat_progresses_across_process_delivery_fence(temp_home):
+    """Renewal also works when the delivery fence is held by another process."""
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="process-delivery")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+    with jobs.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
+        assert owns_claim
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from cron import jobs; "
+             "jobs._JOBS_LOCK_TIMEOUT_SECONDS = 0.05; "
+             "print(jobs.heartbeat_fire_claim(sys.argv[1], expected_owner=sys.argv[2]))",
+             job["id"], owner],
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "True"
 
 
 def test_fire_claim_fence_rejects_stale_owner(temp_home):

@@ -285,6 +285,11 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        # Author kind must survive persistence (sessions.json origin, state.db
+        # origin JSON): a restored peer-bot origin must not come back as a
+        # human. Emitted only when True so human dicts stay byte-identical.
+        if self.is_bot:
+            d["is_bot"] = True
         if self.profile:
             d["profile"] = self.profile
         if self.auto_thread_created:
@@ -313,6 +318,7 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            is_bot=data.get("is_bot") is True,
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
@@ -485,6 +491,38 @@ def neutralize_untrusted_inline_text(value: Any, *, max_chars: int = _MAX_PROMPT
     if max_chars and len(text) > max_chars:
         text = text[: max_chars - 3] + "..."
     return text
+
+
+def format_sender_label(source: Any) -> Optional[str]:
+    """Return the ``[Name]`` label that attributes one message in a shared session.
+
+    Every delivery path (a new turn, a queued follow-up, a mid-turn steer,
+    redirect or interrupt) renders the sender through this one function, so
+    the same speaker always carries the same label.
+
+    - Transport-attested peer bots (``source.is_bot``) are marked
+      ``[Name [bot]]``, the convention the Discord history backfill already
+      uses for ``[Recent channel messages]`` lines. A bot's words must never
+      read as the operator's.
+    - Brackets in the display name are neutralised, so a name such as
+      ``"Zoe] [x"`` cannot close the label early and forge another speaker
+      or hide the bot marker. Names without brackets render unchanged.
+    - Slack keeps the verifiable ``<@U...>`` mention target (#17916).
+
+    Returns None when the source carries no display name.
+    """
+    name = getattr(source, "user_name", None)
+    if not name:
+        return None
+    safe = neutralize_untrusted_inline_text(name).replace("[", "(").replace("]", ")")
+    if not safe:
+        return None
+    user_id = getattr(source, "user_id", None)
+    if getattr(source, "platform", None) == Platform.SLACK and user_id:
+        safe = f"{safe} | Slack user <@{user_id}>"
+    if getattr(source, "is_bot", False) is True:
+        safe = f"{safe} [bot]"
+    return f"[{safe}]"
 
 
 def build_session_context_prompt(
