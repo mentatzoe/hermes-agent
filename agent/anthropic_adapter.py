@@ -217,9 +217,93 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = (
 # Unlike the two lists above, the failure here is asymmetric: a missing entry
 # 400s the turn, while a spurious one only leaves thinking on. When in doubt,
 # add the family.
+#
+# claude-opus-5-5 (observed 2026-10-01 via cpa-gui → api.anthropic.com):
+# '"thinking.type.disabled" is not supported for this model. Use
+# "thinking.type.adaptive" and "output_config.effort" ...'. The 5.5 point
+# release is listed rather than all of Opus 5: claude-opus-5 still accepts the
+# disable, and the runtime learner (``remember_thinking_disable_rejected``)
+# covers the next family that changes its mind before this list catches up.
 _MANDATORY_THINKING_CLAUDE_SUBSTRINGS = (
     "claude-fable",
+    "claude-opus-5-5", "claude-opus-5.5",
+    # Sonnet 5.5 accepts between_tools, not disabled (observed via cpa-gui
+    # 2026-10-02). The shared low-effort projection avoids that invalid shape
+    # without depending on a relay supporting the native between_tools mode.
+    "claude-sonnet-5-5", "claude-sonnet-5.5",
 )
+
+# Learned capability is scoped to the exact model id, provider and endpoint.
+# Relay aliases need not name the same upstream, even within one process.
+_RUNTIME_DISABLE_REJECTED_MODELS: set[tuple[str, str, str]] = set()
+
+
+def _normalize_model_for_thinking_verdict(model: str | None) -> str:
+    m = (model or "").strip().lower()
+    if "/" in m:
+        m = m.rsplit("/", 1)[-1]
+    return m.replace(".", "-")
+
+
+def _thinking_disable_route_key(model, provider, base_url):
+    # Deliberately do not collapse catalog prefixes, dots or provider aliases.
+    return (model or "", provider or "", base_url or "")
+
+
+def remember_thinking_disable_rejected(
+    model: str | None, *, provider: str | None = None, base_url: str | None = None,
+) -> None:
+    """Record a disable rejection for this exact route, for this process only."""
+    if model:
+        _RUNTIME_DISABLE_REJECTED_MODELS.add(
+            _thinking_disable_route_key(model, provider, base_url)
+        )
+
+
+def thinking_disable_is_rejected(
+    model: str | None, *, provider: str | None = None, base_url: str | None = None,
+) -> bool:
+    """Whether a disable is known to fail, across request wire formats.
+
+    Static Claude family knowledge applies on every route. Runtime learning
+    applies only to the exact (model, provider, endpoint) which rejected it:
+    compatible relays can assign different semantics to identical model ids.
+    """
+    m = _normalize_model_for_thinking_verdict(model)
+    if not m:
+        return False
+    if _thinking_disable_route_key(model, provider, base_url) in _RUNTIME_DISABLE_REJECTED_MODELS:
+        return True
+    return "claude" in m and any(
+        re.search(r"(?:^|-)" + re.escape(v.replace(".", "-")) + r"(?:$|-)", m)
+        for v in _MANDATORY_THINKING_CLAUDE_SUBSTRINGS
+    )
+
+
+def is_thinking_disable_rejection(message: str | None) -> bool:
+    """Recognise capability rejection, not unrelated disables/schema errors."""
+    text = (message or "").lower()
+    # Sonnet 5.5's capability error prescribes a different native off mode.
+    # Keep the subject and exact replacement tied together; a generic mention
+    # of between_tools alone is not grounds for retrying an unrelated 400.
+    if re.search(
+        r'to turn thinking off on this model,\s*send\s+["\']thinking["\']'
+        r'\s*:\s*\{\s*["\']type["\']\s*:\s*["\']between_tools["\']\s*\}\s*instead',
+        text,
+    ):
+        return True
+    # Require the disabled-thinking field AND an explicit unsupported verdict.
+    if re.search(
+        r"thinking\.type\.disabled[\"'\s]*(?:is\s+)?(?:not\s+supported|unsupported)\b",
+        text,
+    ):
+        return True
+    # Keep the subject tied to the predicate; merely mentioning reasoning in
+    # an error about another setting must not turn it into a thinking repair.
+    return bool(re.search(
+        r"\b(?:thinking|reasoning)\s+(?:is\s+mandatory|cannot\s+be\s+disabled)\b",
+        text,
+    ))
 
 
 def _is_claude_model(model: str | None) -> bool:
@@ -387,7 +471,9 @@ def _supports_xhigh_effort(model: str) -> bool:
     return not any(v in m for v in _NO_XHIGH_CLAUDE_SUBSTRINGS)
 
 
-def _accepts_thinking_disable(model: str) -> bool:
+def _accepts_thinking_disable(
+    model: str, *, provider: str | None = None, base_url: str | None = None,
+) -> bool:
     """Return True when *model* accepts an explicit thinking disable.
 
     Adaptive Claude models default to thinking ON, so "thinking off" only
@@ -409,8 +495,7 @@ def _accepts_thinking_disable(model: str) -> bool:
         return False
     if not _supports_adaptive_thinking(model):
         return False
-    m = model.lower()
-    return not any(v in m for v in _MANDATORY_THINKING_CLAUDE_SUBSTRINGS)
+    return not thinking_disable_is_rejected(model, provider=provider, base_url=base_url)
 
 
 def _forbids_sampling_params(model: str) -> bool:
@@ -900,6 +985,7 @@ def build_anthropic_kwargs(
     base_url: str | None = None,
     fast_mode: bool = False,
     drop_context_1m_beta: bool = False,
+    provider_name: str | None = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -939,6 +1025,7 @@ def build_anthropic_kwargs(
     Currently only supported on native Anthropic endpoints (not third-party
     compatible ones).
     """
+    requested_model = model  # capability learning uses the exact catalog id
     system, anthropic_messages = convert_messages_to_anthropic(
         messages, base_url=base_url, model=model
     )
@@ -1115,7 +1202,9 @@ def build_anthropic_kwargs(
             # the user keeps paying for it. Send the disable explicitly.
             # Mandatory-thinking models reject it with a 400, so they keep the
             # omission: a silently-ignored disable beats a dead turn.
-            if _accepts_thinking_disable(model):
+            if _accepts_thinking_disable(
+                requested_model, provider=provider_name, base_url=base_url,
+            ):
                 kwargs["thinking"] = {"type": "disabled"}
         elif "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()

@@ -18,6 +18,7 @@ import os
 import logging
 import hashlib
 import ipaddress
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -209,6 +210,125 @@ def _parse_string_map(host_obj: dict, root_obj: dict, key: str) -> dict[str, str
         if alias_key and alias_value:
             result[alias_key] = alias_value
     return result
+
+
+_CHAT_REF_PLATFORM_RE = re.compile(r"^[a-z0-9_-]+$")
+# Sentinel entry: excludeChats was present but unusable, so every chat is
+# treated as excluded rather than silently saving everything (fail closed).
+EXCLUDE_ALL_CHATS = "*"
+
+
+def _normalize_chat_ref(item: Any) -> str | None:
+    """Normalize one excludeChats entry to ``platform:chat_id`` or a bare id.
+
+    Integers are accepted because JSON writers often store snowflake ids as
+    numbers. A prefix counts as a platform only when it looks like one, so a
+    bare id that itself contains ``:`` (e.g. a Matrix room id) stays bare.
+    """
+    if isinstance(item, bool):
+        return None
+    if isinstance(item, int):
+        return str(item)
+    if not isinstance(item, str):
+        return None
+    text = item.strip()
+    if not text:
+        return None
+    if text == EXCLUDE_ALL_CHATS:
+        return text
+    platform, sep, chat = text.partition(":")
+    platform = platform.strip().lower()
+    chat = chat.strip()
+    if sep and chat and _CHAT_REF_PLATFORM_RE.match(platform):
+        return f"{platform}:{chat}"
+    return text
+
+
+def _parse_exclude_chats(host_obj: dict, root_obj: dict) -> list[str]:
+    """Parse excludeChats; a host-level list replaces the root list whole."""
+    key = "excludeChats"
+    source = host_obj[key] if key in host_obj else root_obj.get(key)
+    if source is None:
+        return []
+    if isinstance(source, (str, int)) and not isinstance(source, bool):
+        source = [source]
+    if not isinstance(source, (list, tuple)):
+        logger.warning(
+            "Honcho excludeChats must be a list of \"platform:chat_id\" strings "
+            "(got %s); saving is off for every chat until it is fixed",
+            type(source).__name__,
+        )
+        return [EXCLUDE_ALL_CHATS]
+    result: list[str] = []
+    for item in source:
+        entry = _normalize_chat_ref(item)
+        if entry is None:
+            logger.warning("Honcho excludeChats: ignoring unusable entry %r", item)
+            continue
+        if entry not in result:
+            result.append(entry)
+    return result
+
+
+def _clean_chat_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def match_excluded_chat(
+    exclude_chats: list[str] | tuple[str, ...] | None,
+    *,
+    platform: str | None,
+    chat_id: Any = None,
+    thread_id: Any = None,
+    parent_chat_id: Any = None,
+    chat_type: str | None = None,
+) -> str | None:
+    """Return why a turn from this chat must not be saved, or None.
+
+    An entry matches the chat itself, its thread, or the thread's parent
+    channel, so excluding a channel also excludes every existing and future
+    thread under it. Platforms such as Discord give a thread its own chat id
+    and report the channel separately as ``parent_chat_id``; when such a
+    thread arrives without its parent while the platform has exclusions, the
+    parent cannot be ruled out and the chat is treated as excluded.
+    """
+    if not exclude_chats:
+        return None
+    plat = (platform or "").strip().lower()
+    ids = {
+        "chat": _clean_chat_id(chat_id),
+        "thread": _clean_chat_id(thread_id),
+        "parent channel": _clean_chat_id(parent_chat_id),
+    }
+    platform_has_entries = False
+    for entry in exclude_chats:
+        if entry == EXCLUDE_ALL_CHATS:
+            return "excludeChats is malformed, so every chat is excluded"
+        entry_platform, sep, entry_id = entry.partition(":")
+        if sep and _CHAT_REF_PLATFORM_RE.match(entry_platform):
+            if entry_platform != plat:
+                continue
+        else:
+            entry_id = entry  # bare id: matches on any platform
+        platform_has_entries = True
+        for role, value in ids.items():
+            if value and value == entry_id:
+                return f"{role} {plat}:{value} matches excludeChats entry {entry}"
+    thread = ids["thread"]
+    chat = ids["chat"]
+    is_thread = bool(thread) or (chat_type or "").strip().lower() == "thread"
+    # A thread that is its own chat (chat id == thread id, or no separate
+    # chat id) names its channel only through the parent id.
+    own_chat = thread is None or chat in (None, thread)
+    if platform_has_entries and is_thread and own_chat and not ids["parent channel"]:
+        return (
+            f"thread {plat}:{thread or chat} arrived without its parent channel, "
+            "so an excluded parent cannot be ruled out"
+        )
+    return None
 
 
 def _parse_optional_string(
@@ -408,6 +528,10 @@ class HonchoClientConfig:
     # Toggles
     enabled: bool = False
     save_messages: bool = True
+    # Chats whose turns are never saved, as "platform:chat_id" (or a bare id
+    # for any platform). A channel entry also covers every thread under it.
+    # Reads, context injection and tools stay on in excluded chats.
+    exclude_chats: list[str] = field(default_factory=list)
     # Write frequency: "async" (background thread), "turn" (sync per turn),
     # "session" (flush on session end), or int (every N turns)
     write_frequency: str | int = "async"
@@ -702,6 +826,7 @@ class HonchoClientConfig:
             ),
             enabled=enabled,
             save_messages=save_messages,
+            exclude_chats=_parse_exclude_chats(host_block, raw),
             write_frequency=write_frequency,
             context_tokens=_parse_context_tokens(
                 host_block.get("contextTokens"),

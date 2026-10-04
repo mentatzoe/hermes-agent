@@ -73,6 +73,7 @@ class FailoverReason(enum.Enum):
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
+    thinking_disable_rejected = "thinking_disable_rejected"  # Model rejects a thinking disable (reasoning-mandatory) — resend with thinking on and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
 
     # Catch-all
@@ -883,6 +884,24 @@ def classify_api_error(
                         pass
         if not _body_msg:
             _body_msg = str(body.get("message") or "").lower()
+    # Some OpenAI-compatible relays put upstream JSON inside error.message.
+    # Unwrap only the structured message chain, with a small depth bound; don't
+    # loosen capability matching by globally stripping escape characters.
+    for _ in range(3):
+        if not _body_msg.lstrip().startswith("{"):
+            break
+        try:
+            import json
+            _wrapped = json.loads(_body_msg)
+        except (ValueError, TypeError):
+            break
+        if not isinstance(_wrapped, dict):
+            break
+        _nested_error = _wrapped.get("error", _wrapped)
+        _nested_msg = _nested_error.get("message") if isinstance(_nested_error, dict) else None
+        if not isinstance(_nested_msg, str) or _nested_msg == _body_msg:
+            break
+        _body_msg = _nested_msg.lower()
     # Combine all message sources for pattern matching
     parts = [_raw_msg]
     if _body_msg and _body_msg not in _raw_msg:
@@ -999,6 +1018,30 @@ def classify_api_error(
             retryable=True,
             should_compress=True,
         )
+
+    # Reasoning-mandatory model rejected a thinking disable (HTTP 400).
+    # Observed 2026-10-01 from claude-opus-5-5 behind CLIProxyAPI: '"thinking.
+    # type.disabled" is not supported for this model. Use "thinking.type.
+    # adaptive" and "output_config.effort" ...'.  Deterministic per request
+    # shape, so NOT blindly retryable: the loop's one-shot recovery branch
+    # remembers the verdict and resends with thinking on (conversation_loop.py);
+    # a second rejection then takes the normal non-retryable path (fallback or
+    # a clean abort) instead of burning backoff retries on the same 400.
+    # Not provider-gated: relays proxy the upstream message verbatim.
+    if status_code == 400:
+        try:
+            from agent.anthropic_adapter import is_thinking_disable_rejection
+        except Exception:  # pragma: no cover - import guard
+            is_thinking_disable_rejection = None
+        if is_thinking_disable_rejection is not None and is_thinking_disable_rejection(
+            error_msg
+        ):
+            return _result(
+                FailoverReason.thinking_disable_rejected,
+                retryable=False,
+                should_compress=False,
+                should_fallback=True,
+            )
 
     # Anthropic OAuth subscription rejects the 1M-context beta header.
     # Observed error body: "The long context beta is not yet available for

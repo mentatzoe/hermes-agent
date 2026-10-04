@@ -69,6 +69,7 @@ class TestFailoverReason:
             "content_policy_blocked",
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
+            "thinking_disable_rejected",
             "llama_cpp_grammar_pattern",
             "unknown",
         }

@@ -1556,6 +1556,65 @@ def _content_policy_blocked_result(
     }
 
 
+# A refusal notice is user-facing, so it may quote only what the model returned
+# as visible content. Reasoning/thinking is private working text: it is not
+# addressed to the reader, can misname people, and in a shared chat room it
+# posts one bot's scratch notes to everyone. It goes to agent.log (INFO,
+# truncated) instead. Incident 2026-09-30: a content_filter refusal with no
+# visible text posted the model's reasoning into a Discord room labelled
+# "Model's explanation", misgendering the user twice.
+_REFUSAL_REASONING_LOG_CHARS = 500
+
+
+def _refusal_visible_text(agent, normalized) -> str:
+    """Return only the visible text of a refused response.
+
+    Reads ``content`` and strips inline reasoning (``<think>`` blocks and
+    thinking parts of block lists). Never falls back to the reasoning
+    channel: a refusal with no visible text has no explanation to quote.
+    """
+    content = getattr(normalized, "content", None)
+    if not content:
+        return ""
+    try:
+        visible = agent._strip_think_blocks(content)
+    except Exception:
+        # Fail closed: an unparseable payload is quoted as "no explanation"
+        # rather than risking raw reasoning tags reaching the user.
+        return ""
+    return (visible or "").strip()
+
+
+def _log_refusal_reasoning(agent, normalized) -> None:
+    """Record a refused response's reasoning in agent.log only (INFO, truncated)."""
+    try:
+        reasoning = (agent._extract_reasoning(normalized) or "").strip()
+    except Exception:
+        reasoning = ""
+    if not reasoning:
+        return
+    preview = reasoning[:_REFUSAL_REASONING_LOG_CHARS]
+    if len(reasoning) > _REFUSAL_REASONING_LOG_CHARS:
+        preview += "..."
+    logger.info(
+        "%sRefusal reasoning (%d chars; log only, never shown to the user): %s",
+        agent.log_prefix, len(reasoning), preview,
+    )
+
+
+# Surfaces whose reader is the person operating the agent directly: terminal,
+# TUI, desktop app, editor (ACP). Only these may be shown a labelled excerpt of
+# private reasoning at the empty-response terminal. Chat platforms, cron,
+# webhooks and API clients get the plain terminal, with the reasoning kept in
+# agent.log. Keyed on the session's own platform, never on process env.
+_REASONING_EXCERPT_PLATFORMS = frozenset({"", "cli", "tui", "desktop", "acp", "subagent"})
+
+
+def _reasoning_excerpt_allowed(agent) -> bool:
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    return platform in _REASONING_EXCERPT_PLATFORMS
+
+
 def _compression_deferred_result(
     agent,
     messages: List[Dict],
@@ -4007,11 +4066,11 @@ def run_conversation(
                         )
                     else:
                         _refusal_result = _refusal_transport.normalize_response(response)
-                    _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
-                    # Some refusals carry the explanation only in the reasoning
-                    # channel; fall back to it so the user sees *something*.
-                    if not _refusal_text:
-                        _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
+                    # Quote only the model's *visible* text. Reasoning is
+                    # private working text and never belongs in a user-facing
+                    # notice (it posted a bot's thinking into a shared room on
+                    # 2026-09-30); it goes to agent.log below instead.
+                    _refusal_text = _refusal_visible_text(agent, _refusal_result)
 
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
@@ -4061,11 +4120,14 @@ def run_conversation(
                         "%sModel declined to respond (finish_reason=content_filter). "
                         "model=%s provider=%s refusal=%s",
                         agent.log_prefix, agent.model, agent.provider,
-                        _refusal_log or "(no text)",
+                        _refusal_log or "(no visible text)",
                     )
-                    agent._emit_status(
-                        "⚠️ The model declined to respond to this request (safety refusal)."
-                    )
+                    _log_refusal_reasoning(agent, _refusal_result)
+                    # No separate status line here: the returned notice below
+                    # IS the one user-visible message for this refusal. (An
+                    # extra lifecycle status posted a second, near-identical
+                    # message to chat platforms.)  Fallback-attempt statuses
+                    # flushed above stay — they say something different.
 
                     _refusal_detail = (
                         f"Model's explanation: {_refusal_text}"
@@ -4330,6 +4392,18 @@ def run_conversation(
                                 # the next call drops thinking for one request
                                 # — the answer must be written, not re-derived.
                                 agent._ephemeral_reasoning_off = True
+                                # Log it: _vprint goes to stdout only, so before
+                                # this line agent.log never recorded the
+                                # truncated call or why the next request went
+                                # out with thinking off (2026-10-01 diagnosis).
+                                logger.info(
+                                    "%sThinking-only length truncation "
+                                    "(finish_reason=length, no visible content, "
+                                    "requested cap=%s) — next request requests "
+                                    "thinking off or low effort if required",
+                                    agent.log_prefix,
+                                    agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                                )
                             if _interim_content:
                                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                                 # Marked so the ceiling exit can drop the fragment trail.
@@ -5259,6 +5333,39 @@ def run_conversation(
                             force=True,
                         )
                         continue
+
+                # Repair deterministic request shape before credential recovery or
+                # fallback. A thinking-only continuation can request a disable;
+                # the historical 400 was captured, its preceding truncation was
+                # inferred from timing rather than directly logged.
+                if (
+                    classified.reason == FailoverReason.thinking_disable_rejected
+                    and not _retry.thinking_disable_retry_attempted
+                ):
+                    _retry.thinking_disable_retry_attempted = True
+                    from agent.anthropic_adapter import remember_thinking_disable_rejected
+
+                    remember_thinking_disable_rejected(
+                        getattr(agent, "model", None),
+                        provider=getattr(agent, "provider", None),
+                        base_url=getattr(agent, "base_url", None),
+                    )
+                    # One-call low-effort projection; don't mutate configured
+                    # reasoning. The learned route verdict prevents later off
+                    # requests from repeating the same incompatible shape.
+                    agent._ephemeral_reasoning_off = True
+                    logger.warning(
+                        "%sModel %s rejected a thinking disable (HTTP 400); "
+                        "remembered for this route and retrying at low effort",
+                        agent.log_prefix,
+                        getattr(agent, "model", None),
+                    )
+                    agent._vprint(
+                        f"{agent.log_prefix}🧠 Model requires thinking — retrying "
+                        f"without the thinking disable...",
+                        force=True,
+                    )
+                    continue
 
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,
@@ -6731,10 +6838,12 @@ def run_conversation(
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
                     _nonretryable_summary = agent._summarize_api_error(api_error)
                     if classified.reason == FailoverReason.content_policy_blocked:
-                        agent._emit_status(
-                            f"❌ Provider safety filter blocked this request: "
-                            f"{_nonretryable_summary}"
-                        )
+                        # One refusal, one user-visible notice: the returned
+                        # final_response below already carries the provider's
+                        # message, so no separate lifecycle status here (it
+                        # posted a second, near-identical message to chat).
+                        # logger.error below keeps the raw error in the log.
+                        pass
                     elif classified.reason == FailoverReason.ssl_cert_verification:
                         agent._emit_status(
                             f"❌ TLS certificate verification failed: "
@@ -6866,17 +6975,26 @@ def run_conversation(
                     else:
                         agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.content_policy_blocked:
+                        # Provider text only — and never inline reasoning a
+                        # proxy may echo back from a partial output.
+                        try:
+                            _policy_message = (
+                                agent._strip_think_blocks(_nonretryable_summary) or ""
+                            ).strip()
+                        except Exception:
+                            _policy_message = ""
+                        _policy_message = _policy_message or "(no message)"
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
                             "(not a Hermes/gateway failure).\n\n"
-                            f"Provider message: {_nonretryable_summary}\n\n"
+                            f"Provider message: {_policy_message}\n\n"
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
                         return _content_policy_blocked_result(
                             messages,
                             api_call_count,
                             final_response=_policy_response,
-                            error_detail=_nonretryable_summary,
+                            error_detail=_policy_message,
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
@@ -8660,7 +8778,13 @@ def run_conversation(
                     # returning nothing, is showing the model's own reasoning
                     # (clearly labeled as such) strictly more useful.
                     # Idea credit: PR #48795 (@ligl0325).
-                    if reasoning_text:
+                    # Only on operator surfaces (CLI/TUI/desktop/ACP/subagent
+                    # parent): on chat platforms, cron and API clients the
+                    # excerpt would post private reasoning to an audience
+                    # (2026-09-30 room incident). There the reasoning stays in
+                    # agent.log (the WARNING above) and the plain terminal
+                    # (and its turn-completion explainer) is delivered.
+                    if reasoning_text and _reasoning_excerpt_allowed(agent):
                         final_response = (
                             "⚠️ The model produced only internal reasoning and "
                             "no final answer, despite retries"
