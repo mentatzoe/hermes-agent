@@ -95,6 +95,53 @@ def _platform_defaults(platform_key: str) -> dict[str, Any]:
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
 
+CHANNEL_OVERRIDEABLE_KEYS = OVERRIDEABLE_KEYS | {"thinking_progress", "friendly_tool_labels"}
+
+
+def display_config_for_source(user_config: Any, source: Any) -> Any:
+    """Copy display settings for a room, inheriting parent keys without mutating config.
+
+    Reads display.channel_overrides.<platform>.<id>. Exact chat, thread, then
+    parent wins per key. Unknown keys (including fail_open) are not display
+    controls; null inherits. Values use the ordinary resolver's normalization.
+    """
+    if not isinstance(user_config, dict) or source is None:
+        return user_config
+    display = user_config.get("display")
+    if not isinstance(display, dict):
+        return user_config
+    by_platform = display.get("channel_overrides")
+    if not isinstance(by_platform, dict):
+        return user_config
+    from gateway.run import _channel_override_lookup_keys, _platform_config_key
+
+    platform = getattr(source, "platform", None)
+    if platform is None:
+        return user_config
+    platform_key = _platform_config_key(platform)
+    entries = by_platform.get(platform_key)
+    if not isinstance(entries, dict):
+        return user_config
+    entries = {str(key): value for key, value in entries.items()}
+    keys = _channel_override_lookup_keys(
+        getattr(source, "chat_id", ""), thread_id=getattr(source, "thread_id", None),
+        parent_id=getattr(source, "parent_chat_id", None),
+    )
+    overrides = {}
+    for key in reversed(keys):
+        entry = entries.get(key)
+        if isinstance(entry, dict):
+            overrides.update({k: v for k, v in entry.items()
+                              if k in CHANNEL_OVERRIDEABLE_KEYS and v is not None})
+    if not overrides:
+        return user_config
+    platforms = display.get("platforms")
+    platforms = dict(platforms) if isinstance(platforms, dict) else {}
+    current = platforms.get(platform_key)
+    platforms[platform_key] = {**(current if isinstance(current, dict) else {}), **overrides}
+    return {**user_config, "display": {**display, "platforms": platforms}}
+
+
 def resolve_display_setting(user_config: dict, platform_key: str, setting: str, fallback: Any = None) -> Any:
     """Resolve a display setting with per-platform override support (see module docstring for order).
 

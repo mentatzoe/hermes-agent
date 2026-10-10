@@ -1599,9 +1599,10 @@ class GatewayTurnMixin:
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
+        from gateway.display_config import display_config_for_source
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
-                _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
+                display_config_for_source(_load_gateway_config(), source), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
                 require_platform_override_for={Platform.MATTERMOST},
             )
@@ -1623,7 +1624,7 @@ class GatewayTurnMixin:
         try:
             from gateway.display_config import resolve_display_setting
             _reasoning_style = resolve_display_setting(
-                _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
+                display_config_for_source(_load_gateway_config(), source), _platform_config_key(source.platform), "reasoning_style", "code",
             )
         except Exception:
             _reasoning_style = "code"
@@ -2730,7 +2731,8 @@ class GatewayTurnMixin:
         if not _scfg.globally_enabled:
             return None
         from gateway.display_config import resolve_display_setting
-        _plat_streaming = resolve_display_setting(_load_gateway_config(), _platform_config_key(source.platform), "streaming")
+        from gateway.display_config import display_config_for_source
+        _plat_streaming = resolve_display_setting(display_config_for_source(_load_gateway_config(), source), _platform_config_key(source.platform), "streaming")
         if not _scfg.enabled_for(_plat_streaming):
             return None
         try:
@@ -2941,9 +2943,9 @@ class GatewayTurnMixin:
             _platform_config_key,
         )
         from agent.secret_scope import get_secret
-        from gateway.display_config import resolve_display_setting, resolve_tool_progress
+        from gateway.display_config import display_config_for_source, resolve_display_setting, resolve_tool_progress
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
-        user_config = _load_gateway_config()
+        user_config = display_config_for_source(_load_gateway_config(), source)
         platform_key = _platform_config_key(source.platform)
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
         adapter = self._delivery_adapter_for(source)
