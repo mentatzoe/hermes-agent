@@ -35,9 +35,9 @@ _OWN_VOICE_SCAN_ROWS = 10_000
 _OWN_VOICE_QUERY_BUDGET_S = 10.0
 
 
-def _voice_words(text: str) -> set:
+def _voice_words(text: str) -> list[str]:
     text = re.sub(r"\[[A-Z][a-z]+ \d\.\d\d(?:, [A-Z][a-z]+ \d\.\d\d)*\]\s*", "", text or "")
-    return set(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split())
+    return re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()
 
 
 def _is_agents_own_voice(path: str, transcript: str) -> bool:
@@ -46,12 +46,15 @@ def _is_agents_own_voice(path: str, transcript: str) -> bool:
     Blocking SQLite work: callers must offload it. A row-id window prevents a
     rare-TTS history from scanning a multi-GB store; the progress handler caps
     cold-cache query time. Short or uncertain matches keep normal attribution.
+    Text alone cannot identify the speaker: someone reading a recent sentence
+    aloud word for word can still match.
     """
     import sqlite3
     from hermes_constants import get_hermes_home
 
     try:
-        words = _voice_words(transcript)
+        ordered_words = _voice_words(transcript)
+        words = set(ordered_words)
         if len(words) < 12:
             return False
         db = sqlite3.connect(f"file:{get_hermes_home()}/state.db?mode=ro", uri=True, timeout=5)
@@ -75,14 +78,18 @@ def _is_agents_own_voice(path: str, transcript: str) -> bool:
                 continue
             for call in calls or []:
                 fn = (call or {}).get("function", {}) if isinstance(call, dict) else {}
+                if fn.get("name") not in {"text_to_speech", "text_to_speech_tool", "mcp__tts_local__synthesize"}:
+                    continue
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     continue
-                said = _voice_words(args.get("text") or "") if isinstance(args, dict) else set()
+                ordered_said = _voice_words(args.get("text") or "") if isinstance(args, dict) else []
+                said = set(ordered_said)
                 if len(said) >= 12:
                     overlap = len(words & said)
-                    if overlap / len(words) >= 0.85 and overlap / len(said) >= 0.6:
+                    if (overlap / len(words) >= 0.85 and overlap / len(said) >= 0.6
+                            and SequenceMatcher(None, ordered_words, ordered_said, autojunk=False).ratio() >= 0.85):
                         return True
     except Exception as exc:
         logger.debug("own-voice check skipped: %s", exc)
