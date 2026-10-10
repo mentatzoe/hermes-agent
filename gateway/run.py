@@ -64,9 +64,9 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # Size of the separate pool for best-effort session HOUSEKEEPING; why it is separate: _run_housekeeping_in_executor.
 _HOUSEKEEPING_MAX_WORKERS = 4
 
-# End reasons meaning the USER deliberately closed this thread. Shared by _classify_completion_target and
-# _resolve_async_delegation_session so they never disagree (else a "delivered" reason is acked, then lost).
-_USER_BOUNDARY_END_REASONS = ("session_reset", "user_exit", "session_switch", "new_session")
+# A route switch does not delete a conversation: finished work can follow the
+# current route. Only explicit reset/closure is terminal; classifier and resolver agree.
+_USER_BOUNDARY_END_REASONS = ("session_reset", "user_exit", "new_session")
 # Bounds one stall-notify send so a wedged transport can't block the watcher; on timeout the next tick retries.
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024

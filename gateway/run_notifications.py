@@ -226,6 +226,8 @@ class GatewayNotificationsMixin:
             tip_row = await session_db.get_session(target_session_id)
         except Exception:
             tip_row = None
+        if tip_row is not None and tip_row.get("ended_at") and tip_row.get("end_reason") == "session_switch":
+            return session_entry.session_id  # follow the chat without rewinding its route
         if tip_row is None or tip_row.get("ended_at"):
             logger.warning(
                 "Async-delegation compression continuation %s is %s; dropping injection.",
@@ -315,6 +317,9 @@ class GatewayNotificationsMixin:
                 return None
         if target_session_id == session_entry.session_id:
             return session_entry
+        if not follows_compression and self._is_delegated_session(pinned_row):
+            logger.warning("Refusing async route switch into delegated child %s", pinned_session_id)
+            return None
         prior_session_id = session_entry.session_id
         if not self._is_session_run_current(session_entry.session_key, run_generation):
             logger.warning(
@@ -1264,6 +1269,48 @@ class GatewayNotificationsMixin:
             return _transport.adapter
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
 
+    @staticmethod
+    def _is_delegated_session(row: dict) -> bool:
+        """A compression parent alone is not delegation; the durable marker is."""
+        config = row.get("model_config") or {}
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except (ValueError, TypeError):
+                config = {}
+        return row.get("source") == "subagent" or (
+            isinstance(config, dict) and bool(config.get("_delegate_from"))
+        )
+
+    async def _process_notice_ownership(self, evt: dict) -> str:
+        """A child's inherited chat route is not permission to start another turn."""
+        if evt.get("type") not in {"completion", "watch_match", "watch_disabled", "heartbeat"}:
+            return "deliver"
+        import re
+        from tools.process_registry import process_registry
+        from tools.delegate_tool import get_subagent_attribution
+        process = process_registry.get(str(evt.get("session_id") or ""))
+        delegated = evt.get("delegated_child", getattr(process, "delegated_child", None))
+        if delegated is True:
+            return "drop"
+        if delegated is False:
+            return "deliver"
+        owner_task = (evt.get("owner_task_id") or getattr(process, "owner_task_id", "")
+                      or evt.get("task_id") or getattr(process, "task_id", ""))
+        if re.fullmatch(r"sa-\d+-[0-9a-f]{8}", str(owner_task)) or get_subagent_attribution(owner_task):
+            return "drop"
+        owner = str(evt.get("parent_session_id") or getattr(process, "parent_session_id", "") or "").strip()
+        if not owner:
+            return "deliver"
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            return "retry"
+        try:
+            row = await db.get_session(owner)
+        except Exception:
+            return "retry"
+        return "drop" if row is None or self._is_delegated_session(row) else "deliver"
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
     ) -> Optional[bool]:
@@ -1274,6 +1321,9 @@ class GatewayNotificationsMixin:
         gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
+        ownership = await self._process_notice_ownership(evt)
+        if ownership != "deliver":
+            return None if ownership == "drop" else False
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
@@ -1420,6 +1470,13 @@ class GatewayNotificationsMixin:
         if parent is None:
             return "terminal"
         if not parent.get("ended_at"):
+            if self._is_delegated_session(parent):
+                try:
+                    adopted = await self.async_session_store.lookup_by_session_id(parent_session_id)
+                except Exception:
+                    return "retry"
+                if adopted is None:
+                    return "terminal"
             return "deliver"
         end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
@@ -1435,8 +1492,14 @@ class GatewayNotificationsMixin:
         except Exception:
             logger.debug("Async-completion pre-flight tip lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
-        if tip is None or tip.get("ended_at"):
+        if tip is None:
             return "retry"
+        if tip.get("ended_at"):
+            reason = str(tip.get("end_reason") or "")
+            if reason in _USER_BOUNDARY_END_REASONS:
+                return "terminal"
+            if reason == "compression":
+                return "retry"
         return "deliver"
 
     @staticmethod
@@ -1737,6 +1800,9 @@ class GatewayNotificationsMixin:
         if self._completion_notification_batches_stopping:
             return False
         key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)
+        owner = str(evt.get("owner_task_id") or evt.get("task_id") or "")
+        key = (owner if owner.startswith("sa-") else "", str(evt.get("delegated_child")),
+               str(evt.get("parent_session_id") or "")) + key
         future = asyncio.get_running_loop().create_future()
         self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
         if key not in self._completion_notification_batch_tasks:
@@ -1988,6 +2054,9 @@ class GatewayNotificationsMixin:
         return {
             "type": "completion",
             "session_id": session_id,
+            "task_id": getattr(session, "task_id", ""),
+            "owner_task_id": getattr(session, "owner_task_id", ""),
+            "delegated_child": getattr(session, "delegated_child", None),
             **{k: watcher.get(k, "") for k in _WATCHER_ROUTE_FIELDS},
             "message_id": str(watcher.get("message_id") or "").strip() or None,
             "started_at": getattr(session, "started_at", None),
