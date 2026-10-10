@@ -1530,7 +1530,7 @@ class GatewayStartupMixin:
         # rows: only this pass tells the store which sessions have spooled rows, and a live row
         # written first would get a lower row id than them for good.
         with _log_suppressed(logging.WARNING, "Pending-message recovery failed: %s"):
-            recover_gateway_pending(self)
+            await asyncio.to_thread(recover_gateway_pending, self)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()

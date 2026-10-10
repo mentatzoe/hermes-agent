@@ -200,6 +200,8 @@ def test_recover_skips_failing_payload_and_continues(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
     )
+    # This test is about DB rejection, not age; keep its fixed payloads fresh.
+    monkeypatch.setattr("gateway.shutdown_flush.time.time", lambda: 1700000001)
     bad = _write_flush_file(flush_dir, "pending-a.json", "sid-bad", "first")
     good = _write_flush_file(flush_dir, "pending-b.json", "sid-good", "second")
 

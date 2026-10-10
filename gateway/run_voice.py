@@ -265,6 +265,7 @@ class GatewayVoiceMixin:
                 user_name = source.user_name
             user_name = user_name or GatewayVoiceMixin._cached_user_display_name(client, user_id)
             source.user_id, source.user_name = str(user_id), user_name or str(user_id)
+            source.is_bot = False  # voice author, not the stored text-channel binder
             # The bound source is the `/voice join` message's; its id is not this turn's trigger
             # (run.py exports it as HERMES_SESSION_MESSAGE_ID for reply anchoring).
             source.message_id = None

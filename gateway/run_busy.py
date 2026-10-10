@@ -373,7 +373,7 @@ class GatewayBusySessionMixin:
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.base import merge_pending_message_event, same_message_author
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return
@@ -405,6 +405,7 @@ class GatewayBusySessionMixin:
         }
         if (
             same_security_context
+            and same_message_author(existing, event)
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
@@ -415,6 +416,10 @@ class GatewayBusySessionMixin:
             event._gateway_accepted = True
             return
 
+        self._enqueue_attributed_follow_up(session_key, event, adapter)
+
+    def _enqueue_attributed_follow_up(self, session_key: str, event: MessageEvent, adapter: Any) -> None:
+        """A separate author retains its turn under the existing queue cap."""
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
@@ -439,8 +444,27 @@ class GatewayBusySessionMixin:
         )
         return (enriched_text or text).strip() if successful_transcripts else text
 
+    def _label_shared_steer_text(self, source: Any, text: str) -> str:
+        """Use the normal-turn speaker label without changing upstream origin JSON."""
+        from gateway.session import format_sender_label, is_shared_multi_user_session
+        if text and is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+        ):
+            label = format_sender_label(source)
+            if label:
+                return f"{label} {text}"
+        return text
+
+    def _label_event_text(self, event: Any, text: Optional[str]) -> Optional[str]:
+        if not text or event is None or event.internal:
+            return text
+        return self._label_shared_steer_text(event.source, text)
+
     def _steer_text_with_origin(self, text: str, event: MessageEvent) -> str:
         """Keep event origin in this injection, never in the cached system prompt."""
+        text = self._label_event_text(event, text)
         if not text.strip():
             return text
         import json
@@ -700,21 +724,21 @@ class GatewayBusySessionMixin:
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
-            running_agent.interrupt(_interrupt_text)
+            running_agent.interrupt(self._label_event_text(event, _interrupt_text))
         except Exception:
             pass  # don't let interrupt failure block the ack
 
     def _busy_steer_ack_enabled(self, event: MessageEvent, session_key: str) -> bool:
         # Some mobile chat setups want silent steering — keep the behavior, drop the bubble.
         from gateway.run import _load_gateway_config, _platform_config_key
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import display_config_for_source, resolve_display_setting
         steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
         if steer_ack_env is not None:
             steer_ack_enabled = steer_ack_env.strip().lower() in {"1", "true", "yes", "on"}
         else:
             steer_ack_enabled = bool(
                 resolve_display_setting(
-                    _load_gateway_config(), _platform_config_key(event.source.platform),
+                    display_config_for_source(_load_gateway_config(), event.source), _platform_config_key(event.source.platform),
                     "busy_steer_ack_enabled", True,
                 )
             )
@@ -734,13 +758,13 @@ class GatewayBusySessionMixin:
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _hermes_home, _load_gateway_config, _platform_config_key
         )
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import display_config_for_source, resolve_display_setting
 
         # Terse by default; iteration/tool detail opts in via display.platforms.<p>.busy_ack_detail.
         status_parts = []
         busy_ack_detail_enabled = bool(
             resolve_display_setting(
-                _load_gateway_config(), _platform_config_key(event.source.platform),
+                display_config_for_source(_load_gateway_config(), event.source), _platform_config_key(event.source.platform),
                 "busy_ack_detail", True,
             )
         )
@@ -830,6 +854,10 @@ class GatewayBusySessionMixin:
         if not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
+
+        if event.source.is_bot is True:
+            self._queue_or_replace_pending_event(session_key, event)
+            return True  # peers neither control the running turn nor receive busy notices
 
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping

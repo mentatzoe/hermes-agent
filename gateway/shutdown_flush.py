@@ -21,6 +21,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ _TRANSCRIPT_SPOOL_SEQ = itertools.count()
 # Spool files whose row was written but which could not be deleted. Replaying one again would write
 # its row twice, so both replay passes skip it for the rest of this process.
 _REPLAYED_UNREMOVABLE: set[Path] = set()
+# Old inbound backlog must not look like fresh input. Keep its spool for manual recovery.
+RECOVERY_MAX_AGE_SECONDS = 6 * 60 * 60
 
 
 def _get_flush_dir():
@@ -214,12 +217,42 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
+        source = getattr(value, "source", None)
+        for key, attr in (("sender_id", "user_id"), ("sender_name", "user_name"),
+                          ("chat_type", "chat_type"), ("platform", "platform")):
+            candidate = getattr(source, attr, None)
+            candidate = getattr(candidate, "value", candidate)
+            if key not in result and isinstance(candidate, (str, int)):
+                result[key] = str(candidate)
+        if getattr(source, "is_bot", False) is True:
+            result["sender_is_bot"] = True
+        if getattr(value, "internal", False) is True:
+            result["internal"] = True
         return result
     if isinstance(value, str):  # runner-level _pending_messages
         return {"text": value}
     if isinstance(value, dict) and _json_safe(value):
         return value
     return {"text": str(value)}
+
+
+def _recovered_user_content(data: Dict[str, Any], text: str) -> str:
+    """Recovery uses the live label; internal, DM and legacy rows stay verbatim."""
+    if (data.get("internal") is True or data.get("chat_type") not in ("group", "channel", "thread")
+            or not isinstance(data.get("sender_name"), str)):
+        return text
+    from gateway.config import Platform
+    from gateway.session import format_sender_label
+    platform = data.get("platform")
+    try:
+        platform = Platform(platform) if platform else None
+    except ValueError:
+        platform = None
+    source = SimpleNamespace(user_name=data["sender_name"], user_id=data.get("sender_id"),
+                             platform=platform, is_bot=data.get("sender_is_bot") is True)
+    label = format_sender_label(source)
+    prefix = f"{label} " if label else ""
+    return text if text.startswith(prefix) else prefix + text
 
 
 def _sort_number(value: Any) -> float:
@@ -410,6 +443,11 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             raise
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
+    flushed_at = payload.get("ts")
+    if (isinstance(flushed_at, (int, float)) and not isinstance(flushed_at, bool)
+            and time.time() - flushed_at > RECOVERY_MAX_AGE_SECONDS):
+        logger.warning("Not recovering stale pending message for %s; preserved in %s", session_key, path)
+        return False
     text = data.get("text", "")
     if not text or not session_key:
         logger.warning("Cannot recover structurally invalid pending message from %s; "
@@ -434,7 +472,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
-    target_db.append_message(session_id=session_id, role="user", content=text,
+    target_db.append_message(session_id=session_id, role="user", content=_recovered_user_content(data, text),
                              timestamp=payload.get("ts", int(time.time())))
     return True
 
