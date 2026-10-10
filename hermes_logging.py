@@ -220,6 +220,24 @@ _NOISY_LOGGERS = (
 )
 
 
+class _PreformatDynamicMessageFilter(logging.Filter):
+    """Keep Discord heartbeat warnings readable when embedded stacks contain percent signs.
+
+    discord.py appends dynamic stack text to a format string before supplying its
+    two heartbeat arguments. Repair malformed records at the source, before handlers
+    (including queue handlers) attempt interpolation.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args and isinstance(record.msg, str):
+            try:
+                record.msg % record.args
+            except (TypeError, ValueError, KeyError):
+                record.msg = f"{record.msg} [args={record.args!r}]"
+                record.args = None
+        return True
+
+
 def _quiet_noisy_loggers() -> None:
     """Pin noisy third-party loggers at WARNING."""
     for name in _NOISY_LOGGERS:
@@ -400,6 +418,9 @@ def setup_logging(
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)
     _quiet_noisy_loggers()
+    discord_logger = logging.getLogger("discord.gateway")
+    if not any(isinstance(f, _PreformatDynamicMessageFilter) for f in discord_logger.filters):
+        discord_logger.addFilter(_PreformatDynamicMessageFilter())
     _logging_initialized = True
     return log_dir
 
