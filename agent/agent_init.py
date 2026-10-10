@@ -2006,6 +2006,10 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         with suppress(Exception):
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
     agent.compression_enabled = cs.enabled
+    # Keep companion policy opt-in alongside the upstream compression settings.
+    with suppress(Exception):
+        from agent.companion_compaction import load_companion_config
+        agent.context_compressor._companion = load_companion_config(_agent_cfg.get("compression", {}))
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
     # Micro-compaction has no pre-compress checkpoint hook; suppress it while the gate is
