@@ -24,10 +24,19 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
+
+# A configured path that names the Hermes home: ``~/.hermes``, ``$HERMES_HOME`` or
+# ``${HERMES_HOME}``, alone or followed by a separator. These resolve through
+# hermes_constants.get_hermes_home() so a profile or relocated home reads its own files.
+_HOME_PREFIX = re.compile(r"^(?:~[/\\]\.hermes|\$HERMES_HOME|\$\{HERMES_HOME\})(?=$|[/\\])")
+
+# Warnings already emitted in this process, keyed by (kind, path). Each gap warns once.
+_warned: set = set()
 
 IDENTITY_HEADING = "## Who Is Here (re-sourced at every compaction — not a summary)"
 IDENTITY_END = "<!-- end of re-sourced identity header -->"
@@ -38,8 +47,28 @@ _IDENTITY_MAX_CHARS = 6_000
 _FILE_MAX_CHARS = 2_500
 
 
+def _hermes_home() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home())
+
+
 def _expand(path: str) -> Path:
-    return Path(os.path.expanduser(os.path.expandvars(str(path))))
+    """Expand a configured path; a leading ``~/.hermes`` or ``$HERMES_HOME`` is the active home."""
+    raw = str(path)
+    match = _HOME_PREFIX.match(raw)
+    if match:
+        rest = raw[match.end():].lstrip("/\\")
+        home = _hermes_home()
+        return home / rest if rest else home
+    return Path(os.path.expanduser(os.path.expandvars(raw)))
+
+
+def _warn_once(kind: str, key: str, message: str, *args: Any) -> None:
+    if (kind, key) in _warned:
+        return
+    _warned.add((kind, key))
+    logger.warning(message, *args)
 
 
 def _dedupe_card_lines(text: str) -> str:
@@ -55,13 +84,19 @@ def _dedupe_card_lines(text: str) -> str:
 
 
 def _read_bounded(path: str, limit: int = _FILE_MAX_CHARS) -> str:
+    p: Optional[Path] = None
     try:
         p = _expand(path)
         if not p.is_file():
+            _warn_once("missing", str(p),
+                       "companion: identity file %s (resolved to %s) is missing; "
+                       "the identity header will not include it", path, p)
             return ""
         text = p.read_text(encoding="utf-8", errors="ignore").strip()
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.debug("companion: could not read %s (%s)", path, exc)
+    except Exception as exc:
+        _warn_once("unreadable", str(p or path),
+                   "companion: identity file %s (resolved to %s) could not be read (%s); "
+                   "the identity header will not include it", path, p, exc)
         return ""
     if len(text) > limit:
         text = text[:limit].rsplit("\n", 1)[0] + "\n…[truncated at compaction; read the file for the rest]"
@@ -93,7 +128,7 @@ class CompanionConfig:
         try:
             import importlib.util
 
-            p = Path(os.path.expanduser("~/.hermes/plugins/sibling-sessions/__init__.py"))
+            p = _hermes_home() / "plugins" / "sibling-sessions" / "__init__.py"
             spec = importlib.util.spec_from_file_location("_companion_sib", p)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)  # type: ignore[union-attr]
@@ -159,6 +194,15 @@ class CompanionConfig:
         others = self.other_conversations()
         if others:
             parts.append(others)
+        if len(parts) == 1:
+            try:
+                home = str(_hermes_home())
+            except Exception:  # the warning must never block the header
+                home = "unknown"
+            _warn_once("empty-header", "",
+                       "companion: identity header is empty (no people, identity files or memory "
+                       "context reached it; Hermes home %s); the summarizer gets no names or pronouns",
+                       home)
         text = "\n\n".join(parts)
         if len(text) > _IDENTITY_MAX_CHARS:
             text = text[:_IDENTITY_MAX_CHARS].rsplit("\n", 1)[0] + "\n…[identity header capped]"
