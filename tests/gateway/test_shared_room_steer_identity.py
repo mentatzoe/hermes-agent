@@ -490,4 +490,3 @@ async def test_pending_interrupt_monitor_keeps_human_label():
     )
     assert agent.interrupted == ["[Zoe] hold"]
     assert detected.is_set()
-
