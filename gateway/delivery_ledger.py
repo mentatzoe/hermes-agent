@@ -32,6 +32,8 @@ _DB_LOCK = threading.Lock()
 # ``gateway.delivery_ledger`` and these only matter in the rare recovery path).
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
+# Explicitly rejected replies lose context sooner than ambiguous or unattempted sends.
+FAILED_REDELIVERY_MAX_AGE_SECONDS = 30 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
@@ -399,7 +401,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if (attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS
+                    or (state == "failed" and (now - created_at) > FAILED_REDELIVERY_MAX_AGE_SECONDS)):
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))

@@ -723,7 +723,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
-            return (
+            return EphemeralReply(
                 t("gateway.busy.drain_queued", action=self._status_action_gerund())
                 if queue_during_drain
                 else t("gateway.busy.drain_rejected", action=self._status_action_gerund())
@@ -1056,7 +1056,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining:
-            return True, t("gateway.busy.drain_rejected_new_work", action=self._status_action_gerund()), command
+            return True, EphemeralReply(t("gateway.busy.drain_rejected_new_work", action=self._status_action_gerund())), command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         qcmd = self._hm_quick_commands().get(command) if command else None
