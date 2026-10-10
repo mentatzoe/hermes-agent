@@ -267,13 +267,21 @@ def _strip_embedded_compaction(content: Any) -> Any:
     offset = 0
     fence = ""
     for line in content.splitlines(keepends=True):
-        stripped = line.lstrip()
+        # Four columns (including a leading tab) are indented code, not fences
+        # or handoffs. Never strip their literal marker examples.
+        stripped = line.lstrip(" ")
+        if len(line) - len(stripped) >= 4 or stripped.startswith("\t"):
+            offset += len(line)
+            continue
         match = re.match(r"(`{3,}|~{3,})", stripped)
         if match:
             marker = match.group(1)
             if not fence:
-                fence = marker
-            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                # Backtick info strings cannot themselves contain backticks.
+                if marker[0] != "`" or "`" not in stripped[match.end():]:
+                    fence = marker
+            elif (marker[0] == fence[0] and len(marker) >= len(fence)
+                  and not stripped[match.end():].strip()):
                 fence = ""
         elif not fence and stripped.startswith(_COMPACTION_PREFIXES):
             cut = offset + len(line) - len(stripped)
