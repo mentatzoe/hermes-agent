@@ -1976,8 +1976,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         The reader flips ``exited`` only at EOF; when the direct child has exited but a
         descendant (e.g. a daemon from ``hermes update``) holds the pipe open, poll()
         would report "running" forever. If ``Popen.poll()`` has an exit code, drain
-        readable bytes non-blocking and flip ``exited``. No-op for env/PTY, exited and
-        detached sessions.
+        readable bytes non-blocking and flip ``exited``. No-op for env, exited and
+        detached sessions. On POSIX, a PTY whose reader has stopped can instead
+        finish from its stored exitstatus or negative signalstatus. No wait or
+        isalive() probe is needed: isalive() can block after PTY EOF. If another
+        actor consumed the status (ECHILD) without storing it, it can never be
+        known and the session stays tracked.
 
         The reader thread (`_reader_loop`) sets `session.exited = True` only in its `finally` block, which
         runs when `stdout.read()` returns EOF. If the direct `Popen` child has exited but a descendant
@@ -1989,6 +1993,20 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             return
         proc = getattr(session, "process", None)
         if proc is None:
+            if _IS_WINDOWS:
+                return
+            with session._lock:
+                pty = session._pty
+                reader = session._reader_thread
+                if session.exited or pty is None or (reader is not None and reader.is_alive()):
+                    return
+                rc = getattr(pty, "exitstatus", None)
+                if rc is None:
+                    sig = getattr(pty, "signalstatus", None)
+                    if sig is not None:
+                        rc = -sig
+            if rc is not None:
+                self._finish_exited(session, rc)
             return
         try:
             rc = proc.poll()
