@@ -1438,14 +1438,23 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         A process may close stdout long before it exits.  The reader owns a dedicated
         daemon thread, so it must keep waiting rather than publish a false completion
         and discard the only ``Popen`` handle that can reap the child.
+        Failed or status-less waits get at most three attempts with backoff;
+        ECHILD hands off immediately. An unresolved session and its handles stay
+        tracked for upstream reconciliation, without publishing completion.
         """
         with suppress(Exception):
             tail = decoder.decode(b"", final=True)
             if tail:
                 append(tail)
-        while not session.exited:
+        for attempt in range(3):
+            if session.exited:
+                return
+            unreapable = False
             try:
                 wait()
+            except ChildProcessError as e:
+                unreapable = True
+                logger.debug("%s child no longer reapable for %s: %s", label, session.id, e)
             except Exception as e:
                 # isalive() can reap a PTY before wait(); retain a known status.
                 logger.debug("%s wait failed for %s: %s", label, session.id, e)
@@ -1453,9 +1462,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if code is not None:
                 self._finish_exited(session, code)
                 return
+            if unreapable or attempt == 2:
+                logger.warning("%s reap unresolved for %s; leaving process tracked", label, session.id)
+                return
             # EOF and a successful wait without a status are not completion.
-            # Keep the autonomous reader alive; no client poll is required.
-            time.sleep(0.2)
+            time.sleep(0.2 * (2 ** attempt))
 
     _log_delta_command = staticmethod(log_delta_command)
 

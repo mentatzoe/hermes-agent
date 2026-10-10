@@ -1,5 +1,6 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+import io
 import json
 import os
 import shlex
@@ -317,7 +318,51 @@ def test_reader_waits_past_early_stdout_eof_before_publishing_completion(registr
     assert session.exit_code == 0
 
 
-def test_failed_reader_wait_does_not_publish_false_completion(registry, monkeypatch):
+@pytest.mark.parametrize("reader_kind", ["pipe", "pty"])
+@pytest.mark.parametrize("wait_failure", ["echild", "oserror", "unknown_status"])
+def test_permanent_reap_failure_releases_reader_without_another_actor(registry, reader_kind, wait_failure):
+    """An unreapable child stays tracked, but cannot leak a polling reader."""
+    session = _make_session(sid="proc_unreapable")
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    handle = MagicMock(returncode=None, exitstatus=None, signalstatus=None)
+    if wait_failure == "echild":
+        handle.wait.side_effect = ChildProcessError("No child processes")
+    elif wait_failure == "oserror":
+        handle.wait.side_effect = OSError("unrecoverable wait handle")
+    else:
+        handle.wait.return_value = None
+    if reader_kind == "pipe":
+        handle.stdout = io.StringIO("")
+        session.process = handle
+        reader = registry._reader_loop
+    else:
+        handle.isalive.return_value = False
+        session._pty = handle
+        reader = registry._pty_reader_loop
+    thread = threading.Thread(target=reader, args=(session,), daemon=True)
+    session._reader_thread = thread
+    thread.start()
+    try:
+        thread.join(2)
+        assert not thread.is_alive(), "permanent reap failure leaked the reader"
+        if wait_failure == "echild":
+            assert handle.wait.call_count == 1
+        else:
+            assert 1 < handle.wait.call_count <= 3
+        assert not session.exited
+        assert session.exit_code is None
+        assert not session._completion_event.is_set()
+        assert registry._running[session.id] is session
+        assert registry.completion_queue.empty()
+        assert (session.process if reader_kind == "pipe" else session._pty) is handle
+    finally:
+        # Cleanup only after the no-other-actor assertions, including on red runs.
+        session.exited = True
+        thread.join(2)
+
+
+def test_failed_reader_wait_yields_to_concurrent_kill(registry, monkeypatch):
     """A failed reap stays tracked and retries until a concurrent kill settles it."""
     session = _make_session(sid="proc_wait_failed")
     moved = []
@@ -345,7 +390,8 @@ def test_failed_reader_wait_does_not_publish_false_completion(registry, monkeypa
     assert moved == []
 
 
-def test_failed_reader_wait_still_records_known_exit_status(registry, monkeypatch):
+@pytest.mark.parametrize("wait_error", [OSError("wait failed"), ChildProcessError("No child processes")])
+def test_failed_reader_wait_still_records_known_exit_status(registry, monkeypatch, wait_error):
     """A PTY child reaped by isalive() has its status; a raising wait must not lose it."""
     session = _make_session(sid="proc_pty_wait_failed")
     moved = []
@@ -356,7 +402,7 @@ def test_failed_reader_wait_still_records_known_exit_status(registry, monkeypatc
         MagicMock(decode=MagicMock(return_value="")),
         lambda _text: None,
         "PTY",
-        MagicMock(side_effect=OSError("waitpid ECHILD")),
+        MagicMock(side_effect=wait_error),
         lambda: 9,
     )
 
