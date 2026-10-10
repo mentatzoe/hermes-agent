@@ -31,6 +31,64 @@ _OFF_SET, _ON_SET = "_auto_tts_disabled_chats", "_auto_tts_enabled_chats"
 _VOICE_MODES = {"off", "voice_only", "all"}
 
 
+_OWN_VOICE_SCAN_ROWS = 10_000
+_OWN_VOICE_QUERY_BUDGET_S = 10.0
+
+
+def _voice_words(text: str) -> set:
+    text = re.sub(r"\[[A-Z][a-z]+ \d\.\d\d(?:, [A-Z][a-z]+ \d\.\d\d)*\]\s*", "", text or "")
+    return set(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split())
+
+
+def _is_agents_own_voice(path: str, transcript: str) -> bool:
+    """Conservatively match a forwarded recording against recent TTS text.
+
+    Blocking SQLite work: callers must offload it. A row-id window prevents a
+    rare-TTS history from scanning a multi-GB store; the progress handler caps
+    cold-cache query time. Short or uncertain matches keep normal attribution.
+    """
+    import sqlite3
+    from hermes_constants import get_hermes_home
+
+    try:
+        words = _voice_words(transcript)
+        if len(words) < 12:
+            return False
+        db = sqlite3.connect(f"file:{get_hermes_home()}/state.db?mode=ro", uri=True, timeout=5)
+        try:
+            deadline = time.monotonic() + _OWN_VOICE_QUERY_BUDGET_S
+            db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
+            rows = db.execute(
+                "select tool_calls from messages "
+                "where id > (select coalesce(max(id), 0) from messages) - ? "
+                "and role='assistant' and tool_calls is not null "
+                "and timestamp > strftime('%s','now') - 60*60*24*30 "
+                "and (tool_calls like '%synthesize%' or tool_calls like '%text_to_speech%') "
+                "order by id desc limit 400", (_OWN_VOICE_SCAN_ROWS,),
+            ).fetchall()
+        finally:
+            db.close()
+        for (tc,) in rows:
+            try:
+                calls = json.loads(tc)
+            except Exception:
+                continue
+            for call in calls or []:
+                fn = (call or {}).get("function", {}) if isinstance(call, dict) else {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    continue
+                said = _voice_words(args.get("text") or "") if isinstance(args, dict) else set()
+                if len(said) >= 12:
+                    overlap = len(words & said)
+                    if overlap / len(words) >= 0.85 and overlap / len(said) >= 0.6:
+                        return True
+    except Exception as exc:
+        logger.debug("own-voice check skipped: %s", exc)
+    return False
+
+
 class GatewayVoiceMixin:
     def _voice_key(self, platform: Platform, chat_id: str, profile: Optional[str] = None) -> str:
         """``<profile>:<platform>:<chat_id>`` under multiplexing (else two bots in one channel

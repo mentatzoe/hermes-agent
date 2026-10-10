@@ -292,18 +292,20 @@ def _jobs_lock():
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
     degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
+    scheduler. Yields the actual cross-process protection, including for nested callers,
+    so ownership-sensitive writes can refuse the degraded mode."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
         _jobs_lock_state.depth = depth + 1
         try:
-            yield
+            yield getattr(_jobs_lock_state, "cross_process_locked", False)
         finally:
             _jobs_lock_state.depth -= 1
         return
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_locked = False
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
@@ -315,7 +317,9 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                _jobs_lock_state.cross_process_locked = acquired is True
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -330,12 +334,13 @@ def _jobs_lock():
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
             try:
-                yield
+                yield _jobs_lock_state.cross_process_locked
             finally:
                 if lock_fd is not None:
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process_locked = False
             _jobs_lock_state.load_stamp = None
 
 
@@ -2816,7 +2821,11 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
-    return _with_job(job_id, apply, False)
+    with _jobs_lock() as cross_process_locked:
+        if not cross_process_locked:
+            # Store uncertainty is transient, not definitive ownership loss.
+            raise TimeoutError("Cannot safely renew fire claim without the jobs lock")
+        return _with_job(job_id, apply, False)
 
 
 # Completed one-shots are retained in jobs.json (final status stays inspectable) and pruned by

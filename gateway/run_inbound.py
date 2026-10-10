@@ -1940,6 +1940,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             )
         # Plain quoted line: a "The user sent a voice message..." wrapper read as a meta-instruction
         # and made the LLM comment on voice mode instead.
+        from gateway.run_voice import _is_agents_own_voice
+        if await asyncio.to_thread(_is_agents_own_voice, path, transcript):
+            return transcript, (
+                "[This recording is Aleph's own earlier voice reply, sent back — "
+                f'the words are Aleph\'s, not the sender\'s.] "{transcript}"'
+            )
         return transcript, f'"{transcript}"'
 
     async def _enrich_message_with_transcription(

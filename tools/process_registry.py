@@ -578,6 +578,7 @@ class ProcessSession:
     # Session-db id of the spawning conversation; lets the gateway drop completions whose
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
+    delegated_child: Optional[bool] = None       # execution provenance; None for legacy checkpoints
     notify_on_complete: bool = False            # Queue agent notification on exit
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
     watch_patterns: List[str] = field(default_factory=list)
@@ -652,7 +653,7 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+    "parent_session_id", "delegated_child", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
@@ -915,6 +916,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id,
             "command": session.command,
+            "parent_session_id": session.parent_session_id,
+            "delegated_child": session.delegated_child,
             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
         }
 
@@ -1106,11 +1109,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
         from gateway.session_context import get_session_env
+        from agent.delegation_context import is_delegated_child_context
 
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
+            delegated_child=is_delegated_child_context(),
             wsl_chain=_is_wsl_launcher_command(command),
             started_at=time.time(), **extra)
 
@@ -1420,9 +1425,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
-            self._finish_reader(
-                session, decoder, _append_chunk, "Process",
-                session.process.wait, lambda: session.process.returncode)
+            proc = session.process
+            if proc is not None:
+                self._finish_reader(
+                    session, decoder, _append_chunk, "Process",
+                    proc.wait, lambda: proc.returncode)
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
@@ -1436,16 +1443,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             tail = decoder.decode(b"", final=True)
             if tail:
                 append(tail)
-        try:
-            wait()
-        except Exception as e:
-            # A PTY child reaped by isalive() already has its exitstatus; only an
-            # unknown status must stay tracked for later reconciliation.
-            if exit_code() is None:
-                logger.warning("%s wait failed; leaving process tracked: %s", label, e)
+        while not session.exited:
+            try:
+                wait()
+            except Exception as e:
+                # isalive() can reap a PTY before wait(); retain a known status.
+                logger.debug("%s wait failed for %s: %s", label, session.id, e)
+            code = exit_code()
+            if code is not None:
+                self._finish_exited(session, code)
                 return
-            logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
+            # EOF and a successful wait without a status are not completion.
+            # Keep the autonomous reader alive; no client poll is required.
+            time.sleep(0.2)
 
     _log_delta_command = staticmethod(log_delta_command)
 
@@ -1559,9 +1569,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             tail = decoder.decode(responder.flush())
             if tail:
                 ingest(tail)
-        self._finish_reader(
-            session, decoder, ingest, "PTY",
-            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
+        def exit_code():
+            code = getattr(pty, "exitstatus", None)
+            if code is None:
+                sig = getattr(pty, "signalstatus", None)
+                if sig is not None:
+                    code = -sig
+            return code
+
+        self._finish_reader(session, decoder, ingest, "PTY", pty.wait, exit_code)
 
     def _ingest_output(self, session: ProcessSession, text: str, *, unless_exited: bool = False) -> None:
         """Buffer a freshly-read chunk, then scan watch patterns and stream it live.
@@ -1625,6 +1641,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id,
                 "command": session.command,
+                "parent_session_id": session.parent_session_id,
+                "delegated_child": session.delegated_child,
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
                 **self._exit_fields(session),
                 # A consumer that relays the output (a bot DM's reply) must know it is not whole.
@@ -2500,8 +2518,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if session is None or session.exited or session.owner_task_id != from_owner:
                 return None
             session.owner_task_id = to_owner
+            # v0.21.6 supports an explicit child-to-parent process handoff.
+            # Its future notices belong to the new owner, not the spawn context.
+            session.delegated_child = to_owner.startswith("sa-")
             session.task_id = to_task_id
             session.session_key = to_session_key
+            session.parent_session_id = to_session_key  # caller passes parent.session_id
             session.handoff_note = note
             return session
 

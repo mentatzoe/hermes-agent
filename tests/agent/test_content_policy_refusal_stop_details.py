@@ -17,6 +17,8 @@ def _agent():
     agent._has_pending_fallback.return_value = False
     agent._try_activate_fallback.return_value = False
     agent._extract_reasoning.return_value = ""
+    from agent.agent_runtime_helpers import strip_think_blocks
+    agent._strip_think_blocks.side_effect = lambda text: strip_think_blocks(agent, text)
     return agent
 
 

@@ -1046,9 +1046,19 @@ def nonretryable_client_error_result(
     # Summarize once: Cloudflare/proxy HTML pages and raw provider bodies must be
     # collapsed here or they leak verbatim via the ``error`` field.
     _nonretryable_summary = agent._summarize_api_error(api_error)
+    if classified.reason == FailoverReason.content_policy_blocked:
+        from agent.turn_truncation import visible_refusal_text
+        # Strip before summarizing: the summarizer can remove an unclosed tag
+        # and thereby make its private contents look like ordinary visible text.
+        _visible_error = visible_refusal_text(agent, str(api_error))
+        _nonretryable_summary = (
+            visible_refusal_text(agent, agent._summarize_api_error(Exception(_visible_error)))
+            if _visible_error else ""
+        ) or "the model returned no explanation"
     _plabel = provider_label_for(provider)
     _label = _NONRETRYABLE_LABELS.get(classified.reason, f"{_plabel} rejected the request and retrying won't help")
-    agent._emit_diagnostic_status(f"❌ {_label}: {_nonretryable_summary}")
+    if classified.reason != FailoverReason.content_policy_blocked:
+        agent._emit_diagnostic_status(f"❌ {_label}: {_nonretryable_summary}")
     # The endpoint/status trace is developer detail: verbose only (the log has it always).
     if getattr(agent, "verbose_logging", False):
         _vlines(

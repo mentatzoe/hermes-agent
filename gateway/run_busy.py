@@ -629,6 +629,12 @@ class GatewayBusySessionMixin:
         )
         if effective_mode == "steer":
             steer_text = await self._prepare_busy_steer_text(event)
+            # Live-call transcripts are already text, but retain VOICE for reply
+            # playback and their original speaker. No attachment needs transcription.
+            call_transcript = (
+                event.message_type == MessageType.VOICE
+                and not event.media_urls and not event.media_types
+            )
             # Steerable: plain text, OR every attachment is voice media folded into steer_text.
             # A follow-up qualifies for steering when it is plain text, OR when every attachment is
             # STT-eligible voice media whose transcript was just folded into steer_text — otherwise a voice
@@ -637,7 +643,7 @@ class GatewayBusySessionMixin:
             _steer_all_voice = bool(_steer_media_urls) and (
                 len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
             )
-            if steer_text and (plain_text or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
+            if steer_text and (plain_text or call_transcript or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
                 steered = self._try_agent_verb(
                     running_agent, "steer", steer_text, session_key, event=event
                 )

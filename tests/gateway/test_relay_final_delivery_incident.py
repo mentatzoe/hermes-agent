@@ -119,7 +119,7 @@ def _classify_runner(row):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("end_reason", ["idle_timeout", "timeout", None, ""])
+@pytest.mark.parametrize("end_reason", ["idle_timeout", "timeout", None, "", "session_switch"])
 async def test_idle_ended_parent_classifies_deliver(end_reason):
     """Relay-plane norm: session ended on idle, chat still routable ->
     the completion must be deliverable, not terminally dropped."""
@@ -135,7 +135,7 @@ async def test_idle_ended_parent_classifies_deliver(end_reason):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("end_reason", ["session_reset", "user_exit", "session_switch"])
+@pytest.mark.parametrize("end_reason", ["session_reset", "user_exit", "new_session"])
 async def test_user_boundary_still_terminal(end_reason):
     """Explicit user boundaries remain terminal — /new means the user
     closed the thread of work on purpose."""

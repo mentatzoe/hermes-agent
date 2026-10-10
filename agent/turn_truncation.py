@@ -707,6 +707,21 @@ class RefusalVerdict:
     active_system_prompt: Any
 
 
+def visible_refusal_text(agent: Any, text: Any) -> str:
+    """Fail closed when provider text cannot be separated from think blocks."""
+    if not isinstance(text, str):
+        return ""
+    try:
+        tags = r"think|thinking|reasoning|REASONING_SCRATCHPAD"
+        text = re.sub(rf"<({tags})\b[^>]*>.*?</\1\s*>", "", text, flags=re.I | re.S)
+        # The general sanitizer preserves inline unterminated prose; refusal
+        # notices deliberately fail closed instead, before orphan tags vanish.
+        text = re.sub(rf"<(?:{tags})\b[^>]*>.*$", "", text, flags=re.I | re.S)
+        return agent._strip_think_blocks(text).strip()
+    except Exception:
+        return ""
+
+
 def handle_content_policy_refusal(
     agent: Any, response: Any, _retry: TurnRetryState, *, thinking_spinner: Any,
     messages: List[Dict[str, Any]], api_messages: Any, api_kwargs: Any, active_system_prompt: Any,
@@ -715,13 +730,14 @@ def handle_content_policy_refusal(
 ) -> RefusalVerdict:
     """HTTP-200 refusal (``finish_reason`` ``content_filter`` / ``guardrail_intervened``).
     Deterministic for the unchanged prompt — never retried: one configured-fallback try,
-    else surface the refusal (explanation may live only in the reasoning channel)."""
+    else surface only the visible refusal, never its private reasoning."""
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
 
     _refusal_result = normalize_response_for_agent(agent, response)
-    _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
-    if not _refusal_text:
-        _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
+    _refusal_text = visible_refusal_text(agent, getattr(_refusal_result, "content", None))
+    _reasoning = agent._extract_reasoning(_refusal_result)
+    if isinstance(_reasoning, str) and _reasoning.strip():
+        logger.info("%sRefusal reasoning (local only): %s", agent.log_prefix, _reasoning[:500])
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),
     # not in a content block — without it a classifier halt reads as "(no text)" (#113689).
     _stop_details = (getattr(_refusal_result, "provider_data", None) or {}).get("stop_details")
@@ -729,6 +745,7 @@ def handle_content_policy_refusal(
         _refusal_text = str(_stop_details.get("explanation") or "").strip() or (
             f"provider refusal category: {_stop_details['category']}" if _stop_details.get("category") else ""
         )
+        _refusal_text = visible_refusal_text(agent, _refusal_text)
 
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
@@ -757,7 +774,6 @@ def handle_content_policy_refusal(
         getattr(response, "stop_reason", None) or "n/a", _stop_details or "n/a",
         _refusal_log or "(no text)",
     )
-    agent._emit_diagnostic_status("⚠️ The model declined to respond to this request (safety refusal).")
     _refusal_response = "⚠️ " + content_policy_copy(
         label=provider_label_for(agent.provider),
         summary=_refusal_text or "the model returned no explanation",
