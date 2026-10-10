@@ -318,21 +318,30 @@ def test_reader_waits_past_early_stdout_eof_before_publishing_completion(registr
 
 
 def test_failed_reader_wait_does_not_publish_false_completion(registry, monkeypatch):
-    """A failed reap must leave the session running for later reconciliation."""
+    """A failed reap stays tracked and retries until a concurrent kill settles it."""
     session = _make_session(sid="proc_wait_failed")
     moved = []
     monkeypatch.setattr(registry, "_move_to_finished", lambda _s: moved.append(_s.id))
+    attempts = []
+
+    def wait():
+        assert not session.exited
+        assert moved == []
+        attempts.append(True)
+        if len(attempts) == 2:
+            session.exited = True  # A concurrent kill owns finalization.
+        raise OSError("wait failed")
 
     registry._finish_reader(
         session,
         MagicMock(decode=MagicMock(return_value="")),
         lambda _text: None,
         "Process",
-        MagicMock(side_effect=OSError("wait failed")),
+        wait,
         lambda: None,
     )
 
-    assert session.exited is False
+    assert len(attempts) == 2
     assert moved == []
 
 

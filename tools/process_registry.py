@@ -1420,9 +1420,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
-            self._finish_reader(
-                session, decoder, _append_chunk, "Process",
-                session.process.wait, lambda: session.process.returncode)
+            proc = session.process
+            if proc is not None:
+                self._finish_reader(
+                    session, decoder, _append_chunk, "Process",
+                    proc.wait, lambda: proc.returncode)
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
@@ -1436,16 +1438,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             tail = decoder.decode(b"", final=True)
             if tail:
                 append(tail)
-        try:
-            wait()
-        except Exception as e:
-            # A PTY child reaped by isalive() already has its exitstatus; only an
-            # unknown status must stay tracked for later reconciliation.
-            if exit_code() is None:
-                logger.warning("%s wait failed; leaving process tracked: %s", label, e)
+        while not session.exited:
+            try:
+                wait()
+            except Exception as e:
+                # isalive() can reap a PTY before wait(); retain a known status.
+                logger.debug("%s wait failed for %s: %s", label, session.id, e)
+            code = exit_code()
+            if code is not None:
+                self._finish_exited(session, code)
                 return
-            logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
+            # EOF and a successful wait without a status are not completion.
+            # Keep the autonomous reader alive; no client poll is required.
+            time.sleep(0.2)
 
     _log_delta_command = staticmethod(log_delta_command)
 
@@ -1559,9 +1564,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             tail = decoder.decode(responder.flush())
             if tail:
                 ingest(tail)
-        self._finish_reader(
-            session, decoder, ingest, "PTY",
-            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
+        def exit_code():
+            code = getattr(pty, "exitstatus", None)
+            if code is None:
+                sig = getattr(pty, "signalstatus", None)
+                if sig is not None:
+                    code = -sig
+            return code
+
+        self._finish_reader(session, decoder, ingest, "PTY", pty.wait, exit_code)
 
     def _ingest_output(self, session: ProcessSession, text: str, *, unless_exited: bool = False) -> None:
         """Buffer a freshly-read chunk, then scan watch patterns and stream it live.
