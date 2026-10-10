@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -234,6 +235,68 @@ def _is_compacted_message(db, message_id) -> bool:
     return _is_compacted_state(_get_message_storage_state(db, message_id))
 
 
+# One search may read a named profile rather than the caller's own profile.
+# Never freeze names at import time or share them between concurrent searches.
+_SPEAKER_NAMES: ContextVar[Optional[Dict[str, str]]] = ContextVar("recall_speaker_names", default=None)
+
+
+def _load_speaker_names(profile: Optional[str] = None) -> Dict[str, str]:
+    """Read companion names in the selected profile; malformed settings add no labels."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = None
+    try:
+        if profile and str(profile).strip():
+            from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+            token = set_hermes_home_override(get_profile_dir(normalize_profile_name(profile)))
+        from hermes_cli.config import load_config
+        comp = ((load_config() or {}).get("compression") or {}).get("companion") or {}
+        return {role: str(comp[key]) for role, key in (("user", "user_name"), ("assistant", "agent_name"))
+                if comp.get(key)}
+    except Exception:
+        return {}
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _strip_embedded_compaction(content: Any) -> Any:
+    """Keep the human text before an appended compaction handoff."""
+    if not isinstance(content, str) or not content:
+        return content
+    # A marker mentioned inline, blockquoted, or fenced is conversation, not a handoff.
+    offset = 0
+    fence = ""
+    for line in content.splitlines(keepends=True):
+        stripped = line.lstrip()
+        match = re.match(r"(`{3,}|~{3,})", stripped)
+        if match:
+            marker = match.group(1)
+            if not fence:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = ""
+        elif not fence and stripped.startswith(_COMPACTION_PREFIXES):
+            cut = offset + len(line) - len(stripped)
+            return content[:cut].rstrip() + f"\n[compaction handoff omitted: {len(content) - cut} chars]"
+        offset += len(line)
+    return content
+
+
+def _slim_tool_calls(tool_calls: Any, max_content_len: Optional[int]) -> Any:
+    """Bound string arguments in bounded recall views without changing stored rows."""
+    if not max_content_len or not isinstance(tool_calls, list):
+        return tool_calls
+    limit = max(200, max_content_len // 2)
+    slim = []
+    for call in tool_calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        args = fn.get("arguments") if isinstance(fn, dict) else None
+        if isinstance(args, str) and len(args) > limit:
+            call = {**call, "function": {**fn, "arguments": args[:limit] + f"… [{len(args) - limit} more chars]"}}
+        slim.append(call)
+    return slim
+
+
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None,
                    max_content_len: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row; keeps ``content`` even when empty (tool-call-only turns)."""
@@ -241,8 +304,19 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None,
     if isinstance(content, str) and "\x1b" in content:  # archived terminal output carries ANSI
         from tools.ansi_strip import strip_ansi
         content = strip_ansi(content)
+    if isinstance(content, str) and _is_compaction_summary(content):
+        content = f"[compaction handoff omitted: {len(content)} chars]"
+    else:
+        content = _strip_embedded_compaction(content)
     entry = {"id": m.get("id"), "role": m.get("role"), "content": content, "timestamp": m.get("timestamp")}
+    names = _SPEAKER_NAMES.get()
+    if names is None:
+        names = _load_speaker_names()
+    if speaker := names.get(m.get("role") or ""):
+        entry["speaker"] = speaker
     entry.update({k: m.get(k) for k in ("tool_name", "tool_calls", "tool_call_id") if m.get(k)})
+    if m.get("tool_calls"):
+        entry["tool_calls"] = _slim_tool_calls(m["tool_calls"], max_content_len)
     if anchor_id is not None and m.get("id") == anchor_id:
         entry["anchor"] = True
     if max_content_len and content and len(content) > max_content_len:
@@ -596,6 +670,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
     if profile_db is not None:
         db, current_session_id = profile_db, None
         owned_dbs.append(profile_db)
+    _SPEAKER_NAMES.set(_load_speaker_names(profile))
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:
             return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
@@ -630,11 +705,13 @@ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
+    names_token = _SPEAKER_NAMES.set(None)
     try:
         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail, owned_dbs,
                          after=after, before=before, exclude_session_ids=exclude_session_ids)
     finally:
+        _SPEAKER_NAMES.reset(names_token)
         for owned_db in reversed(owned_dbs):
             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
 

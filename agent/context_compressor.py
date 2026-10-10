@@ -984,6 +984,7 @@ def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
     """Compacted region's REAL user messages verbatim, newest-first under a char budget (straddler truncated); "" if none."""
     collected: list[str] = []
     used = 0
+    seen: set = set()
     for msg in reversed(turns):
         if msg.get("role") != "user":
             continue
@@ -994,6 +995,11 @@ def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
         if remaining <= 0:
             break
         text = content.strip()
+        # A retained tail may be archived again; quote each platform message once.
+        key = (msg.get("platform_message_id") or msg.get("timestamp") or "", text)
+        if key in seen:
+            continue
+        seen.add(key)
         if len(text) > remaining and remaining <= ELISION_MARKER_MAX_LEN:
             break  # no room for marker + content: a marker-only quote would overshoot the budget
         text = elide(text, min(_LEAN_USER_MESSAGE_MAX_CHARS, remaining))
@@ -3610,7 +3616,11 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
                 continue
             if role == "assistant" and msg.get("tool_calls", []):
                 content += "\n[Tool calls:\n" + "\n".join(map(self._render_tool_call_for_summary, msg["tool_calls"])) + "\n]"
-            parts.append(f"[{role.upper()}]: {content}")
+            label = role
+            companion = getattr(self, "_companion", None)
+            if companion is not None and companion.enabled:
+                label = {"user": companion.user_name, "assistant": companion.agent_name}.get(role) or role
+            parts.append(f"[{label.upper()}]: {content}")
         return parts
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
@@ -4090,6 +4100,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             focus_topic = _redact_compaction_text(focus_topic)
         if self._previous_summary:
             self._previous_summary = _redact_compaction_text(self._previous_summary)
+            from agent.companion_compaction import strip_identity_header
+            self._previous_summary = strip_identity_header(self._previous_summary)
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         # Ghost-skill defense: LLMs paraphrase [SKILL_PRUNED] markers away; collect the names
         # deterministically BEFORE the call (from the turn LIST, not the bounded text), re-inject after.
@@ -4129,6 +4141,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
             _raise_if_stale_attempt(self)
             self._previous_summary = summary
+            summary = self._companion_prepend_identity(summary, memory_context)
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
             self._last_summary_error = None
@@ -4138,6 +4151,24 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             return self._with_summary_prefix(summary)
         except Exception as e:
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
+
+    def _companion_prepend_identity(self, summary: str, memory_context: str = "") -> str:
+        """Companion mode: prepend the deterministic, re-sourced identity header."""
+        companion = getattr(self, "_companion", None)
+        if companion is None or not getattr(companion, "enabled", False):
+            return summary
+        try:
+            from agent.companion_compaction import IDENTITY_HEADING
+
+            if IDENTITY_HEADING in summary:
+                return summary
+            summary = companion.name_people(summary)
+            companion.session_id = getattr(self, "_session_id", "") or ""
+            header = _redact_compaction_text(companion.identity_header(memory_context))
+            return header + summary
+        except Exception as exc:  # never block compaction on the header
+            logger.warning("companion identity header failed (%s)", exc)
+            return summary
 
     def _build_summary_prompt(
         self, content_to_summarize: str, summary_budget: int, focus_topic: Optional[str],
@@ -4160,6 +4191,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # Lean mode folds the session log into this SAME single request (one aux call).
         _session_log_section = _LEAN_SESSION_LOG_SECTION if getattr(self, "tail_mode", "lean") == "lean" else ""
         _template_sections = self._summary_template_sections(_section, summary_budget, _session_log_section)
+        companion = getattr(self, "_companion", None)
+        if companion is not None and companion.enabled:
+            try:
+                from agent.companion_compaction import session_origin
+                lane = companion.lane_note(session_origin(self._session_db, self._session_id))
+                _template_sections = companion.template_sections(
+                    HISTORICAL_TASK_HEADING, _section["historical_task"],
+                    _PRUNED_SKILLS_SECTION_HEADING, lane, _today_for_prompt(),
+                )
+            except Exception as exc:
+                logger.warning("companion compaction template failed; using stock template (%s)", exc)
         if self._previous_summary:
             # Iterative update. Bound the previous summary too: a rehydrated handoff can be huge.
             _bounded_previous_summary = self._bound_summary_input(self._previous_summary)
