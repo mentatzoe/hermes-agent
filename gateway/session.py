@@ -141,6 +141,8 @@ class SessionSource:
         if scope:
             d["scope_id"] = d["guild_id"] = scope
         _optional(self._OPTIONAL_POST_SCOPE)
+        if self.is_bot:
+            d["is_bot"] = True
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         _optional(self._OPTIONAL_TAIL)
@@ -157,6 +159,7 @@ class SessionSource:
             platform=Platform(data["platform"]), chat_id=str(data["chat_id"]),
             chat_type=data.get("chat_type", "dm"),
             scope_id=data.get("scope_id", data.get("guild_id")),
+            is_bot=data.get("is_bot") is True,
             auto_thread_created=bool(data.get("auto_thread_created", False)), **plain,
         )
 
@@ -371,6 +374,21 @@ _PLATFORM_NOTES = {
     Platform.DISCORD: _discord_platform_notes,
     **{p: (lambda ctx, note=note: ["", note]) for p, note in _STATIC_PLATFORM_NOTES.items()},
 }
+
+
+def format_sender_label(source: Any) -> Optional[str]:
+    """Render a bracket-safe speaker label; actor kind comes from the transport."""
+    name = getattr(source, "user_name", None)
+    if not name:
+        return None
+    safe = neutralize_untrusted_inline_text(name).replace("[", "(").replace("]", ")")
+    if not safe:
+        return None
+    if getattr(source, "platform", None) == Platform.SLACK and source.user_id:
+        safe = f"{safe} | Slack user <@{source.user_id}>"
+    if getattr(source, "is_bot", False) is True:
+        safe = f"{safe} [bot]"
+    return f"[{safe}]"
 
 
 def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = False) -> str:

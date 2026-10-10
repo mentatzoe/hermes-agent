@@ -107,6 +107,11 @@ class MessageEvent:
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        # Transport-attested bots are conversational peers, not operators.
+        if getattr(self.source, "is_bot", False) is True:
+            self.allow_gateway_control = False
+
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
         if self.reply_expected is not True and other.reply_expected is not False:

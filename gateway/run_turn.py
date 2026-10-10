@@ -3319,7 +3319,7 @@ class GatewayTurnMixin:
             elif not pending_text and (getattr(_peek_event, "media_urls", None) or []):
                 pending_text = _build_media_placeholder(_peek_event)
         log()
-        agent.interrupt(pending_text)
+        agent.interrupt(self._label_event_text(_peek_event, pending_text))
         _interrupt_detected.set()
         # Abort streaming TTS on barge-in.
         # See #60671.
@@ -3815,7 +3815,7 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.base import route_pending_follow_up
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3839,7 +3839,10 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                route_pending_follow_up(
+                    adapter._pending_messages, session_key, pending_event,
+                    enqueue_separate=lambda queued: self._enqueue_attributed_follow_up(session_key, queued, adapter),
+                )
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}

@@ -1800,6 +1800,40 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def message_author_key(event: Any) -> Optional[tuple]:
+    """Stable transport actor identity, including synthetic/control boundaries."""
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    sender = source.user_id_alt or source.user_id
+    if sender:
+        who = ("user", str(sender))
+    elif source.chat_type in {"dm", "private"} and source.chat_id:
+        who = ("dm", str(source.chat_id))
+    else:
+        return None
+    return (_platform_name(source.platform), *who, source.is_bot is True,
+            bool(event.internal), event.allow_gateway_control is not False)
+
+
+def same_message_author(existing: Any, event: Any) -> bool:
+    key = message_author_key(existing)
+    return key is not None and key == message_author_key(event)
+
+
+def route_pending_follow_up(
+    pending_messages: Dict[str, MessageEvent], session_key: str, event: MessageEvent,
+    *, merge_text: bool = False,
+    enqueue_separate: Optional[Callable[[MessageEvent], None]] = None,
+) -> None:
+    """Keep different actors in separate FIFO turns when a runner owns the queue."""
+    existing = pending_messages.get(session_key)
+    if existing is not None and enqueue_separate is not None and not same_message_author(existing, event):
+        enqueue_separate(event)
+        return
+    merge_pending_message_event(pending_messages, session_key, event, merge_text=merge_text)
+
+
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
@@ -3825,19 +3859,14 @@ class BasePlatformAdapter(ABC):
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
 
-        def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
-            source = getattr(candidate, "source", None)
-            if source is None:
-                return None
-            platform = _platform_name(getattr(source, "platform", None))
-            sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-            if sender:
-                return (platform, str(sender))
-            if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
-                return (platform, "dm", str(source.chat_id))
+        return same_message_author(existing, event)
+
+    def _separate_follow_up_enqueuer(self, session_key: str):
+        runner = getattr(self, "gateway_runner", None)
+        enqueue = getattr(runner, "_enqueue_attributed_follow_up", None)
+        if not inspect.ismethod(enqueue):
             return None
-        existing_sender = _identity(existing)
-        return existing_sender is not None and existing_sender == _identity(event)
+        return lambda event: enqueue(session_key, event, self)
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -3861,6 +3890,10 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                else:
+                    enqueue = self._separate_follow_up_enqueuer(session_key)
+                    if enqueue is not None:
+                        enqueue(event)
                 return
         now = time.monotonic()
         if state is None:
@@ -4172,7 +4205,8 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
+            route_pending_follow_up(self._pending_messages, session_key, event,
+                                    enqueue_separate=self._separate_follow_up_enqueuer(session_key))
             event._gateway_accepted = True
             return
         if self._is_queue_text_debounce_candidate(event):
@@ -4183,8 +4217,9 @@ class BasePlatformAdapter(ABC):
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
+            route_pending_follow_up(self._pending_messages, session_key, event,
+                                    merge_text=event.message_type == MessageType.TEXT,
+                                    enqueue_separate=self._separate_follow_up_enqueuer(session_key))
             event._gateway_accepted = True
 
     def _get_human_delay(self) -> float:

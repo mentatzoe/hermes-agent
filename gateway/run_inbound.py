@@ -584,10 +584,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
     ) -> None:
         """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
-        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.base import route_pending_follow_up
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            route_pending_follow_up(
+                adapter._pending_messages, _quick_key, event, merge_text=merge_text,
+                enqueue_separate=lambda queued: self._enqueue_attributed_follow_up(_quick_key, queued, adapter),
+            )
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -688,7 +691,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             _interrupt_text = _build_media_placeholder(event)
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
-        running_agent.interrupt(_interrupt_text)
+        running_agent.interrupt(self._label_event_text(event, _interrupt_text))
 
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -696,6 +699,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if source.is_bot is True:
+            self._queue_or_replace_pending_event(_quick_key, event)
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
@@ -1429,16 +1435,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_multi_user and source.user_name:
-            # Display names are attacker-influenceable: neutralize newlines/control chars or a
-            # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # Slack: expose the CURRENT speaker's verifiable `<@U...>` id so "mention me again" has a
-            # trusted target (display names are ambiguous). user_id comes from the envelope, not user-editable.
-            # See #17916.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
-            message_text = f"[{_safe_user_name}] {message_text}"
+        if _is_shared_multi_user and source.user_name and not event.internal:
+            from gateway.session import format_sender_label
+            label = format_sender_label(source)
+            if label:
+                message_text = f"{label} {message_text}"
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
