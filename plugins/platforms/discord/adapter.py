@@ -6365,6 +6365,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             await self.handle_message(event)
         return True
 
+    def _text_batch_key(self, event: MessageEvent) -> str:
+        """Rejoin one author's split posts, never other shared-room speakers."""
+        key = super()._text_batch_key(event)
+        author = getattr(event.source, "user_id", None)
+        return f"{key}|author:{author}" if author else key
+
     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
         """A bot handoff's continuation chunks arrive at Discord's send rate (~1/s), so a
         batch opened by a bot tag waits the split delay regardless of chunk length."""
