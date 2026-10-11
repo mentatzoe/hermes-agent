@@ -13,10 +13,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-try:
-    import discord
-except ImportError:  # the adapter does not start without discord.py
-    discord = None
+# discord is imported inside the methods that use it, never bound at module level: the adapter
+# can start without discord.py and lazy-install it mid-process (check_discord_requirements), which
+# rebinds only adapter.py's globals. A module-level ``discord = None`` here would stay None.
 
 _MAX_RECORDS = 2000
 
@@ -105,6 +104,8 @@ class DiscordThreadTitlesMixin:
 
     def _guild_channel_labels(self, channel: Any) -> tuple[str, str | None]:
         """``(chat_name, chat_topic)`` for a guild channel or thread, as a message posted there gets them."""
+        import discord
+
         if isinstance(channel, discord.Thread):
             return self._format_thread_chat_name(channel), self._get_effective_topic(channel, is_thread=True)
         name, guild = getattr(channel, "name", str(channel.id)), getattr(channel, "guild", None)
