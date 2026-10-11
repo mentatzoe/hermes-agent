@@ -1968,14 +1968,42 @@ def _consume_ephemeral_reasoning_off(agent) -> bool:
 
 
 def _reasoning_config_for_wire(agent):
-    """``agent.reasoning_config`` with the one-shot reasoning-off override applied."""
-    if _consume_ephemeral_reasoning_off(agent):
-        return {
-            **(agent.reasoning_config or {}),
-            "enabled": False,
-            "effort": "none",
-        }
-    return agent.reasoning_config
+    """``agent.reasoning_config`` with the one-shot reasoning-off override applied.
+
+    Models that reject a thinking disable (reasoning-mandatory Claude such as
+    claude-fable and claude-opus-5-5, plus the exact routes that rejected a
+    disable earlier in this process) must never receive one. On an OpenAI-compatible
+    relay the override becomes ``reasoning_effort="none"``, which CLIProxyAPI
+    translates into ``thinking: {"type": "disabled"}`` and the upstream
+    rejects with HTTP 400 — killing a turn that was only truncated.  For
+    those models the override degrades to the lowest effort instead: thinking
+    stays on (the model insists), but the budget leans toward writing the
+    answer, which is the override's whole purpose.
+    """
+    one_shot = _consume_ephemeral_reasoning_off(agent)
+    config = agent.reasoning_config
+    configured_off = isinstance(config, dict) and (
+        config.get("enabled") is False
+        or str(config.get("effort") or "").strip().lower() == "none"
+    )
+    if one_shot or configured_off:
+        from agent.anthropic_adapter import thinking_disable_is_rejected
+
+        if thinking_disable_is_rejected(
+            getattr(agent, "model", None),
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+        ):
+            # Projection only: never replace the user's stored configuration.
+            logger.info(
+                "Reasoning-off request downgraded to effort=low for %s "
+                "(this route rejects a thinking disable)",
+                getattr(agent, "model", None),
+            )
+            return {**(config or {}), "enabled": True, "effort": "low"}
+        if one_shot:
+            return {**(config or {}), "enabled": False, "effort": "none"}
+    return config
 
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -2004,6 +2032,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
             base_url=getattr(agent, "_anthropic_base_url", None),
+            provider_name=agent.provider,
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
@@ -2253,6 +2282,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
             provider_profile=_profile,
+            provider_name=agent.provider,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
             provider_preferences=_prefs or None,

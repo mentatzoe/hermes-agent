@@ -128,6 +128,85 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "status_callback" not in provider.init_kwargs
 
 
+def test_aiagent_forwards_thread_parent_channel_to_memory_provider():
+    """A Discord thread's parent channel reaches the provider (Zoe, 2026-09-30).
+
+    Honcho's excludeChats excludes a channel with all of its threads; a
+    thread has its own chat id, so the parent must travel with it.
+    """
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-thread",
+            platform="discord",
+            user_id="362335298983559169",
+            chat_id="1554661535073443841",
+            chat_type="thread",
+            thread_id="1554661535073443841",
+            parent_chat_id="1554601512842301531",
+        )
+
+    assert provider.init_kwargs["chat_id"] == "1554661535073443841"
+    assert provider.init_kwargs["thread_id"] == "1554661535073443841"
+    assert provider.init_kwargs["parent_chat_id"] == "1554601512842301531"
+
+    from plugins.memory.honcho.client import match_excluded_chat
+
+    # The provider's own decision on exactly these kwargs excludes the thread.
+    assert match_excluded_chat(
+        ["discord:1554601512842301531"],
+        platform=provider.init_kwargs["platform"],
+        chat_id=provider.init_kwargs["chat_id"],
+        thread_id=provider.init_kwargs["thread_id"],
+        parent_chat_id=provider.init_kwargs["parent_chat_id"],
+    )
+
+
+def test_aiagent_without_parent_channel_sends_none():
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-channel",
+            platform="discord",
+            chat_id="1500000000000000001",
+            chat_type="group",
+        )
+
+    assert "parent_chat_id" not in provider.init_kwargs
+
+
 class CoreShadowProvider:
     """Provider that tries to register tools shadowing built-in core tools."""
 

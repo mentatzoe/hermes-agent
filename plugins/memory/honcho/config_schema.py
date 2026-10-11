@@ -182,6 +182,20 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Message writing",
         ),
         ProviderField(
+            key="excludeChats",
+            label="Excluded chats",
+            kind=KIND_JSON,
+            description="Chats whose messages are never saved to Honcho.",
+            info=(
+                'A list of "platform:chat_id" entries, e.g. ["discord:123"]. '
+                "A channel entry also covers every thread under it. Reads, "
+                "context injection and Honcho tools stay on in excluded chats. "
+                "A host-level list replaces the root list."
+            ),
+            placeholder='["discord:123456789012345678"]',
+            group="Message writing",
+        ),
+        ProviderField(
             key="writeFrequency",
             label="Write frequency",
             kind=KIND_TEXT,

@@ -19,6 +19,20 @@ from providers import register_provider
 from providers.base import ProviderProfile
 
 
+def _disable_rejected_by(
+    model: str | None, base_url: str | None = None, provider: str = "custom",
+) -> bool:
+    """Shared verdict: does *model* answer a thinking disable with HTTP 400?"""
+    if not model:
+        return False
+    try:
+        from agent.anthropic_adapter import thinking_disable_is_rejected
+
+        return thinking_disable_is_rejected(model, provider=provider, base_url=base_url)
+    except Exception:
+        return False
+
+
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
     """True when ``base_url`` is an Ollama host, not a generic OpenAI-compat relay.
 
@@ -89,7 +103,17 @@ class CustomProfile(ProviderProfile):
         if reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
-            if _effort == "none" or _enabled is False:
+            if (_effort == "none" or _enabled is False) and _disable_rejected_by(
+                ctx.get("model"), ctx.get("base_url"), ctx.get("provider_name") or "custom"
+            ):
+                # The model behind this relay rejects a thinking disable
+                # (reasoning-mandatory Claude such as claude-opus-5-5 — an
+                # OpenAI-compatible relay like CLIProxyAPI translates
+                # reasoning_effort="none" into thinking.type="disabled" and
+                # the upstream answers HTTP 400).  Omit the field: the model
+                # keeps its default adaptive thinking, which beats a dead turn.
+                pass
+            elif _effort == "none" or _enabled is False:
                 # Ollama's /v1/chat/completions silently ignores
                 # extra_body.think (only /api/chat honours it — ollama#14820)
                 # but respects the top-level reasoning_effort field (#25758).

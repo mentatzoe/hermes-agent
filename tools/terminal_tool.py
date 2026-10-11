@@ -3449,6 +3449,7 @@ def terminal_tool(
                 # watch-pattern and completion notifications can be
                 # routed back to the correct chat/thread.
                 if background and (notify_on_complete or watch_patterns):
+                    proc_session.delegated_child = _in_delegated_child_context()
                     from gateway.session_context import (
                         async_delivery_supported as _async_ok,
                         get_session_env as _gse,

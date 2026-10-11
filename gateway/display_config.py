@@ -9,6 +9,12 @@ Resolution order (first non-None wins):
     3. ``_PLATFORM_DEFAULTS[<platform>][<key>]``  — built-in sensible default
     4. ``_GLOBAL_DEFAULTS[<key>]``              — built-in global default
 
+Per-channel overrides: ``display.channel_overrides.<platform>.<id>`` entries
+are folded into step 1 for a single message by
+``gateway.run._display_config_for_source``, which returns a per-source view of
+the config (entry merged over ``display.platforms.<platform>``).  The resolver
+itself stays source-agnostic; see ``channel_display_overrides()`` below.
+
 Exception: ``display.streaming`` is CLI-only.  Gateway streaming follows the
 top-level ``streaming`` config unless ``display.platforms.<platform>.streaming``
 sets an explicit per-platform override.
@@ -194,6 +200,11 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 # Canonical set of per-platform overrideable keys (for validation).
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
+# Keys a ``display.channel_overrides.<platform>.<id>`` entry may set.  The
+# gateway also resolves ``thinking_progress`` and ``friendly_tool_labels``
+# through resolve_display_setting even though they have no global default.
+CHANNEL_OVERRIDEABLE_KEYS = OVERRIDEABLE_KEYS | {"thinking_progress", "friendly_tool_labels"}
+
 
 def resolve_display_setting(
     user_config: dict,
@@ -258,6 +269,46 @@ def resolve_display_setting(
         return val
 
     return fallback
+
+
+def channel_display_overrides(
+    user_config: dict,
+    platform_key: str,
+    lookup_keys: "list[str] | tuple[str, ...]",
+) -> dict[str, Any]:
+    """Return the per-channel display keys that apply to one message.
+
+    Reads ``display.channel_overrides.<platform>.<id>`` for each id in
+    *lookup_keys* (most specific first: chat id, thread id, then parent
+    channel id, as ``_channel_override_lookup_keys`` in gateway/run.py
+    builds them).  A more specific entry wins per key, so a thread entry can
+    refine its parent channel's entry.  Only display settings the resolver
+    understands (``OVERRIDEABLE_KEYS`` plus ``thinking_progress``) are kept;
+    other keys in an entry (such as ``fail_open``) and ``None`` values are
+    ignored.  Values are returned raw; ``resolve_display_setting`` normalises
+    them the same way as per-platform values.
+    """
+    display_cfg = user_config.get("display") if isinstance(user_config, dict) else None
+    if not isinstance(display_cfg, dict):
+        return {}
+    by_platform = display_cfg.get("channel_overrides")
+    if not isinstance(by_platform, dict):
+        return {}
+    entries = by_platform.get(platform_key)
+    if not isinstance(entries, dict) or not entries:
+        return {}
+    # Unquoted numeric ids in YAML load as ints; compare as strings.
+    entries = {str(cid): entry for cid, entry in entries.items()}
+    merged: dict[str, Any] = {}
+    for key in reversed(list(lookup_keys)):  # least specific first; later wins
+        entry = entries.get(str(key))
+        if not isinstance(entry, dict):
+            continue
+        for setting, value in entry.items():
+            if value is None or setting not in CHANNEL_OVERRIDEABLE_KEYS:
+                continue
+            merged[setting] = value
+    return merged
 
 
 # ---------------------------------------------------------------------------

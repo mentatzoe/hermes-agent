@@ -32,7 +32,8 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +85,34 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
     return final_path
 
 
+def _with_session_id(
+    serialised: dict,
+    session_key: str,
+    session_id_resolver: Optional[Callable[[str], Optional[str]]],
+) -> dict:
+    """Stamp the routing key's current session id onto a flush payload.
+
+    Queued ``MessageEvent`` objects never carry a session id, so without this
+    every flushed inbound message was unrecoverable ("no session_id in flush
+    file"); 30 room messages were lost that way on 30 Sep.
+    """
+    if serialised.get("session_id") or session_id_resolver is None or not session_key:
+        return serialised
+    try:
+        session_id = session_id_resolver(session_key)
+    except Exception:
+        session_id = None
+    if isinstance(session_id, str) and session_id:
+        serialised = dict(serialised)
+        serialised["session_id"] = session_id
+    return serialised
+
+
 def flush_pending_to_file(
     pending: Dict[str, Any],
     *,
     reason: str = "shutdown",
+    session_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
 ) -> int:
     """Serialise non-empty ``_pending_messages`` slots to disk.
 
@@ -98,6 +123,10 @@ def flush_pending_to_file(
         ``MessageEvent`` objects (adapter) or plain strings (runner).
     reason:
         Logged context (``shutdown``, ``restart``, etc.).
+    session_id_resolver:
+        Optional ``session_key -> session_id`` lookup (the runner passes
+        ``SessionStore.peek_session_id``) so recovery can file the message
+        into the right transcript.
 
     Returns
     -------
@@ -118,6 +147,7 @@ def flush_pending_to_file(
             serialised = _serialise_value(value)
             if serialised is None:
                 continue
+            serialised = _with_session_id(serialised, session_key, session_id_resolver)
             _write_payload(
                 flush_dir,
                 {
@@ -146,6 +176,7 @@ def flush_overflow_to_file(
     overflow_by_session: Dict[str, Any],
     *,
     reason: str = "shutdown",
+    session_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
 ) -> int:
     """Serialise the FIFO overflow tails (``queued_events``) to disk.
 
@@ -177,6 +208,9 @@ def flush_overflow_to_file(
                 serialised = _serialise_value(value)
                 if serialised is None:
                     continue
+                serialised = _with_session_id(
+                    serialised, session_key, session_id_resolver
+                )
                 _write_payload(
                     flush_dir,
                     {
@@ -329,6 +363,42 @@ def _serialise_value(value: Any) -> Optional[dict]:
                     result[attr] = val
                 except (TypeError, ValueError):
                     result[attr] = str(val)
+        # The gateway's real MessageEvent has none of the legacy attribute
+        # names above: its sender lives on ``user_id``/``user_name`` or
+        # ``source``, and it never carries a session id.  Record what it does
+        # have so recovery can attribute the row (30 Sep: 30 flushed room
+        # messages were unrecoverable).
+        source = getattr(value, "source", None)
+        for key, candidates in (
+            ("sender_id", (getattr(value, "user_id", None),
+                           getattr(source, "user_id", None))),
+            ("sender_name", (getattr(value, "user_name", None),
+                             getattr(source, "user_name", None))),
+            ("message_id", (getattr(value, "message_id", None),)),
+        ):
+            if key in result:
+                continue
+            for candidate in candidates:
+                if isinstance(candidate, (str, int)) and str(candidate):
+                    result[key] = str(candidate)
+                    break
+        if "sender_is_bot" not in result and isinstance(
+            getattr(source, "is_bot", None), bool
+        ):
+            result["sender_is_bot"] = source.is_bot
+        chat_type = getattr(source, "chat_type", None)
+        if "chat_type" not in result and isinstance(chat_type, str) and chat_type:
+            result["chat_type"] = chat_type
+        # Recovery renders the sender label with the live
+        # ``format_sender_label``, which needs the platform (Slack keeps the
+        # verifiable user id) and must leave gateway-internal notices
+        # unlabelled.
+        platform = getattr(source, "platform", None)
+        platform = getattr(platform, "value", platform)
+        if "platform" not in result and isinstance(platform, str) and platform:
+            result["platform"] = platform
+        if getattr(value, "internal", False) is True:
+            result["internal"] = True
         return result
     # Plain string (runner-level _pending_messages)
     if isinstance(value, str):
@@ -343,8 +413,78 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
+# Flushed inbound messages older than this are not injected into a
+# transcript: a restart hours later must not surface a stale backlog as if it
+# were current input.  Their files are kept for manual inspection.
+RECOVERY_MAX_AGE_SECONDS = 6 * 60 * 60
+
+
+def _flush_order_key(path: Path) -> tuple:
+    """Sort key giving arrival order for flush files (ts, seq, name)."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        ts = payload.get("ts")
+        seq = payload.get("seq")
+        return (
+            ts if isinstance(ts, (int, float)) else 0,
+            seq if isinstance(seq, int) else -1,
+            path.name,
+        )
+    except Exception:
+        return (0, -1, path.name)
+
+
+def _recovered_user_content(data: Dict[str, Any], text: str) -> str:
+    """Label a recovered inbound message with its sender.
+
+    Every live delivery path labels shared-session turns with
+    ``gateway.session.format_sender_label``: peer bots are marked
+    ``[Name [bot]]``, brackets in a display name are neutralised so it cannot
+    forge a second speaker, and Slack keeps the user id.  A message recovered
+    after a restart must carry the same label, or a peer bot's queued words
+    would read as the operator's.  Gateway-internal notices stay unlabelled.
+    """
+    name = data.get("sender_name")
+    if not isinstance(name, str) or not name.strip():
+        return text
+    if data.get("internal") is True:
+        return text
+    # Label only when the flush recorded a shared (non-DM) chat; unknown or
+    # legacy payloads keep their text verbatim.
+    if data.get("chat_type") not in ("group", "channel", "thread"):
+        return text
+    platform = data.get("platform")
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(platform) if isinstance(platform, str) and platform else None
+    except Exception:
+        platform = None
+    sender = SimpleNamespace(
+        user_name=name,
+        user_id=data.get("sender_id"),
+        platform=platform,
+        is_bot=data.get("sender_is_bot") is True,
+    )
+    try:
+        from gateway.session import format_sender_label
+
+        label = format_sender_label(sender)
+    except Exception:
+        # Same neutralisation as format_sender_label, minus the Slack id.
+        safe = " ".join(name.split())[:64].replace("[", "(").replace("]", ")")
+        label = f"[{safe}{' [bot]' if sender.is_bot else ''}]" if safe else None
+    if not label:
+        return text
+    prefix = f"{label} "
+    return text if text.startswith(prefix) else prefix + text
+
+
 def recover_pending_to_db(
     session_db=None,
+    *,
+    session_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
+    max_age_seconds: Optional[float] = RECOVERY_MAX_AGE_SECONDS,
 ) -> int:
     """Recover flushed pending messages into state.db via SessionDB.
 
@@ -358,6 +498,13 @@ def recover_pending_to_db(
     session_db:
         An existing ``SessionDB`` instance.  If ``None``, a new one is
         opened on the default ``state.db`` path.
+    session_id_resolver:
+        Optional ``session_key -> session_id`` lookup used when a flush file
+        predates session-id stamping (the gateway passes
+        ``SessionStore.peek_session_id``).
+    max_age_seconds:
+        Flush files older than this are skipped and preserved.  ``None`` or
+        ``0`` disables the age check.
 
     Returns
     -------
@@ -365,7 +512,9 @@ def recover_pending_to_db(
         Number of messages recovered.
     """
     flush_dir = _get_flush_dir()
-    flush_files = sorted(flush_dir.glob("*.json"))
+    # Replay in arrival order: flush files carry random names, so sort by
+    # flush time, then the per-session ``seq`` written for FIFO overflow.
+    flush_files = sorted(flush_dir.glob("*.json"), key=_flush_order_key)
     if not flush_files:
         return 0
 
@@ -428,24 +577,42 @@ def recover_pending_to_db(
                 )
                 continue
 
+            flushed_at = payload.get("ts")
+            if (
+                max_age_seconds
+                and isinstance(flushed_at, (int, float))
+                and time.time() - flushed_at > max_age_seconds
+            ):
+                logger.warning(
+                    "Not recovering pending message for %s: flushed %.1f h ago "
+                    "(limit %.1f h), too stale to add to the transcript. "
+                    "Preserved in %s",
+                    session_key,
+                    (time.time() - flushed_at) / 3600,
+                    max_age_seconds / 3600,
+                    path,
+                )
+                continue
+
             # The session_key is a gateway routing key (e.g.
             # "agent:main:telegram:supergroup:...").  We need the actual
             # session_id (e.g. "20260728_120000_abc123") to append a
-            # message row.  Try the session_id field from the serialised
-            # data first; fall back to scanning sessions for a matching
-            # session_key in the source column.
+            # message row.  Flushes stamp it at shutdown; for older files
+            # ask the caller's resolver (SessionStore.peek_session_id).
             session_id = data.get("session_id", "")
+            if not session_id and session_id_resolver is not None:
+                try:
+                    resolved = session_id_resolver(session_key)
+                except Exception:
+                    resolved = None
+                if isinstance(resolved, str) and resolved:
+                    session_id = resolved
 
             if not session_id:
-                # Try to extract from the session_key itself — gateway
-                # session keys contain the session_id as the last segment
-                # in some formats, but that's not guaranteed.  Log and
-                # skip if we can't resolve it.
                 logger.warning(
                     "Cannot recover pending message for %s: no session_id "
-                    "in flush file and session_key-to-id resolution is not "
-                    "available at this recovery stage. The message text is "
-                    "preserved in %s",
+                    "in flush file and no session is bound to that key. "
+                    "The message text is preserved in %s",
                     session_key, path,
                 )
                 continue
@@ -453,7 +620,7 @@ def recover_pending_to_db(
             session_db.append_message(
                 session_id=session_id,
                 role="user",
-                content=text,
+                content=_recovered_user_content(data, text),
                 timestamp=payload.get("ts", int(time.time())),
             )
             recovered += 1

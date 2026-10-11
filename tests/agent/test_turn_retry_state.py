@@ -27,6 +27,7 @@ EXPECTED_FIELDS = {
     "image_shrink_retry_attempted",
     "multimodal_tool_content_retry_attempted",
     "oauth_1m_beta_retry_attempted",
+    "thinking_disable_retry_attempted",
     "llama_cpp_grammar_retry_attempted",
     "primary_recovery_attempted",
     "has_retried_429",

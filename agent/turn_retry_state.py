@@ -62,6 +62,7 @@ class TurnRetryState:
     image_shrink_retry_attempted: bool = False
     multimodal_tool_content_retry_attempted: bool = False
     oauth_1m_beta_retry_attempted: bool = False
+    thinking_disable_retry_attempted: bool = False
     llama_cpp_grammar_retry_attempted: bool = False
 
     # ── Transport / rate-limit recovery ──────────────────────────────────

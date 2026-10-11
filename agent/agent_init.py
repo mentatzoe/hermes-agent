@@ -614,6 +614,7 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    parent_chat_id: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -684,6 +685,8 @@ def init_agent(
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id
+    # Parent channel when chat_id is a thread with its own id (Discord threads).
+    agent._parent_chat_id = parent_chat_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -1998,6 +2001,8 @@ def init_agent(
                         _init_kwargs["chat_type"] = agent._chat_type
                     if agent._thread_id:
                         _init_kwargs["thread_id"] = agent._thread_id
+                    if getattr(agent, "_parent_chat_id", None):
+                        _init_kwargs["parent_chat_id"] = agent._parent_chat_id
                     # Thread gateway session key for stable per-chat Honcho session isolation
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key

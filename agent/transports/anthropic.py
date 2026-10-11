@@ -57,6 +57,7 @@ class AnthropicTransport(ProviderTransport):
             preserve_dots: bool
             context_length: int | None
             base_url: str | None
+            provider_name: str | None — scopes learned model capabilities
             fast_mode: bool
             drop_context_1m_beta: bool
         """
@@ -75,6 +76,7 @@ class AnthropicTransport(ProviderTransport):
             base_url=params.get("base_url"),
             fast_mode=params.get("fast_mode", False),
             drop_context_1m_beta=params.get("drop_context_1m_beta", False),
+            provider_name=params.get("provider_name"),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

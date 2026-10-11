@@ -416,6 +416,9 @@ class ProcessSession:
     # notifications whose spawning session was closed at an explicit user
     # boundary (/new), instead of injecting them into the chat's NEW session.
     parent_session_id: str = ""
+    # Spawn-time execution provenance, not the mutable session's current role.
+    # None preserves the conservative DB/owner fallback for older checkpoints.
+    delegated_child: Optional[bool] = None
     notify_on_complete: bool = False             # Queue agent notification on exit
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
@@ -632,6 +635,8 @@ class ProcessRegistry:
                     "session_key": session.session_key,
                     "task_id": session.task_id,
                     "owner_task_id": session.owner_task_id or session.task_id,
+                    "parent_session_id": session.parent_session_id,
+                    "delegated_child": session.delegated_child,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -671,6 +676,8 @@ class ProcessRegistry:
             "session_key": session.session_key,
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id or session.task_id,
+            "parent_session_id": session.parent_session_id,
+            "delegated_child": session.delegated_child,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -698,6 +705,8 @@ class ProcessRegistry:
             "session_key": session.session_key,
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id or session.task_id,
+            "parent_session_id": session.parent_session_id,
+            "delegated_child": session.delegated_child,
             "command": session.command,
             "type": "watch_disabled",
             "suppressed": 0,
@@ -1511,16 +1520,30 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
-            try:
-                session.process.wait(timeout=5)
-            except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
-            session.exited = True
-            if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
-            self._move_to_finished(session)
+            # EOF (or a broken capture stream) is not process exit. A child
+            # may close/redirect both output descriptors and keep working for
+            # hours. Keep this autonomous watcher until wait confirms exit;
+            # a five-second reap timeout must never publish exit_code=None.
+            proc = session.process
+            if proc is not None:
+                while not session.exited:
+                    try:
+                        rc = proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        continue
+                    except Exception as e:
+                        logger.debug("Process wait failed for %s: %s", session.id, e)
+                        time.sleep(0.2)
+                        continue
+                    if rc is None:
+                        time.sleep(0.2)
+                        continue
+                    with session._lock:
+                        if session.completion_reason != "killed":
+                            session.exit_code = rc
+                            session.completion_reason = "exited"
+                        session.exited = True
+                    self._move_to_finished(session)
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
@@ -1620,16 +1643,29 @@ class ProcessRegistry:
         except Exception:
             pass
 
-        # Process exited
-        try:
-            pty.wait()
-        except Exception as e:
-            logger.debug("PTY wait timed out or failed: %s", e)
-        session.exited = True
-        if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
-        self._move_to_finished(session)
+        # As with pipes, PTY EOF/read failure does not prove the child died.
+        # Some PTY adapters return None (or raise) before status is available.
+        while not session.exited:
+            try:
+                pty.wait()
+                rc = getattr(pty, "exitstatus", None)
+                if rc is None:
+                    sig = getattr(pty, "signalstatus", None)
+                    if sig is not None:
+                        rc = -sig
+                if rc is None:
+                    time.sleep(0.2)
+                    continue
+            except Exception as e:
+                logger.debug("PTY wait failed for %s: %s", session.id, e)
+                time.sleep(0.2)
+                continue
+            with session._lock:
+                if session.completion_reason != "killed":
+                    session.exit_code = rc
+                    session.completion_reason = "exited"
+                session.exited = True
+            self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
@@ -1656,6 +1692,8 @@ class ProcessRegistry:
                 "session_key": session.session_key,
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id or session.task_id,
+                "parent_session_id": session.parent_session_id,
+                "delegated_child": session.delegated_child,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -2838,6 +2876,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "parent_session_id": s.parent_session_id,
+                            "delegated_child": s.delegated_child,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
@@ -2936,6 +2975,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 parent_session_id=entry.get("parent_session_id", ""),
+                delegated_child=entry.get("delegated_child"),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
@@ -2958,6 +2998,7 @@ class ProcessRegistry:
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
+                    "delegated_child": session.delegated_child,
                 })
 
         self._write_checkpoint(extra_entries=unresolved_scope_entries)

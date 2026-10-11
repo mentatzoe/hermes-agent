@@ -239,6 +239,39 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _PreformatDynamicMessageFilter(logging.Filter):
+    """Pre-render records whose format string embeds dynamic text.
+
+    discord.py's keep-alive thread builds its "heartbeat blocked" warning as
+    ``block_msg + "Loop thread traceback" + <formatted stack>`` and then calls
+    ``_log.warning(msg, shard_id, total)``, so the event-loop stack text
+    becomes part of the %-format string.  ``traceback.format_stack`` quotes
+    source lines, and any ``%`` in them (a log format string, a SQL LIKE
+    pattern) makes ``record.getMessage()`` raise ``TypeError`` in every
+    handler.  On 30 Sep every blocked-heartbeat warning from 10:13:57 to
+    10:15:08 became a "--- Logging error ---" dump for that reason.
+
+    Attached to the source logger, this runs once in the emitting thread,
+    before any handler or the queue listener: when formatting fails, the
+    record's text is kept verbatim with its args appended, so the loop stack
+    is still logged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args and isinstance(record.msg, str):
+            try:
+                record.msg % record.args
+            except (TypeError, ValueError, KeyError):
+                record.msg = f"{record.msg} [args={record.args!r}]"
+                record.args = None
+        return True
+
+
+# Third-party loggers whose messages interpolate dynamic text into the
+# format string itself (see _PreformatDynamicMessageFilter).
+_DYNAMIC_FORMAT_LOGGERS = ("discord.gateway",)
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -379,6 +412,15 @@ def setup_logging(
     # Suppress noisy third-party loggers.
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Keep third-party warnings that embed stack text in their format string
+    # loggable (discord.py heartbeat-blocked warnings; 30 Sep 10:13-10:15).
+    for name in _DYNAMIC_FORMAT_LOGGERS:
+        _dyn_logger = logging.getLogger(name)
+        if not any(
+            isinstance(f, _PreformatDynamicMessageFilter) for f in _dyn_logger.filters
+        ):
+            _dyn_logger.addFilter(_PreformatDynamicMessageFilter())
 
     _logging_initialized = True
     return log_dir

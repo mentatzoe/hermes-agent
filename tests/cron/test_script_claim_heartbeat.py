@@ -519,9 +519,16 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
 
 def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     """Store uncertainty cannot let a run outlive its last confirmed lease forever."""
+    from types import SimpleNamespace
+
     import cron.scheduler as scheduler
 
     calls = 0
+    # Real logging/thread scheduling can exceed the 30ms grace on the first
+    # error. Advance only the scheduler clock deterministically so this test
+    # actually exercises repeated errors, not host load (or logging latency).
+    clock = iter((0.0, 0.01, 0.02, 0.04))
+    monkeypatch.setattr(scheduler, "time", SimpleNamespace(monotonic=lambda: next(clock)))
 
     def heartbeat(*_args, **_kwargs):
         nonlocal calls

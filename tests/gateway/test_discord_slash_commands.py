@@ -396,6 +396,9 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
     assert "TestGuild" in event.source.chat_name
+    # The thread's parent channel travels with the source, as on the message
+    # path, so per-channel settings (e.g. Honcho excludeChats) cover it.
+    assert event.source.parent_chat_id == "100"
 
 
 # ------------------------------------------------------------------

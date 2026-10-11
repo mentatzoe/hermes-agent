@@ -168,6 +168,16 @@ def _add_prompt_cache_key(
         api_kwargs["prompt_cache_key"] = cache_key
 
 
+def _thinking_disable_rejected(model, provider=None, base_url=None) -> bool:
+    """Shared verdict (agent.anthropic_adapter): does *model* 400 on a disable?"""
+    try:
+        from agent.anthropic_adapter import thinking_disable_is_rejected
+
+        return thinking_disable_is_rejected(model, provider=provider, base_url=base_url)
+    except Exception:
+        return False
+
+
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
     """Return the model's wire-compatible reasoning config.
 
@@ -777,6 +787,11 @@ class ChatCompletionsTransport(ProviderTransport):
                         _enabled = False
                 if _enabled:
                     extra_body["reasoning"] = {"enabled": True, "effort": _effort}
+                elif _thinking_disable_rejected(model, provider_name, base_url):
+                    # Reasoning-mandatory model (e.g. claude-opus-5-5): a
+                    # disable answers HTTP 400, so send no reasoning field and
+                    # let the model keep its default adaptive thinking.
+                    pass
                 else:
                     extra_body["reasoning"] = {"enabled": False, "effort": "none"}
 
@@ -907,6 +922,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 qwen_session_metadata=params.get("qwen_session_metadata"),
                 model=model,
                 base_url=params.get("base_url"),
+                provider_name=params.get("provider_name") or profile.name,
                 ollama_num_ctx=params.get("ollama_num_ctx"),
                 session_id=params.get("session_id"),
             )

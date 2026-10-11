@@ -29,7 +29,9 @@ sends):
   message. Redelivered WITH a visible recovered-reply marker so the
   contract is honest at-least-once, never a silent duplicate.
 - ``failed``      — definitively rejected once; the restart is a natural
-  retry boundary. Also carries the marker.
+  retry boundary. Also carries the marker. Only rows younger than
+  ``FAILED_REDELIVERY_MAX_AGE_SECONDS`` are retried; older ones are
+  abandoned rather than replayed hours out of context.
 - ``delivered``   — nothing to do; retention prunes.
 
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
@@ -62,6 +64,12 @@ _DB_LOCK = threading.Lock()
 # only matter in the rare recovery path).
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
+# Rows the platform definitively rejected ('failed') are retried at the next
+# restart only while fresh.  The restart is a natural retry boundary for a
+# transient rejection, but a reply that failed hours ago lands out of context:
+# on 30 Sep 22 replies rejected at 06:11-06:45 (403 Missing Access while the
+# bot had lost thread access) were replayed into a live room at 10:15.
+FAILED_REDELIVERY_MAX_AGE_SECONDS = 30 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
@@ -348,7 +356,14 @@ def sweep_recoverable(
              adapter_profile) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+            if (
+                attempts >= MAX_ATTEMPTS
+                or (now - created_at) > STALE_AFTER_SECONDS
+                or (
+                    state == "failed"
+                    and (now - created_at) > FAILED_REDELIVERY_MAX_AGE_SECONDS
+                )
+            ):
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""",

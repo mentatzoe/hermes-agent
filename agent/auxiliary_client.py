@@ -9375,6 +9375,22 @@ def _build_call_kwargs(
     effective_base = base_url or (
         _current_custom_base_url() if provider == "custom" else ""
     )
+    # Auxiliary task config reaches us as extra_body.reasoning rather than
+    # the explicit reasoning_config argument. Project that off request too,
+    # before provider hooks build the wire shape. An explicit reasoning_config
+    # takes precedence; neither caller-owned dictionary may be mutated.
+    _task_reasoning = (extra_body or {}).get("reasoning")
+    if isinstance(_task_reasoning, dict) and (
+        _task_reasoning.get("enabled") is False
+        or str(_task_reasoning.get("effort") or "").strip().lower() == "none"
+    ):
+        from agent.anthropic_adapter import thinking_disable_is_rejected
+
+        if thinking_disable_is_rejected(model, provider=provider, base_url=effective_base):
+            extra_body = dict(extra_body or {})
+            extra_body.pop("reasoning")
+            if not reasoning_config:
+                reasoning_config = {**_task_reasoning, "enabled": True, "effort": "low"}
     profile_body: Dict[str, Any] = {}
     profile_reasoning_extra: Dict[str, Any] = {}
     profile_top_level: Dict[str, Any] = {}
@@ -9396,6 +9412,7 @@ def _build_call_kwargs(
                     supports_reasoning=reasoning_config is not None,
                     model=model,
                     base_url=effective_base,
+                    provider_name=provider,
                 )
             )
             profile_reasoning_extra = profile_reasoning_extra or {}
@@ -9423,8 +9440,21 @@ def _build_call_kwargs(
         and isinstance(reasoning_config, dict)
         and not profile_handles_reasoning
     ):
-        if reasoning_config.get("enabled") is False:
-            merged_extra["reasoning"] = {"enabled": False}
+        if (
+            reasoning_config.get("enabled") is False
+            or str(reasoning_config.get("effort") or "").strip().lower() == "none"
+        ):
+            try:
+                from agent.anthropic_adapter import thinking_disable_is_rejected
+
+                _aux_disable_rejected = thinking_disable_is_rejected(
+                    model, provider=provider, base_url=effective_base,
+                )
+            except Exception:
+                _aux_disable_rejected = False
+            # A reasoning-mandatory model 400s on a disable; omit instead.
+            if not _aux_disable_rejected:
+                merged_extra["reasoning"] = {"enabled": False}
         else:
             effort = reasoning_config.get("effort") or "medium"
             merged_extra["reasoning"] = {"enabled": True, "effort": effort}
@@ -9468,7 +9498,18 @@ def _build_call_kwargs(
             or _endpoint_speaks_anthropic_messages(effective_base)
             or _is_anthropic_compat_endpoint(provider_norm, effective_base)
         ):
-            kwargs["_reasoning_config"] = dict(reasoning_config)
+            native_reasoning = dict(reasoning_config)
+            if (
+                native_reasoning.get("enabled") is False
+                or str(native_reasoning.get("effort") or "").strip().lower() == "none"
+            ):
+                from agent.anthropic_adapter import thinking_disable_is_rejected
+
+                if thinking_disable_is_rejected(
+                    model, provider=provider, base_url=effective_base,
+                ):
+                    native_reasoning.update(enabled=True, effort="low")
+            kwargs["_reasoning_config"] = native_reasoning
 
     return kwargs
 

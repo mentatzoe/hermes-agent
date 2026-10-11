@@ -6480,6 +6480,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
 
+        channel_id = str(interaction.channel_id)
+        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
+        # A thread has its own chat id; carry its parent channel like the
+        # message path does, so per-channel settings cover its threads.
+        thread_parent_id = (
+            self._get_parent_channel_id(interaction.channel) if is_thread else None
+        )
+
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -6488,11 +6496,10 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            parent_chat_id=thread_parent_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
-        channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
@@ -6574,6 +6581,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
 
+        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
+
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -6582,10 +6592,9 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            parent_chat_id=_parent_id or None,
         )
 
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
@@ -8658,12 +8667,19 @@ class DiscordAdapter(BasePlatformAdapter):
         routed profile differs.
         """
         from gateway.session import build_session_key
-        return build_session_key(
+        key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        # Batching exists to re-join ONE author's client-side 2000-char splits.
+        # In shared sessions (threads, or group_sessions_per_user=false) the
+        # session key is the same for everyone, so without the author in the
+        # key, back-to-back posts from different people/bots were merged into
+        # one event under the first sender's name (Zoe, 2026-09-30).
+        author = getattr(event.source, "user_id", None)
+        return f"{key}|author:{author}" if author else key
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.

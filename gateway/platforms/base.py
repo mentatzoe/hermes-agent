@@ -2513,8 +2513,17 @@ class MessageEvent:
     # Whether this event may resolve gateway commands or pending control
     # prompts. Kept last to preserve positional construction compatibility.
     # Proactive plugin events set this to False so untrusted payload text
-    # remains conversational input.
+    # remains conversational input. Events whose source is a transport-attested
+    # bot (``source.is_bot``) are always False: see ``__post_init__``.
     allow_gateway_control: bool = True
+
+    def __post_init__(self) -> None:
+        # A bot author (another bot or a webhook) is a conversational peer,
+        # never the operator. Its text must not run slash commands, answer an
+        # approval or clarify prompt, or otherwise act with the operator's
+        # authority, whichever adapter built the event.
+        if getattr(self.source, "is_bot", False) is True:
+            self.allow_gateway_control = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2822,6 +2831,71 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     ):
         if hasattr(event, attr):
             delattr(event, attr)
+
+
+def message_author_key(event: Any) -> Optional[tuple]:
+    """Stable identity of the actor behind one inbound event, for merge decisions.
+
+    Two events may share one agent turn only when their keys are equal, so a
+    merge never re-attributes one participant's words to another, never folds
+    a peer bot into a human's message, and never folds a synthetic gateway
+    notice into either. Built from structured, transport-attested fields only.
+    Returns None when no stable sender is known (a non-DM event without a user
+    id); such events never merge.
+    """
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
+    if sender:
+        who: tuple = ("user", str(sender))
+    elif getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
+        who = ("dm", str(source.chat_id))
+    else:
+        return None
+    return (
+        _platform_name(getattr(source, "platform", None)),
+        *who,
+        getattr(source, "is_bot", False) is True,
+        bool(getattr(event, "internal", False)),
+        getattr(event, "allow_gateway_control", True) is not False,
+    )
+
+
+def same_message_author(existing: Any, event: Any) -> bool:
+    """True when both events come from the same actor (see ``message_author_key``)."""
+    key = message_author_key(existing)
+    return key is not None and key == message_author_key(event)
+
+
+def route_pending_follow_up(
+    pending_messages: Dict[str, MessageEvent],
+    session_key: str,
+    event: MessageEvent,
+    *,
+    merge_text: bool = False,
+    enqueue_separate: Optional[Callable[[MessageEvent], None]] = None,
+) -> None:
+    """Queue a busy-session follow-up without re-attributing it.
+
+    The pending slot holds a single event. A follow-up from the same actor
+    merges into it as before (photo albums, rapid split messages). A
+    follow-up from a different actor (another participant, a peer bot, a
+    synthetic gateway notice) keeps its own turn through ``enqueue_separate``
+    (the gateway's FIFO overflow), so its sender survives to the agent.
+    Without ``enqueue_separate`` the legacy merge applies unchanged.
+    """
+    existing = pending_messages.get(session_key)
+    if (
+        existing is not None
+        and enqueue_separate is not None
+        and not same_message_author(existing, event)
+    ):
+        enqueue_separate(event)
+        return
+    merge_pending_message_event(
+        pending_messages, session_key, event, merge_text=merge_text
+    )
 
 
 def merge_pending_message_event(
@@ -5864,22 +5938,24 @@ class BasePlatformAdapter(ABC):
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
+        return same_message_author(existing, event)
 
-        def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
-            source = getattr(candidate, "source", None)
-            if source is None:
-                return None
-            platform = _platform_name(getattr(source, "platform", None))
-            sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-            if sender:
-                return (platform, str(sender))
-            if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
-                return (platform, "dm", str(source.chat_id))
+    def _separate_follow_up_enqueuer(
+        self, session_key: str
+    ) -> Optional[Callable[[MessageEvent], None]]:
+        """The runner's capped FIFO for follow-ups that must keep their own turn.
+
+        Returns None (legacy merge) when no live gateway runner is attached.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        enqueue = getattr(runner, "_enqueue_attributed_follow_up", None)
+        if not inspect.ismethod(enqueue):
             return None
 
-        existing_sender = _identity(existing)
-        incoming_sender = _identity(event)
-        return existing_sender is not None and existing_sender == incoming_sender
+        def _enqueue(queued: MessageEvent) -> None:
+            enqueue(session_key, queued, self)
+
+        return _enqueue
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -5911,6 +5987,13 @@ class BasePlatformAdapter(ABC):
                         event,
                         merge_text=True,
                     )
+                else:
+                    # A third sender while the slot and the buffer both hold
+                    # other senders: give it its own queued turn rather than
+                    # dropping it.
+                    enqueue_separate = self._separate_follow_up_enqueuer(session_key)
+                    if enqueue_separate is not None:
+                        enqueue_separate(event)
                 return
 
         now = time.monotonic()
@@ -6423,7 +6506,12 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                merge_pending_message_event(self._pending_messages, session_key, event)
+                route_pending_follow_up(
+                    self._pending_messages,
+                    session_key,
+                    event,
+                    enqueue_separate=self._separate_follow_up_enqueuer(session_key),
+                )
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -6442,11 +6530,12 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
-                merge_pending_message_event(
+                route_pending_follow_up(
                     self._pending_messages,
                     session_key,
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
+                    enqueue_separate=self._separate_follow_up_enqueuer(session_key),
                 )
             return  # Don't process now - will be handled after current task finishes
         
@@ -7323,7 +7412,15 @@ class BasePlatformAdapter(ABC):
         # Flush pending messages to disk before clearing (#72680).
         try:
             from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            flush_pending_to_file(
+                self._pending_messages,
+                reason="adapter_shutdown",
+                session_id_resolver=getattr(
+                    getattr(getattr(self, "gateway_runner", None), "session_store", None),
+                    "peek_session_id",
+                    None,
+                ),
+            )
         except Exception:
             pass
         self._pending_messages.clear()

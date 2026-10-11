@@ -170,6 +170,7 @@ class HonchoSessionManager:
         # ._prefetch_result) so session-start prewarm and turn-driven fires share
         # one source of truth; see __init__.py _do_session_init for the prewarm.
         self._context_cache: dict[str, dict] = {}
+        self._context_generations: dict[str, int] = {}
         self._prefetch_cache_lock = threading.Lock()
         self._dialectic_reasoning_level: str = (
             config.dialectic_reasoning_level if config else "low"
@@ -952,7 +953,7 @@ class HonchoSessionManager:
                 raise
             return ""
 
-    def prefetch_context(self, session_key: str, user_message: str | None = None) -> None:
+    def prefetch_context(self, session_key: str, user_message: str | None = None, *, generation: int | None = None) -> None:
         """
         Fire get_prefetch_context in a background thread, caching the result.
 
@@ -962,16 +963,27 @@ class HonchoSessionManager:
         def _run():
             result = self.get_prefetch_context(session_key, user_message)
             if result:
+                if generation is not None:
+                    result["retrieval_generation"] = str(generation)
                 self.set_context_result(session_key, result)
 
         t = spawn_context_thread(_run, name="honcho-context-prefetch")
         t.start()
+
+    def set_context_generation(self, session_key: str, generation: int) -> None:
+        """Reserve the current request before starting asynchronous work."""
+        with self._prefetch_cache_lock:
+            self._context_generations[session_key] = generation
+            self._context_cache.pop(session_key, None)
 
     def set_context_result(self, session_key: str, result: dict[str, str]) -> None:
         """Store a prefetched context result in a thread-safe way."""
         if not result:
             return
         with self._prefetch_cache_lock:
+            generation = self._context_generations.get(session_key)
+            if generation is not None and result.get("retrieval_generation") != str(generation):
+                return
             self._context_cache[session_key] = result
 
     def pop_context_result(self, session_key: str) -> dict[str, str]:
@@ -1013,7 +1025,7 @@ class HonchoSessionManager:
         # return null summary — the guard below handles that gracefully.
         # Per-directory returning sessions get their accumulated summary.
         try:
-            if session.honcho_session_id in self._sessions_cache:
+            if not user_message and session.honcho_session_id in self._sessions_cache:
                 ctx = self._authed_call(
                     "session summary fetch",
                     lambda: self._sdk_session(session.honcho_session_id).context(summary=True),
@@ -1038,14 +1050,22 @@ class HonchoSessionManager:
 
         # Also fetch AI peer's own representation so Hermes knows itself.
         try:
-            ai_ctx = self._fetch_peer_context(session.assistant_peer_id, target=session.assistant_peer_id)
-            result["ai_representation"] = ai_ctx["representation"]
-            result["ai_card"] = "\n".join(ai_ctx["card"])
+            if user_message:
+                # The directional user query already retrieves conversation
+                # evidence. Do not repeat it as an AI self-model or include
+                # unrelated assistant-only sessions.
+                result["ai_card"] = "\n".join(self._fetch_peer_card(session.assistant_peer_id))
+            else:
+                ai_ctx = self._fetch_peer_context(session.assistant_peer_id, target=session.assistant_peer_id)
+                result["ai_representation"] = ai_ctx["representation"]
+                result["ai_card"] = "\n".join(ai_ctx["card"])
         except HonchoAuthError:
             return result
         except Exception as e:
             logger.debug("Failed to fetch AI peer context from Honcho: %s", e)
 
+        if user_message:
+            result["retrieval_query"] = user_message
         return result
 
     def migrate_local_history(self, session_key: str, messages: list[dict[str, Any]]) -> bool:
@@ -1303,6 +1323,7 @@ class HonchoSessionManager:
                 context_kwargs["target"] = target
             if search_query is not None:
                 context_kwargs["search_query"] = search_query
+                context_kwargs["include_most_frequent"] = False
 
             def _peer_context() -> Any:
                 peer = self._get_or_create_peer(peer_id)
@@ -1320,7 +1341,7 @@ class HonchoSessionManager:
         except Exception as e:
             logger.debug("Direct peer.context() failed for '%s': %s", peer_id, e)
 
-        if not representation:
+        if not representation and search_query is None:
             try:
                 def _peer_representation() -> Any:
                     peer = self._get_or_create_peer(peer_id)
