@@ -16,7 +16,7 @@ import weakref
 from contextlib import suppress
 from difflib import SequenceMatcher
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.i18n import t
 from gateway.config import Platform
@@ -209,6 +209,19 @@ class GatewayVoiceMixin:
         if getattr(raw, "guild_id", None):  # slash command interaction
             return int(raw.guild_id)
         return raw.guild.id if getattr(raw, "guild", None) else None  # regular message
+
+    def _voice_guild_for_event(self, event: MessageEvent, adapter: Any) -> Optional[int]:
+        """Guild for voice output: the event's own guild, else (synthetic heartbeat/goal/loop
+        events carry no raw_message) the connected guild whose voice session is bound to this
+        chat, as DiscordAdapter.play_tts resolves it."""
+        if guild_id := self._get_guild_id(event):
+            return guild_id
+        bound = getattr(adapter, "_voice_text_channels", None)
+        is_in_vc = getattr(adapter, "is_in_voice_channel", None)
+        if not (isinstance(bound, dict) and callable(is_in_vc)):
+            return None
+        chat_id = str(event.source.chat_id)
+        return next((gid for gid, ch in bound.items() if str(ch) == chat_id and is_in_vc(gid)), None)
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)
@@ -503,7 +516,7 @@ class GatewayVoiceMixin:
     async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: List[str]) -> None:
         """Play the files in the connected voice channel, else send them as voice messages."""
         adapter = self._delivery_adapter_for(event.source)
-        guild_id = self._get_guild_id(event)
+        guild_id = self._voice_guild_for_event(event, adapter)
         play = getattr(adapter, "play_in_voice_channel", None)
         is_in_vc = getattr(adapter, "is_in_voice_channel", None)
         if guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):

@@ -644,7 +644,7 @@ class GatewayAgentCacheMixin:
         if source.platform != Platform.DISCORD:
             return None
         adapter = self.adapters.get(Platform.DISCORD)
-        guild_id = self._get_guild_id(event)
+        guild_id = self._voice_guild_for_event(event, adapter)
         if not (guild_id and adapter and hasattr(adapter, "get_voice_channel_context")):
             return None
         try:
