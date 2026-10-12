@@ -288,11 +288,16 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     scaffolding, not the active ask.
     """
     from agent.context_compressor import user_originated_turn_view
+    from agent.prompt_builder import STEER_DISPLAY_KIND
 
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
+            continue
+        # A mid-turn /steer is its own user row and never this turn's anchor. Landing on it
+        # makes the persist override write this turn's text over the steer's own words.
+        if msg.get("display_kind") == STEER_DISPLAY_KIND:
             continue
         # Typed synthetic current events keep their persistence anchor when raw
         # content is unchanged; not eligible for the human-only fallback below.
