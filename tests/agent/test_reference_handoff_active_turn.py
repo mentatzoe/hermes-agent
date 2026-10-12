@@ -333,6 +333,34 @@ class TestReanchorSkipsHandoffFallback:
 
         assert reanchor_current_turn_user_idx(messages, "rewritten ask") == 1
 
+    def test_fallback_never_lands_on_a_mid_turn_steer(self):
+        # A /steer arrives after a tool batch as its own user row. When this turn's row no
+        # longer matches verbatim (injected context), the fallback used to pick the steer, and the
+        # persist override then wrote this turn's text over it: the steer's own words were lost
+        # from state.db (Home DM, 12 Oct 2026, row 589551).
+        from agent.prompt_builder import steer_user_row
+
+        messages = [
+            {"role": "user", "content": "older ask"},
+            {"role": "assistant", "content": "older answer"},
+            {"role": "user", "content": "live ask\n\n[injected context]"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "{}"},
+            steer_user_row("voice note sent mid-turn"),
+        ]
+
+        assert reanchor_current_turn_user_idx(messages, "live ask") == 2
+
+    def test_steer_with_identical_text_is_not_the_turn_row(self):
+        from agent.prompt_builder import steer_user_row
+
+        steer = steer_user_row("same words")
+        messages = [{"role": "user", "content": "same words"}, steer]
+        # Even an exact content match must not anchor the turn on the steer row.
+        steer["content"] = "same words"
+        assert reanchor_current_turn_user_idx(messages, "same words") == 0
+
 
 class TestRetryableUserText:
     def test_losslessly_flattens_text_only_parts(self):
