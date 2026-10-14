@@ -3927,48 +3927,44 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                         await asyncio.sleep(0.05)
                     return True
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
-            # Legacy one-shot path: pause receiver while playing (echo prevention).
-            receiver = self._voice_receivers.get(guild_id)
-            if receiver:
-                receiver.pause()
-            try:
-                wait_start = time.monotonic()
-                while vc.is_playing():
-                    if time.monotonic() - wait_start > playback_timeout:
-                        logger.warning("Timed out waiting for previous playback to finish")
-                        vc.stop()
-                        break
-                    await asyncio.sleep(0.1)
-                done = asyncio.Event()
-                loop = asyncio.get_running_loop()
-
-                def _after(error):
-                    if error:
-                        logger.error("Voice playback error: %s", error)
-                    loop.call_soon_threadsafe(done.set)
-                # Lead silence so socket warm-up doesn't clip the first word (mirrors mixer path).
-                ffmpeg_opts: Dict[str, Any] = {}
-                _fx_cfg = getattr(self, "_voice_fx_cfg", None) or {}
-                try:
-                    lead_ms = int(_fx_cfg.get("lead_silence_ms", 0) or 0)
-                except (TypeError, ValueError):
-                    lead_ms = 0
-                if lead_ms > 0:
-                    ffmpeg_opts["options"] = f"-af adelay={lead_ms}:all=1"
-                source = discord.FFmpegPCMAudio(
-                    audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
-                )
-                source = discord.PCMVolumeTransformer(source, volume=1.0)
-                vc.play(source, after=_after)
-                try:
-                    await asyncio.wait_for(done.wait(), timeout=playback_timeout)
-                except asyncio.TimeoutError:
-                    logger.warning("Voice playback timed out after %.1fs", playback_timeout)
+            # Legacy one-shot path. The receiver keeps listening while this plays: pausing it
+            # discarded whatever Zoe said over the reply (3 and 12 Oct 2026), and inbound voice
+            # wins (Zoe, 15 Jun 2026). Echo needs no pause, because _on_packet already drops the
+            # bot's own SSRC.
+            wait_start = time.monotonic()
+            while vc.is_playing():
+                if time.monotonic() - wait_start > playback_timeout:
+                    logger.warning("Timed out waiting for previous playback to finish")
                     vc.stop()
-                return True
-            finally:
-                if receiver:
-                    receiver.resume()
+                    break
+                await asyncio.sleep(0.1)
+            done = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _after(error):
+                if error:
+                    logger.error("Voice playback error: %s", error)
+                loop.call_soon_threadsafe(done.set)
+            # Lead silence so socket warm-up doesn't clip the first word (mirrors mixer path).
+            ffmpeg_opts: Dict[str, Any] = {}
+            _fx_cfg = getattr(self, "_voice_fx_cfg", None) or {}
+            try:
+                lead_ms = int(_fx_cfg.get("lead_silence_ms", 0) or 0)
+            except (TypeError, ValueError):
+                lead_ms = 0
+            if lead_ms > 0:
+                ffmpeg_opts["options"] = f"-af adelay={lead_ms}:all=1"
+            source = discord.FFmpegPCMAudio(
+                audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
+            )
+            source = discord.PCMVolumeTransformer(source, volume=1.0)
+            vc.play(source, after=_after)
+            try:
+                await asyncio.wait_for(done.wait(), timeout=playback_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Voice playback timed out after %.1fs", playback_timeout)
+                vc.stop()
+            return True
         finally:
             self._reset_voice_timeout(guild_id)
 
