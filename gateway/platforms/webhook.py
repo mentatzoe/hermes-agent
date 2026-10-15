@@ -727,8 +727,13 @@ class WebhookAdapter(BasePlatformAdapter):
                                    user_id=f"webhook:{route_name}", user_name=route_name)
         if profile and isinstance(profile, str):
             source.profile = profile
+        # No human awaits this reply: a route may tell its agent to answer a bare silence marker when
+        # there is nothing to deliver, and that must stay silent rather than become the human-turn
+        # "unexpected silence" warning. ``reply_expected=False``, not ``internal``: an internal event
+        # skips authorization, the emergency stop and the pre-dispatch hook. The turn persists it on
+        # the user row, so crash recovery reaches the same verdict.
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, raw_message=payload,
-                             message_id=delivery_id)
+                             message_id=delivery_id, reply_expected=False)
         # The per-delivery session is closed by ``on_processing_complete`` once the run finishes
         # (``handle_message`` is fire-and-forget, so nothing can be closed here).
         task = asyncio.create_task(self.handle_message(event))
