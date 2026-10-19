@@ -5045,8 +5045,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             # carrier itself, after the marker. Already actionable.
             return compressed
 
-        # Keep any reply pointer: the restated task still needs its disambiguation.
-        task_text = _restated_request_text(inflight.get("content"))
+        from agent.context_compressor_restatement import restated_task_text
+        task_text = restated_task_text(inflight.get("content"), getattr(self, "_skill_reload_available", False))
         if not task_text:
             return compressed
 

@@ -243,6 +243,8 @@ class CompressionFacadeMixin:
             resolve_context_compression_timeouts,
         )
         reset_context_compression_timeout_outcome(self)
+        from agent.context_compressor_restatement import note_skill_reload
+        note_skill_reload(self)
         from agent.portal_tags import (
             get_affinity_scope, get_conversation_context, reset_affinity_scope, reset_conversation_context,
             set_affinity_scope, set_conversation_context,
