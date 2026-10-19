@@ -113,6 +113,15 @@ def test_saved_cards_are_not_used_when_stale_for_other_people_or_off(home, monke
     assert "Zoe uses they/them, always." not in _header(summary)
 
 
+def test_no_copy_when_companion_names_no_user(home, monkeypatch):
+    # Without a user name the copy can't tell one person's cards from another's.
+    (home / "config.yaml").write_text(json.dumps(_config(user_name="")))
+    _compact(_agent(_provider(CARDS)), monkeypatch)
+    assert not (home / SAVED).exists()
+    prompt, _ = _compact(_agent(None), monkeypatch)
+    assert "MEMORY PROVIDER CONTEXT" not in prompt
+
+
 def test_unreadable_saved_copy_does_not_block_compaction(home, monkeypatch):
     (home / "state").mkdir()
     (home / SAVED).write_text("{not json")

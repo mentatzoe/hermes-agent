@@ -11,7 +11,10 @@ So companion compaction keeps the last provider context that arrived and stands 
 with its age, when a compaction gets none. The provider itself deliberately never hands a late
 fetch to a different session, because one provider object is rebound across sessions. This copy
 lives in the host instead: in the active profile's home, and used only by a compaction for the
-same agent and user, so it never crosses profiles or people.
+same agent and user name. That separates people only where the memory provider resolves one
+user per profile, as the Honcho setup with a pinned user peer does. It also assumes the
+provider's context is standing facts, as Honcho's peer cards are; a provider that returns notes
+about one conversation would have them replayed into others.
 """
 from __future__ import annotations
 
@@ -25,9 +28,9 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _SAVED_RELPATH = Path("state") / "companion-compaction-provider-context.json"
-# Peer cards are standing facts: across 24 compactions from 29 Sep to 16 Oct 2026 the user card
-# never changed and the AI card changed once. A week-old copy would have covered 78 of the 80
-# compactions that had none; a 72-hour limit, 73.
+# Peer cards are standing facts: in the 24 compaction headers that carried them up to 18 Oct
+# 2026, the user card never changed and the AI card changed once. A week-old copy would have
+# covered 78 of the 80 compactions that had none.
 _DEFAULT_MAX_AGE_HOURS = 168.0
 
 
@@ -62,7 +65,7 @@ def _remember(companion: Any, memory_context: str) -> None:
     atomic_json_write(_saved_path(), record, mode=0o600)
 
 
-def _recall(companion: Any) -> Optional[str]:
+def _recall(companion: Any, max_age: float) -> Optional[str]:
     from datetime import datetime
 
     from hermes_time import get_timezone
@@ -74,7 +77,7 @@ def _recall(companion: Any) -> Optional[str]:
     context = str(record.get("context") or "").strip()
     saved_at = float(record.get("saved_at") or 0)
     age = time.time() - saved_at
-    if not context or record.get("who") != _who(companion) or not 0 <= age <= _max_age_seconds(companion):
+    if not context or record.get("who") != _who(companion) or not 0 <= age <= max_age:
         return None
     saved_on = datetime.fromtimestamp(saved_at, tz=get_timezone()).strftime("%Y-%m-%d %H:%M %Z").strip()
     old = f"{int(age // 60)} min" if age < 3600 else f"{age / 3600:.0f} h"
@@ -84,16 +87,21 @@ def _recall(companion: Any) -> Optional[str]:
 def companion_memory_context(companion: Any, memory_context: str) -> str:
     """The provider context for a companion compaction: save a fresh one, or stand in a recent copy.
 
-    Non-companion compressors, and companion mode with ``saved_context_max_age_hours: 0``,
-    get ``memory_context`` back unchanged. Reading or writing the copy never blocks compaction.
+    Non-companion compressors, companion mode that names no user, and
+    ``saved_context_max_age_hours: 0`` get ``memory_context`` back unchanged; without a user
+    name the copy could not tell one person's cards from another's. Reading or writing the copy
+    never blocks compaction.
     """
-    if companion is None or not getattr(companion, "enabled", False) or _max_age_seconds(companion) <= 0:
+    if companion is None or not getattr(companion, "enabled", False) or not getattr(companion, "user_name", ""):
+        return memory_context
+    max_age = _max_age_seconds(companion)
+    if max_age <= 0:
         return memory_context
     try:
         if memory_context and memory_context.strip():
             _remember(companion, memory_context)
             return memory_context
-        return _recall(companion) or memory_context
+        return _recall(companion, max_age) or memory_context
     except Exception:  # never block compaction on the saved copy
         logger.warning("companion: saved provider context unavailable", exc_info=True)
         return memory_context
