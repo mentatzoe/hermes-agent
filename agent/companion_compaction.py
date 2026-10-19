@@ -92,7 +92,7 @@ def _read_bounded(path: str, limit: int = _FILE_MAX_CHARS) -> str:
                        "companion: identity file %s (resolved to %s) is missing; "
                        "the identity header will not include it", path, p)
             return ""
-        text = p.read_text(encoding="utf-8", errors="ignore").strip()
+        text = p.read_text(encoding="utf-8-sig", errors="ignore").strip()
     except Exception as exc:
         _warn_once("unreadable", str(p or path),
                    "companion: identity file %s (resolved to %s) could not be read (%s); "
@@ -115,6 +115,9 @@ class CompanionConfig:
         self.identity_files = [str(p) for p in (raw.get("identity_files") or []) if str(p).strip()]
         self.letter_budget_tokens = int(raw.get("letter_budget_tokens") or 2_500)
         self.appendix_budget_tokens = int(raw.get("appendix_budget_tokens") or 1_500)
+        # How old a saved copy of the memory provider's context may be when a compaction gets
+        # none (agent/companion_compaction_context.py); unset means a week, 0 turns it off.
+        self.saved_context_max_age_hours = raw.get("saved_context_max_age_hours")
         lanes = raw.get("lanes") or []
         self.lanes = [l for l in lanes if isinstance(l, dict) and l.get("note")]
         self.session_id = ""

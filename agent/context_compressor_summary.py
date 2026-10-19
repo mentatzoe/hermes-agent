@@ -80,9 +80,11 @@ class SummaryDispatchMixin:
                 telemetry["failure_class"] = "stall_deterministic_fallback"
             return None
         # Focus-topic derivation scans user turns; only pay when a summary is generated.
+        from agent.companion_compaction_context import companion_memory_context
+
         summary_kwargs: Dict[str, Any] = {
             "focus_topic": focus_topic or self._derive_auto_focus_topic(messages),
-            "memory_context": memory_context,
+            "memory_context": companion_memory_context(getattr(self, "_companion", None), memory_context),
         }
         if _accepts_keyword_argument(self._generate_summary, "bypass_cooldown"):
             summary_kwargs["bypass_cooldown"] = bypass_cooldown
