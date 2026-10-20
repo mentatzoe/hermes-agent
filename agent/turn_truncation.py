@@ -389,21 +389,13 @@ def observed_output_tokens(agent: Any, response: Any) -> int:
     ).output_tokens
 
 
-def boosted_output_cap(
-    agent: Any, requested_cap: Optional[int], n: int, base: Optional[int] = None,
-    observed: Optional[int] = None,
-) -> int:
+def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: Optional[int] = None) -> int:
     """Output budget for truncation retry ``n`` (1-based): ``base·2ⁿ``, never below the
     failed request's cap, at most ``max(32768, 2×cap)``, and never above the model's
     known output limit. ``base`` defaults to max_tokens, else the cap actually sent.
 
     A ceiling equal to the requested cap would re-send the same budget (#72770); a
     ceiling past the model limit only buys a provider 400 (#79715).
-
-    ``observed`` is the output the truncated response produced. When the failed request
-    sent no cap, the provider's own default was in force, and that output is the cap that
-    ran out: the retry never gets less room than it. Behind a relay whose default is
-    65,536, the ladder from 4,096 retried with 8,192 (aleph-vault #213).
     """
     if base is None:
         base = agent.max_tokens or requested_cap or 4096
@@ -412,9 +404,24 @@ def boosted_output_cap(
     if limit and anchor >= limit:
         return anchor  # already at the model ceiling: doubling cannot help
     boost = min(max(base * (2 ** n), requested_cap or 0), max(32768, anchor * 2))
-    if not requested_cap and observed:
-        boost = max(boost, int(observed))
     return min(boost, limit) if limit else boost
+
+
+def continuation_output_cap(agent: Any, requested_cap: Optional[int], n: int, response: Any) -> Optional[int]:
+    """Output cap for truncation retry ``n``: the ``boosted_output_cap`` ladder, unless the
+    truncated request sent no cap and its response already produced at least that much.
+    The provider's own default was then in force and gave more room than the ladder
+    would, so the retry sends no cap and gets that default again (``None``).
+
+    Behind cpa-gui the default for claude-opus-5-5 is 65,536, and the ladder from 4,096
+    retried with 8,192, 16,384 and 32,768 (aleph-vault #213). This only ever leaves a cap
+    out; it never sends a number the ladder would not, so it cannot exceed a model limit
+    Hermes doesn't know.
+    """
+    boost = boosted_output_cap(agent, requested_cap, n)
+    if not requested_cap and observed_output_tokens(agent, response) >= boost:
+        return None
+    return boost
 
 
 def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict:
@@ -429,9 +436,8 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
             agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
         else:
             agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
-        agent._ephemeral_max_output_tokens = boosted_output_cap(
-            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n,
-            observed=observed_output_tokens(agent, getattr(st, "response", None)),
+        agent._ephemeral_max_output_tokens = continuation_output_cap(
+            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n, getattr(st, "response", None),
         )
         return st.done("continue")  # don't append the broken response
     agent._flush_status_buffer()
@@ -511,8 +517,8 @@ def recover_from_truncation(
     _cap_of = getattr(agent, "_requested_output_cap_from_api_kwargs", None)
     _sent_cap = _cap_of(api_kwargs) if callable(_cap_of) else None
     logger.warning(
-        "%sResponse truncated (finish_reason=length): output cap sent %s, output %d tokens (%d reasoning)",
-        getattr(agent, "log_prefix", ""), _sent_cap or "none (provider default)",
+        "%s%s: output cap sent %s, output %d tokens (%d reasoning)",
+        getattr(agent, "log_prefix", ""), _banner, _sent_cap or "none (provider default)",
         _usage.output_tokens, _usage.reasoning_tokens,
     )
 

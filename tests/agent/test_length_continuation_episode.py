@@ -139,10 +139,13 @@ def test_each_new_episode_starts_at_the_first_rung_of_the_output_budget(loop_age
 
 def test_continuation_without_a_sent_cap_keeps_the_room_that_ran_out(loop_agent):
     # The 19 Oct route sends no max_tokens; the relay's default (65,536 after the cpa-gui
-    # rule) is what the thinking-only response used up. The continuation must not retry
-    # with the 8,192 / 16,384 / 32,768 ladder rungs.
+    # rule) is what each thinking-only response used up. Every continuation must again go
+    # out with no cap, never with the 8,192 / 16,384 / 32,768 rungs, and never above the
+    # default with a doubled number Hermes can't check against the model's limit.
     assert loop_agent.max_tokens is None
     loop_agent.client.chat.completions.create.side_effect = [
+        _thinking_only_truncation(),
+        _thinking_only_truncation(),
         _thinking_only_truncation(),
         _mock_response(content="answer", finish_reason="stop"),
     ]
@@ -150,5 +153,19 @@ def test_continuation_without_a_sent_cap_keeps_the_room_that_ran_out(loop_agent)
 
     calls = loop_agent.client.chat.completions.create.call_args_list
     assert result["final_response"] == "answer"
-    assert "max_tokens" not in calls[0].kwargs and "max_completion_tokens" not in calls[0].kwargs
-    assert (calls[1].kwargs.get("max_tokens") or calls[1].kwargs.get("max_completion_tokens")) == 65_536
+    assert len(calls) == 4
+    for call in calls:
+        assert "max_tokens" not in call.kwargs and "max_completion_tokens" not in call.kwargs
+
+
+def test_truncation_writes_one_log_line_with_the_cap_and_tokens(loop_agent, caplog):
+    import logging
+    loop_agent.client.chat.completions.create.side_effect = [
+        _thinking_only_truncation(),
+        _mock_response(content="answer", finish_reason="stop"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+        _run(loop_agent, "do the long task")
+    lines = [r.getMessage() for r in caplog.records if "output cap sent" in r.getMessage()]
+    assert len(lines) == 1
+    assert "none (provider default)" in lines[0] and "output 65536 tokens" in lines[0]
