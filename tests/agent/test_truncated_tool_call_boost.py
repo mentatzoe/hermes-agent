@@ -69,3 +69,25 @@ def test_boost_clamped_to_known_model_output_limit(site):
 
 def test_small_explicit_max_tokens_ladder_still_capped_at_floor():
     assert _tool_call_budgets(_agent(4096, None)) == [8192, 16384, 32768, 32768]
+
+
+def test_unsent_cap_retry_never_gets_less_room_than_the_output_that_ran_out():
+    # No cap was sent, so the provider's default was in force and the truncated response's
+    # output is that default (aleph-vault #213: 65,536 behind cpa-gui, retried with 8,192).
+    from agent.turn_truncation import boosted_output_cap
+    agent = _agent(None, None)
+    assert [boosted_output_cap(agent, None, n, observed=65_536) for n in (1, 2, 3, 4)] == [65_536] * 4
+    # The ladder still wins when it is larger than what was observed.
+    assert boosted_output_cap(agent, None, 3, observed=2_048) == 32_768
+
+
+def test_sent_cap_ignores_observed_output():
+    # With an explicit cap the ladder is anchored on it (#72770); observed output adds nothing.
+    from agent.turn_truncation import boosted_output_cap
+    assert boosted_output_cap(_agent(None, 4096), 4096, 1, observed=4096) == 8192
+
+
+def test_observed_output_still_clamped_to_known_model_limit():
+    from agent.turn_truncation import boosted_output_cap
+    agent = _agent(None, None, api_mode="anthropic_messages", model="claude-sonnet-4-5")
+    assert boosted_output_cap(agent, None, 1, observed=70_000) == 64_000

@@ -379,13 +379,31 @@ def _model_output_limit(agent: Any) -> Optional[int]:
     return _get_anthropic_max_output(getattr(agent, "model", None) or "")
 
 
-def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: Optional[int] = None) -> int:
+def observed_output_tokens(agent: Any, response: Any) -> int:
+    """Output tokens ``response`` reports producing (0 when its usage is missing)."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return 0
+    return normalize_usage(
+        usage, provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None)
+    ).output_tokens
+
+
+def boosted_output_cap(
+    agent: Any, requested_cap: Optional[int], n: int, base: Optional[int] = None,
+    observed: Optional[int] = None,
+) -> int:
     """Output budget for truncation retry ``n`` (1-based): ``base·2ⁿ``, never below the
     failed request's cap, at most ``max(32768, 2×cap)``, and never above the model's
     known output limit. ``base`` defaults to max_tokens, else the cap actually sent.
 
     A ceiling equal to the requested cap would re-send the same budget (#72770); a
     ceiling past the model limit only buys a provider 400 (#79715).
+
+    ``observed`` is the output the truncated response produced. When the failed request
+    sent no cap, the provider's own default was in force, and that output is the cap that
+    ran out: the retry never gets less room than it. Behind a relay whose default is
+    65,536, the ladder from 4,096 retried with 8,192 (aleph-vault #213).
     """
     if base is None:
         base = agent.max_tokens or requested_cap or 4096
@@ -394,6 +412,8 @@ def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: O
     if limit and anchor >= limit:
         return anchor  # already at the model ceiling: doubling cannot help
     boost = min(max(base * (2 ** n), requested_cap or 0), max(32768, anchor * 2))
+    if not requested_cap and observed:
+        boost = max(boost, int(observed))
     return min(boost, limit) if limit else boost
 
 
@@ -410,7 +430,8 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
         else:
             agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
         agent._ephemeral_max_output_tokens = boosted_output_cap(
-            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
+            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n,
+            observed=observed_output_tokens(agent, getattr(st, "response", None)),
         )
         return st.done("continue")  # don't append the broken response
     agent._flush_status_buffer()
@@ -483,6 +504,17 @@ def recover_from_truncation(
     else:
         _banner = "Response truncated (finish_reason='length') - model hit max output tokens"
     agent._vprint(f"{agent.log_prefix}⚠️  {_banner}", force=True, diagnostic=True)
+    # The banner is stdout-only and a truncated call never reaches the usage fold, so
+    # without this line agent.log has no record of the call or the cap it ran out of.
+    _usage = normalize_usage(getattr(response, "usage", None),
+                             provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None))
+    _cap_of = getattr(agent, "_requested_output_cap_from_api_kwargs", None)
+    _sent_cap = _cap_of(api_kwargs) if callable(_cap_of) else None
+    logger.warning(
+        "%sResponse truncated (finish_reason=length): output cap sent %s, output %d tokens (%d reasoning)",
+        getattr(agent, "log_prefix", ""), _sent_cap or "none (provider default)",
+        _usage.output_tokens, _usage.reasoning_tokens,
+    )
 
     # #106260: a context-overflow error after partial delivery must not seed a
     # continuation. _partial_stream_stub marks such stubs _overflow_terminal and

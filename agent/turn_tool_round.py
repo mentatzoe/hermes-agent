@@ -41,6 +41,7 @@ class ToolRoundVerdict:
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
     result: Optional[Dict[str, Any]] = None
+    length_continue_retries: Any = 0
 
 
 def run_tool_round(
@@ -48,7 +49,7 @@ def run_tool_round(
     conversation_history: Any, api_call_count: Any, effective_task_id: Any, user_message: Any,
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
-    truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    truncated_tool_call_retries: Any, current_turn_user_idx: Any, length_continue_retries: Any = 0,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -63,6 +64,7 @@ def run_tool_round(
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
             current_turn_user_idx=current_turn_user_idx, result=result,
+            length_continue_retries=length_continue_retries,
         )
 
     if not agent.quiet_mode:
@@ -189,8 +191,11 @@ def run_tool_round(
                     agent.stream_delta_callback(None)
         return _verdict("break")
 
-    # Reset per-turn retry counters so one truncation can't poison the turn.
+    # Reset per-turn retry counters so one truncation can't poison the turn. A tool round
+    # also ends a length-continuation episode: the four-try ceiling counts truncations in a
+    # row, not every truncation in a long worker turn (#213).
     truncated_tool_call_retries = 0
+    length_continue_retries = 0
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real
     # text arrives, so tool iterations don't stack blank lines.
     agent._stream_needs_break = True
