@@ -69,3 +69,39 @@ def test_boost_clamped_to_known_model_output_limit(site):
 
 def test_small_explicit_max_tokens_ladder_still_capped_at_floor():
     assert _tool_call_budgets(_agent(4096, None)) == [8192, 16384, 32768, 32768]
+
+
+def test_unsent_cap_retry_leaves_the_cap_out_when_the_default_gave_more_room():
+    # No cap was sent, so the provider's default was in force, and the truncated response
+    # already produced more than the rung: send no cap, so the retry gets that default again
+    # (aleph-vault #213: 65,536 behind cpa-gui, retried with 8,192 / 16,384 / 32,768).
+    from agent.turn_truncation import continuation_output_cap
+    agent = _agent(None, None)
+    full = SimpleNamespace(usage={"completion_tokens": 65_536})
+    assert [continuation_output_cap(agent, None, n, full) for n in (1, 2, 3, 4)] == [None] * 4
+
+
+def test_unsent_cap_retry_keeps_the_ladder_when_it_gives_more_room():
+    from agent.turn_truncation import continuation_output_cap
+    agent = _agent(None, None)
+    small = SimpleNamespace(usage={"completion_tokens": 2_048})
+    assert [continuation_output_cap(agent, None, n, small) for n in (1, 2, 3)] == [8192, 16384, 32768]
+    # Missing usage falls back to the ladder too.
+    assert continuation_output_cap(agent, None, 1, SimpleNamespace(usage=None)) == 8192
+
+
+def test_sent_cap_always_uses_the_ladder():
+    # With an explicit cap the ladder is anchored on it (#72770), whatever the response used.
+    from agent.turn_truncation import continuation_output_cap
+    full = SimpleNamespace(usage={"completion_tokens": 4096})
+    assert continuation_output_cap(_agent(None, 4096), 4096, 1, full) == 8192
+
+
+def test_continuation_cap_never_exceeds_what_the_ladder_would_send():
+    # It only ever leaves the cap out; any number it sends is the ladder's, clamped as before.
+    from agent.turn_truncation import boosted_output_cap, continuation_output_cap
+    agent = _agent(None, None, api_mode="anthropic_messages", model="claude-sonnet-4-5")
+    huge = SimpleNamespace(usage={"completion_tokens": 10**30})
+    for n in (1, 2, 3, 4):
+        cap = continuation_output_cap(agent, 40_000, n, huge)
+        assert cap == boosted_output_cap(agent, 40_000, n) <= 64_000

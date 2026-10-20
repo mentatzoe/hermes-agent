@@ -379,6 +379,16 @@ def _model_output_limit(agent: Any) -> Optional[int]:
     return _get_anthropic_max_output(getattr(agent, "model", None) or "")
 
 
+def observed_output_tokens(agent: Any, response: Any) -> int:
+    """Output tokens ``response`` reports producing (0 when its usage is missing)."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return 0
+    return normalize_usage(
+        usage, provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None)
+    ).output_tokens
+
+
 def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: Optional[int] = None) -> int:
     """Output budget for truncation retry ``n`` (1-based): ``base·2ⁿ``, never below the
     failed request's cap, at most ``max(32768, 2×cap)``, and never above the model's
@@ -397,6 +407,23 @@ def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: O
     return min(boost, limit) if limit else boost
 
 
+def continuation_output_cap(agent: Any, requested_cap: Optional[int], n: int, response: Any) -> Optional[int]:
+    """Output cap for truncation retry ``n``: the ``boosted_output_cap`` ladder, unless the
+    truncated request sent no cap and its response already produced at least that much.
+    The provider's own default was then in force and gave more room than the ladder
+    would, so the retry sends no cap and gets that default again (``None``).
+
+    Behind cpa-gui the default for claude-opus-5-5 is 65,536, and the ladder from 4,096
+    retried with 8,192, 16,384 and 32,768 (aleph-vault #213). This only ever leaves a cap
+    out; it never sends a number the ladder would not, so it cannot exceed a model limit
+    Hermes doesn't know.
+    """
+    boost = boosted_output_cap(agent, requested_cap, n)
+    if not requested_cap and observed_output_tokens(agent, response) >= boost:
+        return None
+    return boost
+
+
 def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict:
     """Truncated tool call: re-run the same call (up to 4×) with a boosted max_tokens —
     a real output-cap truncation needs it, harmless for a network stall — else refuse to
@@ -409,8 +436,8 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
             agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
         else:
             agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
-        agent._ephemeral_max_output_tokens = boosted_output_cap(
-            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
+        agent._ephemeral_max_output_tokens = continuation_output_cap(
+            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n, getattr(st, "response", None),
         )
         return st.done("continue")  # don't append the broken response
     agent._flush_status_buffer()
@@ -483,6 +510,17 @@ def recover_from_truncation(
     else:
         _banner = "Response truncated (finish_reason='length') - model hit max output tokens"
     agent._vprint(f"{agent.log_prefix}⚠️  {_banner}", force=True, diagnostic=True)
+    # The banner is stdout-only and a truncated call never reaches the usage fold, so
+    # without this line agent.log has no record of the call or the cap it ran out of.
+    _usage = normalize_usage(getattr(response, "usage", None),
+                             provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None))
+    _cap_of = getattr(agent, "_requested_output_cap_from_api_kwargs", None)
+    _sent_cap = _cap_of(api_kwargs) if callable(_cap_of) else None
+    logger.warning(
+        "%s%s: output cap sent %s, output %d tokens (%d reasoning)",
+        getattr(agent, "log_prefix", ""), _banner, _sent_cap or "none (provider default)",
+        _usage.output_tokens, _usage.reasoning_tokens,
+    )
 
     # #106260: a context-overflow error after partial delivery must not seed a
     # continuation. _partial_stream_stub marks such stubs _overflow_terminal and
