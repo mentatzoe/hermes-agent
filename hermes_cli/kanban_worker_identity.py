@@ -23,8 +23,9 @@ def fingerprints_match(recorded: Any, current: Any) -> bool:
     boot can't come within 2 s of it.
 
     An integer fingerprint (rows written before the epoch was added) keeps the exact comparison:
-    with no epoch, only an exact start time rules out a process from a previous boot. Nothing
-    unreadable or malformed matches.
+    with no epoch, only an exact start time rules out a process from a previous boot. Such a row is
+    still exposed to the macOS drift above; spawns since the epoch was added write the composed form,
+    so it ends with the worker that carries it. Nothing unreadable or malformed matches.
     """
     from gateway.status import _start_times_agree, start_time_fingerprints_match
 

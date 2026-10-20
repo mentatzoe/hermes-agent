@@ -148,8 +148,9 @@ def _read_in_another_process(pid: int, recorded: str, shift: float = 0.0) -> tup
 
 @pytest.fixture
 def recorded_child(board):
-    """A live child whose fingerprint this process records, as the spawning dispatcher does."""
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL)
+    """A live child whose fingerprint this process records, as the spawning dispatcher does. It
+    waits on stdin, so it outlives every reader and ends when the fixture closes its stdin."""
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
     try:
         tid = kb.create_task(board, title="job", assignee="worker")
         kb.claim_task(board, tid)
@@ -160,6 +161,8 @@ def recorded_child(board):
     finally:
         child.kill()
         child.wait(timeout=30)
+        if child.stdin is not None:
+            child.stdin.close()
 
 
 def test_fingerprint_recorded_in_one_process_is_checked_in_another(recorded_child):
@@ -174,7 +177,7 @@ def test_fingerprint_recorded_in_one_process_is_checked_in_another(recorded_chil
     assert _read_in_another_process(pid, f"{epoch}|{int(start) + 360000}")[1] == "False"
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="psutil's kern.boottime adjustment is macOS-only")
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("shift", [1.0, 2.0])
 def test_reader_whose_psutil_saw_boottime_move_still_finds_the_worker(recorded_child, shift):
     """The #215 mechanism itself: the reading process's psutil adds the boot-time movement since
