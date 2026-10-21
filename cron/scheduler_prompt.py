@@ -294,7 +294,8 @@ def _build_job_prompt(
     omitted, the script (if any) runs inline as before. extra_prompt: Optional per-run context (from
     ``cronjob(action='run')``, 57331 — salvaged from #57342 by @liuhao1024).
     """
-    user_prompt = str(job.get("prompt") or "")
+    from cron.oneshot_lateness import late_run_note
+    user_prompt = late_run_note(job) + str(job.get("prompt") or "")
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
     prompt = user_prompt

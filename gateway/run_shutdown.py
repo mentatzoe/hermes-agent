@@ -28,8 +28,8 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
+from gateway.lifecycle_cron import stop_dispatch, resume_dispatch
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
-
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
@@ -704,7 +704,7 @@ class GatewayShutdownMixin:
         """Begin external drain: refuse NEW turns (in-flight ones are NOT interrupted). Idempotent."""
         if self._external_drain_active:
             return
-        self._external_drain_active = True
+        stop_dispatch(self, external=True)
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
@@ -716,7 +716,7 @@ class GatewayShutdownMixin:
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
         if not self._external_drain_active:
             return
-        self._external_drain_active = False
+        resume_dispatch(self)
         if self._draining or not self._running:
             logger.info(
                 "External drain marker cleared during shutdown — not reverting "
@@ -1716,7 +1716,7 @@ class GatewayShutdownMixin:
         self._restart_via_service = via_service
         self._restart_task_started = True
         # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-        self._draining = True
+        stop_dispatch(self)
         # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
         # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
         self._mark_api_runs_shutdown_requested()
@@ -1863,7 +1863,7 @@ class GatewayShutdownMixin:
         ctx.started_at = time.monotonic()
         self._running = False
         self._clear_plugin_message_injector()
-        self._draining = True
+        stop_dispatch(self)
         self._mark_api_runs_shutdown_requested()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)

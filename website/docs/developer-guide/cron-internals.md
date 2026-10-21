@@ -31,6 +31,30 @@ Four schedule formats are supported:
 
 The model-facing surface is a single `cronjob_manage` tool with action-style operations: `create`, `list`, `update`, `pause`, `resume`, `run`, `remove`.
 
+## One-offs across gateway restarts
+
+`gateway/lifecycle_cron.py` records the first dispatch-stop epoch, PID and actually ticked
+profile homes when restart/shutdown/drain sets the dispatch gate. Canceling an external drain
+clears that open boundary. `record_startup` in `gateway/lifecycle_ledger.py` closes it at the
+new claim's start time only if the previous life has `phase=exited` and a matching stop PID.
+The ledger retains the last three closed windows; missing, malformed, future or unclean
+boundaries do not create a window. This is restart evidence, not an inferred heartbeat tail.
+
+`cron/oneshot_lateness.py` admits never-run one-offs whose due instant lies between a window's
+start minus the ordinary 120-second grace and its end, no more than two hours late. The
+persisted `restart_admission` is keyed by job ID and exact due string, separate from run/fire
+ownership. Failed dispatch retries reuse it, even after window history rotates; a schedule
+edit cannot transfer it. The cap is also checked when a queued worker acquires its fire claim.
+Agent prompts explain the late restart run; `last_dispatch` records scheduled/actual timing.
+Manual/forced fires, recurring jobs and the independent store-outage exemption keep their
+existing policies.
+
+A one-off retired outside grace still gets its existing output diagnostic and now queues an
+idempotent one-line skipped-run notice in the profile's `cron/deliveries.db`, addressed to the
+job's delivery target. A missing/local target uses the home-channel fallback (`origin` without
+an origin). Queue/transport failures are logged; delivery remains subject to the existing
+queue's at-most-once and unavailable-transport semantics. Nothing sends from the due scanner.
+
 ## Job Storage
 
 Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write to temp file, then rename). Each job record contains:

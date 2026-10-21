@@ -274,7 +274,11 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
+        from gateway.lifecycle_cron import startup_windows
+
+        previous = _read_json(get_lifecycle_sentinel_path(home)) or {}
         claim: Dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
+        claim["restart_windows"] = startup_windows(previous, claim["start_time"])
         # Process birth (psutil), distinct from ``start_time`` (the ledger claim, seconds later once
         # imports finish): the Windows start attestation binds PIDs to birth time (#110020 review).
         from hermes_cli.process_identity import _process_create_time
@@ -310,7 +314,8 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
                                   "exited_at": _now_iso()}
         # Carry the incarnation identity: the Windows start attestation matches a clean exit by
         # PID *and* start time so a reused PID's exit cannot vouch for a different life (#110020).
-        for key in ("start_time", "create_time"):
+        for key in ("start_time", "create_time", "restart_windows", "dispatch_stopped_at",
+                    "dispatch_stopped_pid", "dispatch_stopped_homes"):
             if sentinel is not None and sentinel.get(key) is not None:
                 exited[key] = sentinel[key]
         _write_sentinel(exited, home)
