@@ -65,6 +65,26 @@ def _guarded_store_write(action, description, *args, **kwargs):
         logger.warning("Cron %s write failed: %s", description, e, exc_info=True)
 
 
+def _note_dispatch_held(homes=None) -> None:
+    """Dispatch is held (restart wait, drain, stop): mark each ticked store, so a one-shot that
+    falls due now fires once afterwards instead of being retired by the next gateway's first scan
+    (aleph-vault#221). ``homes``: the multiplex cycle's ``(name, home)`` pairs; None = the active
+    store. A failed marker write is logged and never stops the ticker."""
+    from cron.oneshot_lateness import note_dispatch_held
+
+    if homes is None:
+        _guarded_store_write(note_dispatch_held, "dispatch-held marker")
+        return
+    for _name, home in homes:
+        with _profile_cron_scope(home):
+            _guarded_store_write(note_dispatch_held, "dispatch-held marker")
+
+
+def _note_dispatch_resumed() -> None:
+    from cron.oneshot_lateness import note_dispatch_resumed
+    note_dispatch_resumed()
+
+
 def _profile_entry(entry) -> tuple:
     """Normalize a ``profile_homes`` entry (``(name, home)`` tuple or bare home) to ``(name,
     home)``."""
@@ -489,7 +509,9 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    _note_dispatch_held()
                 else:
+                    _guarded_store_write(_note_dispatch_resumed, "dispatch-held marker")
                     cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
@@ -615,10 +637,12 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    _note_dispatch_held(cycle_homes)
                 else:
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
+                                _guarded_store_write(_note_dispatch_resumed, "dispatch-held marker")
                                 cron_tick(
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,

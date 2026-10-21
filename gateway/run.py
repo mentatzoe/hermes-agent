@@ -5659,10 +5659,10 @@ def _start_gateway_start_cron_and_housekeeping(runner):
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in cron_profile_homes])
 
-    # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
+    # The in-process ticker alone polls local due jobs, so only it gets the drain gate (shut in stop()).
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
+            runner._draining or runner._external_drain_active or not runner._running)
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(

@@ -146,3 +146,12 @@ def blocked_config_notice(job_name: str, reason: str) -> str:
         "the next scheduled time and will not repeat this alert; check with "
         "`hermes cron doctor`."
     )
+
+
+def missed_oneshot_notice(job_name: str, job_id: str, due: str) -> str:
+    """Notice for a one-shot the scheduler removed unrun because it was found too late to run."""
+    return (
+        f"⚠️ Cron '{job_name}' did not run: it was due at {due}, but the scheduler couldn't run it "
+        "in time (the gateway was down or restarting for too long), so it was removed without "
+        f"running. Recreate it if you still need it; details are in {cron_output_dir_display(job_id)}."
+    )

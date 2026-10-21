@@ -154,7 +154,15 @@ dropped silently. The mechanics, in the order the due scan applies them
 5. **Past grace → collapse the backlog, fire once** (`kind = catch_up`), or skip
    with a logged reason when the operator set `cron.catch_up_missed: false`
    (planned downtime). One-shots past their 120 s grace are retired with a
-   diagnostic, never resurrected.
+   diagnostic and a notice queued for the job's failure lane, never fired hours
+   late — with two exceptions that fire them once: a one-shot due while its
+   store was unwritable (`store_health.outage_covers`), and one due while the
+   ticker held dispatch (`can_dispatch` false during a restart's wait or a
+   drain). The held ticker keeps `cron/dispatch_held` in each store, so the
+   replacement gateway's first scan fires such a one-shot (at most 2 h late,
+   stamped `last_dispatch.kind = catch_up`, its prompt opening with when it
+   was due), and that scan's save removes the marker
+   (`cron/oneshot_lateness.py`).
 6. **Paused / disabled / terminal jobs never fire**; the due scan drops them
    before any of the above, and pause/resume clears any pending slot. A
    recurring occurrence that came due *while paused* is not lost, though:

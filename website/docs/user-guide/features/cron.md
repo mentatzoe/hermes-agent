@@ -1079,6 +1079,18 @@ restart is never run again, and a long outage collapses into a single run rather
 than one run per missed slot. Paused jobs never catch up. Each catch-up shows in
 `hermes cron list` as `⚠ late` / `⚠ catch-up after missed fire`.
 
+One-shot jobs follow a stricter rule: one found more than two minutes past its
+time is removed without running, so a reminder never arrives hours late. The
+exception is a gateway restart. While `/restart` waits for running work, the
+scheduler holds new dispatches, and a one-shot that falls due during that wait
+(or in the restart itself) runs once when the new gateway starts, as long as
+it's at most two hours late. The run shows as a catch-up in `hermes cron list`,
+and an agent job's prompt starts by saying when it was due, so it can adjust
+time-bound wording or stay silent. When a one-shot is removed without running,
+Hermes also sends a short "did not run" notice through the job's failure
+delivery target (`failure_deliver`, else `deliver`), next to the diagnostic file
+in its output folder. Jobs that deliver `local` get only the file.
+
 To avoid that catch-up load after a planned gateway stop, set:
 
 ```yaml

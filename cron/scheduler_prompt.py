@@ -334,6 +334,10 @@ def _build_job_prompt(
         has_injected_data = True
 
     prompt = _CRON_HINT + prompt
+    # A one-shot the scheduler could only fire late says so first (aleph-vault#221).
+    from cron.oneshot_lateness import late_run_note
+    if late_note := late_run_note(job):
+        prompt = late_note + prompt
     skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(
