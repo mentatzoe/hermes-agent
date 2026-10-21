@@ -162,9 +162,11 @@ dropped silently. The mechanics, in the order the due scan applies them
    tick, so the replacement gateway's first scan fires such a one-shot (at
    most 2 h late, stamped `last_dispatch.kind = catch_up`, its prompt opening
    with when it was due). The marker covers jobs only while its last stamp is
-   under 15 minutes old, and a scan removes it once nobody has stamped it for
-   150 s. A failed late dispatch is retried only until due + 2 h
-   (`run_claim.until`; `cron/oneshot_lateness.py`).
+   under 15 minutes old (and not in the future), and a scan removes it only
+   once it can't cover anything; stamps and deletes take the jobs lock. A
+   hold-admitted one-shot whose dispatch fails or waits is started only until
+   due + 2 h (`run_claim.until`); a store-outage claim keeps retrying as before
+   (`cron/oneshot_lateness.py`).
 6. **Paused / disabled / terminal jobs never fire**; the due scan drops them
    before any of the above, and pause/resume clears any pending slot. A
    recurring occurrence that came due *while paused* is not lost, though:

@@ -9,11 +9,19 @@ retry. Each test below is one finding of that review, driven through the real du
   3. a marker last stamped before real downtime admits nothing
   4. another process's scan during a live hold leaves the marker for the next gateway
   5. a hold that ended long ago does not lend its start to a new one
+
+and of the second review (da2fb56c):
+
+  6. a scan's delete and a ticker's stamp are serialized by the jobs lock
+  7. a backed-off ticker's 8-minute gap between stamps does not end its hold
+  8. a queued scheduled run past its claim's ``until`` is not started
+  9. a marker stamped in the future (clock skew) admits nothing
 """
 
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -137,7 +145,6 @@ def test_4_another_process_scan_during_a_live_hold_keeps_the_marker(store):
 
     store["clock"]["now"] = _at(10, 15)
     assert [d["id"] for d in get_due_jobs()] == ["gp"]
-    assert not (cronjobs.CRON_DIR / "dispatch_held").exists()  # unstamped for 4 min: released
 
 
 def test_5_a_hold_that_ended_long_ago_does_not_cover_a_new_one(store):
@@ -160,3 +167,63 @@ def test_5_a_hold_that_ended_long_ago_does_not_cover_a_new_one(store):
     assert get_due_jobs() == []
     assert _ids() == []
     register_ticked_homes([])
+
+
+def test_6_a_stamp_waits_for_a_scan_that_holds_the_jobs_lock(store):
+    """end_hold_window reads, then unlinks. A ticker's stamp must not land between the two, or the
+    delete erases a hold that has just been renewed."""
+    _hold(store, _at(9, 0), _at(9, 1))  # an old hold: the next scan drops its marker
+    store["clock"]["now"] = _at(10, 0)
+    stamped = threading.Event()
+
+    def stamp():
+        oneshot_lateness.note_dispatch_held()
+        stamped.set()
+
+    with cronjobs._jobs_lock():
+        ticker = threading.Thread(target=stamp, daemon=True)
+        ticker.start()
+        assert not stamped.wait(0.5), "the stamp ran inside a scan's critical section"
+        oneshot_lateness.end_hold_window(_at(10, 0).timestamp())
+    assert stamped.wait(10)
+    since, last = (cronjobs.CRON_DIR / "dispatch_held").read_text(encoding="utf-8").split()
+    assert float(since) == float(last) == _at(10, 0).timestamp()
+
+
+def test_7_a_backed_off_ticker_keeps_its_hold_between_stamps(store):
+    """EMFILE backoff stretches the tick to 8 min: stamps at 10:00 and 10:08. A scan by another
+    process at 10:03 must leave the marker, and the 10:09 scan fires the 10:04 reminder."""
+    save_jobs([_oneshot("gp", _at(10, 4))])
+    _hold(store, _at(10, 0), _at(10, 0))
+    assert _scan_in_another_process(store, _at(10, 3)) == 0
+    _hold(store, _at(10, 8), _at(10, 8))
+    since = float((cronjobs.CRON_DIR / "dispatch_held").read_text(encoding="utf-8").split()[0])
+    assert since == _at(10, 0).timestamp()
+    store["clock"]["now"] = _at(10, 9)
+    assert [d["id"] for d in get_due_jobs()] == ["gp"]
+
+
+def test_8_a_queued_run_past_its_deadline_is_not_started(store):
+    """Admitted at 10:13, the run waits behind busy workers; its worker reaches the fire claim at
+    12:10, after due + 2 h. It must not start; a hand-run still may."""
+    save_jobs([_oneshot("gp", _at(10, 0))])
+    _hold(store, _at(9, 42), _at(10, 12))
+    store["clock"]["now"] = _at(10, 13, 24)
+    assert [d["id"] for d in get_due_jobs()] == ["gp"]
+
+    store["clock"]["now"] = _at(12, 10)
+    assert not claim_job_for_fire("gp")
+    assert load_jobs()[0]["fire_claim"] is None
+    assert claim_job_for_fire("gp", manual=True)
+
+
+def test_9_a_marker_stamped_in_the_future_admits_nothing(store):
+    """A writer with a fast clock (or a clock corrected backwards) left last=11:00. At 10:30 that
+    is no evidence of a live hold: the 10:00 reminder is a miss and the marker goes."""
+    save_jobs([_oneshot("gp", _at(10, 0))])
+    (cronjobs.CRON_DIR / "dispatch_held").write_text(
+        f"{_at(9, 42).timestamp()} {_at(11, 0).timestamp()}\n", encoding="utf-8")
+    store["clock"]["now"] = _at(10, 30)
+    assert get_due_jobs() == []
+    assert _ids() == []
+    assert not (cronjobs.CRON_DIR / "dispatch_held").exists()

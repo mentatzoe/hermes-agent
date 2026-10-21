@@ -69,7 +69,7 @@ def _note_dispatch_held(homes=None) -> None:
     """Dispatch is held (restart wait, drain, stop): mark each ticked store, so a one-shot that
     falls due now fires once afterwards instead of being retired by the next gateway's first scan
     (aleph-vault#221). ``homes``: the multiplex cycle's ``(name, home)`` pairs; None = the active
-    store. A failed marker write is logged and never stops the ticker."""
+    store. A failed marker write never stops the ticker."""
     from cron.oneshot_lateness import note_dispatch_held
 
     if homes is None:
@@ -632,6 +632,9 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                     _note_dispatch_held(cycle_homes)
+                    # A held cycle is healthy: reset any backoff, as the single-store loop does,
+                    # so the marker keeps its once-a-tick stamp.
+                    ok = _tick_error is None
                 else:
                     for _pname, home in cycle_homes:
                         try:

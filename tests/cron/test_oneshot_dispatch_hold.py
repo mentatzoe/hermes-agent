@@ -136,26 +136,28 @@ def test_without_a_hold_a_late_oneshot_is_still_retired(cron_store):
 
 
 def test_a_held_oneshot_more_than_two_hours_late_is_not_fired(cron_store, monkeypatch):
+    """The hold is still live (stamped a minute ago); only the 2 h ceiling stops the fire."""
     save_jobs([_oneshot("very-late", DUE_IN_WAIT)])
-    _hold_through_restart_wait(cron_store, monkeypatch)
-    cron_store["now"] = DUE_IN_WAIT + timedelta(seconds=oneshot_lateness.HELD_ONESHOT_MAX_LATE_SECONDS + 60)
+    late = DUE_IN_WAIT + timedelta(seconds=oneshot_lateness.HELD_ONESHOT_MAX_LATE_SECONDS + 60)
+    _hold_through_restart_wait(cron_store, monkeypatch, end=late - timedelta(minutes=1))
+    cron_store["now"] = late
     assert get_due_jobs() == []
     assert load_jobs() == []
 
 
 def test_hold_window_closes_once_the_marker_goes_unstamped(cron_store, monkeypatch):
-    """A scan removes the marker once no ticker has stamped it for 150 s, so a one-shot missed later
-    while nothing is held is retired as before."""
+    """A scan removes the marker once it can no longer cover a job (15 min unstamped), so a one-shot
+    missed later while nothing is held is retired as before."""
     save_jobs([])
     _hold_through_restart_wait(cron_store, monkeypatch)
-    cron_store["now"] = NEW_GATEWAY_FIRST_SCAN  # 84 s after the last stamp: a hold may still be live
+    cron_store["now"] = NEW_GATEWAY_FIRST_SCAN
     get_due_jobs()
     assert (cronjobs.CRON_DIR / "dispatch_held").exists()
-    cron_store["now"] = datetime(2026, 10, 20, 10, 15, tzinfo=timezone.utc)
+    cron_store["now"] = datetime(2026, 10, 20, 10, 27, 1, tzinfo=timezone.utc)
     get_due_jobs()
     assert not (cronjobs.CRON_DIR / "dispatch_held").exists()
 
-    missed_later = NEW_GATEWAY_FIRST_SCAN + timedelta(minutes=5)
+    missed_later = datetime(2026, 10, 20, 10, 40, tzinfo=timezone.utc)
     save_jobs([_oneshot("later", missed_later)])
     cron_store["now"] = missed_later + timedelta(minutes=10)
     assert get_due_jobs() == []
@@ -167,10 +169,10 @@ def test_a_marker_still_being_stamped_is_not_closed_by_a_scan(cron_store):
     survives, so the post-restart scan still sees the hold."""
     oneshot_lateness.note_dispatch_held()
     save_jobs([])
-    cron_store["now"] += timedelta(seconds=60)
+    cron_store["now"] += timedelta(minutes=8)  # a backed-off ticker's gap between stamps
     get_due_jobs()
     assert (cronjobs.CRON_DIR / "dispatch_held").exists()
-    cron_store["now"] += timedelta(seconds=120)
+    cron_store["now"] += timedelta(minutes=8)
     get_due_jobs()
     assert not (cronjobs.CRON_DIR / "dispatch_held").exists()
 

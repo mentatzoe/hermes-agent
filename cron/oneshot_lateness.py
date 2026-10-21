@@ -11,11 +11,13 @@ removed it unrun, leaving only a file in its output folder (aleph-vault#221).
   and every process's scan reads the same answer. A one-shot past its grace still fires once when
   it fell due between ``since`` and shortly after ``last``, the marker was stamped recently (a
   restart, not downtime), and it is at most ``HELD_ONESHOT_MAX_LATE_SECONDS`` late. A scan deletes
-  the marker only once nobody has stamped it for ``_RELEASE_SECONDS``: a CLI scan during the hold,
-  or one right after the hold ends, leaves it for the next gateway's first scan.
+  the marker only once it can no longer cover anything (unstamped for ``_TAIL_SECONDS``, or
+  stamped in the future), so no scan in any process can end a hold early. Stamping and deleting
+  both happen under the store's jobs lock.
 * **Late run.** A one-shot fired past its grace is stamped in ``last_dispatch`` and its prompt opens
   with when it was due. A hold-admitted claim carries ``until`` (due + the 2 h ceiling), which
-  ``clear_run_claim`` keeps, so a failed dispatch is retried only inside that window.
+  ``clear_run_claim`` keeps; past it, neither a due scan nor a queued worker's fire claim starts
+  the job, so a failed or delayed dispatch runs only inside that window.
 * **Skip notice.** A one-shot retired unrun also queues a notice in the durable delivery queue
   (``cron/deliveries.db``), which the gateway sends through the job's failure lane.
 """
@@ -30,11 +32,12 @@ logger = logging.getLogger("cron.jobs")
 # How late a held one-shot may still fire: the recurring catch-up ceiling (``_MAX_GRACE_SECONDS``).
 HELD_ONESHOT_MAX_LATE_SECONDS = 7200
 _MARKER = "dispatch_held"
-# A held ticker stamps on every tick (60 s); a marker this long unstamped belongs to no live hold.
-_RELEASE_SECONDS = 150.0
 # How long after its last stamp a hold still covers one-shots: the stopping gateway's last minute,
-# its exit, and the replacement's boot up to its first tick. Longer is downtime, not a restart.
+# its exit, and the replacement's boot up to its first tick. Longer is downtime, not a restart; it
+# also bounds the gap between two stamps of one hold (a held ticker stamps every tick, 60 s).
 _TAIL_SECONDS = 15 * 60.0
+# A stamp this far in the future is clock skew between writers; any further is not a live hold.
+_SKEW_SECONDS = 60.0
 # Job fields the delivery path reads; the notice must not carry the prompt or script.
 _NOTICE_JOB_FIELDS = ("id", "name", "deliver", "failure_deliver", "origin", "attach_to_session")
 
@@ -52,18 +55,25 @@ def _read_marker() -> Optional[Tuple[float, float]]:
         return None
 
 
+def _live(marker: Optional[Tuple[float, float]], now: float) -> bool:
+    """Whether a marker's last stamp is recent enough to belong to a hold that still covers jobs."""
+    return marker is not None and -_SKEW_SECONDS <= now - marker[1] <= _TAIL_SECONDS
+
+
 def note_dispatch_held() -> None:
     """The ticker is skipping dispatch for the active store (restart wait, drain, stop): stamp the
     marker. A hold stamped moments ago (by this process or the previous one) is the same gap and
-    keeps its start. A write failure costs this protection, never the tick."""
-    from cron.jobs import _hermes_now, _write_marker
+    keeps its start. Under the jobs lock, so a scan's delete can't land between the read and the
+    write. A write failure costs this protection, never the tick."""
+    from cron.jobs import _hermes_now, _jobs_lock, _write_marker
 
-    now = _hermes_now().timestamp()
-    previous = _read_marker()
-    since = previous[0] if previous and 0 <= now - previous[1] <= _TAIL_SECONDS else now
-    if previous is None or since != previous[0]:
-        logger.info("Cron dispatch held: a one-shot that falls due now fires once when it resumes")
-    _write_marker(_MARKER, f"{since} {now}\n", ".held_")
+    with _jobs_lock():
+        now = _hermes_now().timestamp()
+        previous = _read_marker()
+        since = previous[0] if _live(previous, now) else now
+        if previous is None or since != previous[0]:
+            logger.info("Cron dispatch held: a one-shot that falls due now fires once when it resumes")
+        _write_marker(_MARKER, f"{since} {now}\n", ".held_")
 
 
 def hold_covers(due_at: float, now: float) -> bool:
@@ -72,20 +82,17 @@ def hold_covers(due_at: float, now: float) -> bool:
     from cron.jobs import ONESHOT_GRACE_SECONDS
 
     marker = _read_marker()
-    if marker is None:
+    if not _live(marker, now):
         return False
     since, last = marker
-    return (now - last <= _TAIL_SECONDS
-            and since - ONESHOT_GRACE_SECONDS <= due_at <= last + _TAIL_SECONDS
+    return (since - ONESHOT_GRACE_SECONDS <= due_at <= last + _TAIL_SECONDS
             and now - due_at <= HELD_ONESHOT_MAX_LATE_SECONDS)
 
 
 def end_hold_window(now: float) -> None:
-    """After a due scan's save: once no ticker has stamped the marker for ``_RELEASE_SECONDS``, the
-    hold is over and a scan that could dispatch has claimed or fired what it covered, so normal
-    grace applies again. A marker that is still being stamped stays."""
-    marker = _read_marker()
-    if marker is not None and now - marker[1] < _RELEASE_SECONDS:
+    """After a due scan's save (under the jobs lock): drop a marker that can no longer cover any job,
+    so normal grace applies again. A marker that still could stays, whichever process scans."""
+    if _live(_read_marker(), now):
         return
     path = _marker_path()
     try:
@@ -108,12 +115,17 @@ def retry_claim(claim: Any) -> Optional[Dict[str, Any]]:
     return {key: claim[key] for key in ("outage", "until") if key in claim}
 
 
-def unexpired_claim(job: Dict[str, Any], now: float) -> Any:
-    """The job's ``run_claim``, or None once a hold-admitted claim is past its ``until``: from then
-    on the job is a miss like any other."""
+def claim_expired(job: Dict[str, Any], now: float) -> bool:
+    """A hold-admitted ``run_claim`` past its ``until``: the job may no longer start on schedule."""
     claim = job.get("run_claim")
     until = claim.get("until") if isinstance(claim, dict) else None
-    return None if isinstance(until, (int, float)) and now > until else claim
+    return isinstance(until, (int, float)) and now > until
+
+
+def unexpired_claim(job: Dict[str, Any], now: float) -> Any:
+    """The job's ``run_claim``, or None once it has expired: from then on the job is a miss like any
+    other."""
+    return None if claim_expired(job, now) else job.get("run_claim")
 
 
 def late_dispatch_stamp(next_run: str, now, lateness: float) -> Dict[str, Any]:
