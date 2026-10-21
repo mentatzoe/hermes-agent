@@ -1799,10 +1799,10 @@ DEFAULT_CONFIG = {
 
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
-        # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
-        # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
-        # created this way are user-owned in the same flat jobs table. Interactive toolsets
-        # (messaging/clarify) stay denied in cron regardless.
+        # Opt-in late never-run one-shots: 0 keeps the upstream 120s grace-only policy.
+        "oneshot_max_lateness_seconds": 0,
+        "notify_missed_oneshots": False,  # Failure lane after retirement; local opts out.
+        # Opt in to cronjob tools for cron agents; interactive tools stay denied.
         "allow_agent_scheduling": False,
         # Pre-dispatch validation: before building any agent machinery, verify the provider API key
         # resolves (unless a fallback chain exists), attached skills are ready, and delivery

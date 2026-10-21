@@ -1094,6 +1094,35 @@ next occurrence cannot be computed, the existing run-once fallback is preserved.
 This does not change one-shot expiry, resume behavior, or the hosted-provider sweep
 below. There is no per-job override.
 
+### Late one-shot jobs (opt-in)
+
+By default a never-run one-shot more than 120 seconds late is retired with a
+local diagnostic. To catch up after a restart or other downtime, configure the
+owning profile:
+
+```yaml
+cron:
+  oneshot_max_lateness_seconds: 21600  # default 0: upstream grace-only policy
+  notify_missed_oneshots: true        # default false
+```
+
+The cap is total seconds since the due time, inclusive; it never shortens the
+120-second grace. Non-positive, non-finite or invalid caps disable late catch-up.
+A never-run one-shot within the cap runs once through normal execution claims.
+Its agent prompt starts with when it was due and how late it is, and asks the
+agent to adjust time-bound wording or stay silent if it is no longer useful.
+Script-only jobs run unchanged; non-silent output gets a one-line late prefix.
+The note uses the current claimed schedule, including edits made before execution.
+
+Beyond the cap, the job is retired with the existing diagnostic. With notices
+on, successful retirement also sends one skip line through `failure_deliver`,
+or `deliver` when no failure override exists, with the normal origin/home
+fallback. `local` opts out of messaging. Delivery uses that profile's ticker
+adapters; failures are logged, not retried by a new queue. There is a crash gap
+between retirement and sending the notice; the local diagnostic remains.
+Recurring jobs, explicit manual/forced fires and store-outage recovery keep
+their existing policy. No restart marker or per-occurrence admission is stored.
+
 ### Misfire catch-up
 
 When an external scheduler provider is active (managed cron on hosted deployments), the gateway also runs a catch-up sweep: a job whose scheduled time passed with no fire delivered — and whose grace window has elapsed — is claimed and run locally, so an outage in the fire hand-off costs minutes instead of the whole day. The sweep is de-duplicated against late scheduler retries by the same store claim used for normal fires.

@@ -112,7 +112,9 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
-        due_jobs = _sched.get_due_jobs()
+        from cron.oneshot_lateness import skip_delivery_scope
+        with skip_delivery_scope(adapters, loop):
+            due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
         if not due_jobs:

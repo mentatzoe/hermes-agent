@@ -3160,26 +3160,9 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
 
 
 def _retire_expired_oneshot(d: _DueJob) -> bool:
-    """One-shot grace gate; True when the job must not fire this tick.
-
-    A one-shot beyond the grace window must never fire (create/update/resume reject such schedules
-    and recovery never revives them; only the due scan used to dispatch them hours late). With no
-    claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
-    still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
-    if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
-        return False
-    # Due during an outage of its store: it was skipped, not missed; fire it once on recovery.
-    if store_health.outage_covers(_current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS):
-        return False
-    claim = d.job.get("run_claim")
-    # An outage-covered claim that never reached its fire claim never started: it stays covered.
-    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
-        return False
-    if not (claim or d.job.get("fire_claim")):
-        _write_missed_oneshot_diagnostic(d.job, d.next_run)
-        d.scan.retire(d.job["id"])
-        d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
-    return True
+    """One-shot grace/cap gate; claims and store-outage recovery retain their existing rules."""
+    from cron.oneshot_lateness import retire_expired_oneshot
+    return retire_expired_oneshot(d)
 
 
 def _oneshot_dispatch_limit_reached(job: Dict[str, Any], scan: _DueScan) -> bool:
@@ -3301,8 +3284,10 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         # same HERMES_HOME must not re-dispatch it while in flight, and advancing next_run_at by a
         # fixed window is not enough for a run that outlives a tick. The other process sees the
         # fresh claim and skips; mark_job_run() clears it. The TTL only covers a tick that DIES.
+        from cron.oneshot_lateness import outage_exempt
+        outage = outage_exempt(d)
         claim = {"at": now.isoformat(), "by": _machine_id()}
-        if _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS:  # only an outage lets it through
+        if _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS and outage:
             claim["outage"] = True
         job["run_claim"] = claim
         scan.persist(job["id"], run_claim=claim)
