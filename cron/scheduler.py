@@ -2969,6 +2969,9 @@ def _compose_run_delivery(
                 # The one alert on entering a provider-window hold says so (#89376).
                 + hold_notice(job, job.get("_quota_hold_seconds"))
             )
+    if not success:
+        from cron.oneshot_lateness import script_failure_delivery
+        deliver_content = script_failure_delivery(job, deliver_content, final_response)
     return deliver_content, blocked_config, blocked_config_silent, incident_acked, failure_incident_id
 
 

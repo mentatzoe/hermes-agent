@@ -135,7 +135,10 @@ def test_recurring_unchanged(rig, catch_up):
 
 
 @pytest.mark.parametrize("target_profile", ["default", "secondary"])
-def test_named_launch_multiplex_uses_actual_profile_delivery(rig, monkeypatch, target_profile):
+@pytest.mark.parametrize("originless,multiplex", [(False, True), (True, True), (True, False)])
+def test_named_launch_multiplex_uses_actual_profile_delivery(
+    rig, monkeypatch, target_profile, originless, multiplex,
+):
     import asyncio
     from concurrent.futures import Future
     import threading
@@ -148,15 +151,21 @@ def test_named_launch_multiplex_uses_actual_profile_delivery(rig, monkeypatch, t
     root = rig[0]
     launch = root / "profiles" / "named"
     secondary = root / "profiles" / "secondary"
-    for home in (launch, secondary):
-        home.mkdir(parents=True)
-        (home / "config.yaml").write_text((root / "config.yaml").read_text())
+    for home in (root, launch, secondary):
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".env").write_text("DISCORD_HOME_CHANNEL=123\n")
+        if home != root:
+            (home / "config.yaml").write_text((root / "config.yaml").read_text())
+    monkeypatch.setenv("DISCORD_HOME_CHANNEL", "launch-channel-must-not-leak")
+    monkeypatch.setattr("hermes_constants.get_routing_process_hermes_home", lambda: launch)
     monkeypatch.setenv("HERMES_HOME", str(launch))
     monkeypatch.setenv("HERMES_PROFILE", "named")
     target_home = root if target_profile == "default" else secondary
     with _profile_cron_scope(target_home):
-        late_job(rig)
-        late_job(rig, 7 * 3600)
+        for lag in (1800, 7 * 3600):
+            job, _ = late_job(rig, lag)
+            if originless:
+                jobs.update_job(job["id"], {"deliver": "origin"})
 
     delivered = []
 
@@ -197,11 +206,18 @@ def test_named_launch_multiplex_uses_actual_profile_delivery(rig, monkeypatch, t
 
     monkeypatch.setattr(scheduler, "tick", one_cycle)
     provider = InProcessCronScheduler()
-    provider.start(stop, interval=0, loop=loop,
-                   profile_homes=[("default", root), ("named", launch), ("secondary", secondary)],
-                   adapters={Platform.DISCORD: primary}, default_profile="default",
-                   profile_adapters={"named": {Platform.DISCORD: named},
-                                     "secondary": {Platform.DISCORD: satellite}})
+    from agent.secret_scope import set_multiplex_context, reset_multiplex_context, current_secret_scope
+    token = set_multiplex_context(multiplex)
+    previous_scope = current_secret_scope()
+    try:
+        provider.start(stop, interval=0, loop=loop,
+                       profile_homes=[("default", root), ("named", launch), ("secondary", secondary)],
+                       adapters={Platform.DISCORD: primary}, default_profile="default",
+                       profile_adapters={"named": {Platform.DISCORD: named},
+                                         "secondary": {Platform.DISCORD: satellite}})
+        assert current_secret_scope() is previous_scope
+    finally:
+        reset_multiplex_context(token)
     assert len(rig[2]) == 1
     assert len(delivered) == 2
     assert any("Skipped" in row[2] for row in delivered)
@@ -265,3 +281,51 @@ def test_skip_uses_failure_override_not_other_lane(rig):
     jobs.update_job(job["id"], {"failure_deliver": "discord:456"})
     assert scheduler.tick(verbose=False) == 0
     assert rig[3][0][3][0]["chat_id"] == "456"
+
+
+@pytest.mark.parametrize("defaults", [False, True])
+def test_cap_never_retires_an_external_inflight_fire(rig, defaults):
+    if defaults:
+        (rig[0] / "config.yaml").write_text("cron: {}\n")
+    job, _ = late_job(rig)
+    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
+    assert isinstance(claimed, dict)
+    assert jobs.claim_dispatch(job["id"])
+    assert jobs.get_due_jobs() == []
+    stored = jobs.get_job(job["id"])
+    assert stored and stored["fire_claim"] == claimed["fire_claim"]
+    assert jobs.mark_job_run(job["id"], True, expected_fire_owner=claimed["fire_claim"]["by"])
+    assert jobs.get_job(job["id"])["last_run_at"]
+
+
+def test_failed_script_late_prefix_survives_normal_failure_composer(rig, monkeypatch):
+    _, due = late_job(rig, no_agent=True, script="fixture.py")
+    monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat",
+                        lambda *a, **kw: (False, "Script exited with code 1"))
+    assert scheduler.tick(verbose=False) == 1
+    assert len(rig[3]) == 1
+    assert rig[3][0][0].startswith("This one-off job is running late")
+    assert due in rig[3][0][0] and "failed" in rig[3][0][0]
+
+
+def test_failed_script_note_does_not_unsuppress_acked_incident(rig, monkeypatch):
+    late_job(rig, no_agent=True, script="fixture.py")
+    monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat",
+                        lambda *a, **kw: (False, "Script exited with code 1"))
+    monkeypatch.setattr(scheduler, "_upsert_incident_for_failure", lambda *a, **kw: (True, "acked"))
+    assert scheduler.tick(verbose=False) == 1
+    assert not rig[3]
+
+
+@pytest.mark.parametrize("ok", [False, True])
+def test_script_note_uses_start_time_not_long_runtime(rig, monkeypatch, ok):
+    late_job(rig, 30, no_agent=True, script="fixture.py")
+
+    def long_script(*args, **kwargs):
+        rig[1][0] += timedelta(hours=1)
+        return ok, "script result"
+
+    monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat", long_script)
+    assert scheduler.tick(verbose=False) == 1
+    assert len(rig[3]) == 1
+    assert "one-off job is running late" not in rig[3][0][0]

@@ -10,6 +10,7 @@ import math
 
 logger = logging.getLogger("cron.scheduler")
 _skip_delivery: ContextVar[list | None] = ContextVar("oneshot_skip_delivery", default=None)
+_LATE_PREFIX = "This one-off job is running late:"
 
 
 def max_lateness_seconds():
@@ -32,7 +33,7 @@ def retire_expired_oneshot(d):
     if late <= jobs.ONESHOT_GRACE_SECONDS or outage_exempt(d):
         return False
     automatic = d.job.get("manual_run_at") != d.next_run and not d.job.get("last_run_at")
-    if automatic and late <= max_lateness_seconds():
+    if automatic and not d.job.get("fire_claim") and late <= max_lateness_seconds():
         return False
     # Preserve upstream's in-flight guard: a stale lease is not proof that a run never started.
     if not (d.job.get("run_claim") or d.job.get("fire_claim")):
@@ -53,7 +54,8 @@ def _one_line(value):
 def _send_skip(job, text, adapters=None, loop=None):
     from cron import scheduler
     try:
-        error = scheduler._deliver_result(job, text, adapters=adapters, loop=loop, for_failure=True)
+        with scheduler._fire_secret_scope():
+            error = scheduler._deliver_result(job, text, adapters=adapters, loop=loop, for_failure=True)
         if error:
             logger.error("One-off skip notice delivery failed for %s: %s", job["id"], error)
     except Exception:
@@ -101,7 +103,18 @@ def late_note(job, *, agent=False):
     late = jobs._elapsed_seconds(jobs._hermes_now(), due)
     if late <= jobs.ONESHOT_GRACE_SECONDS:
         return ""
-    text = f"This one-off job is running late: due {job['next_run_at']}; {late:.0f} seconds late."
+    text = f"{_LATE_PREFIX} due {job['next_run_at']}; {late:.0f} seconds late."
     if agent:
         text += " Adjust time-bound wording to the actual time, or stay silent if it is no longer useful."
     return text + ("\n\n" if agent else "\n")
+
+
+def script_failure_delivery(job, content, final_response):
+    """Keep the script's start-time note when failure composition replaces its alert.
+
+    Do not resurrect an acknowledged/suppressed failure, or recalculate after a long script.
+    """
+    if (job.get("no_agent") and content and isinstance(final_response, str)
+            and final_response.startswith(_LATE_PREFIX)):
+        return final_response.partition("\n")[0] + "\n" + content
+    return content
