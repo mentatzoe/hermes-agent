@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +12,13 @@ import pytest
 
 from gateway import hosted_room_driver as state
 from gateway import hosted_rooms
+from tests.tui_gateway.hosted_room_runtime_support import (
+    WAIT_TIMEOUT,
+    DeadlineClock,
+    RecordingTurnLocks,
+    managed_runtimes as managed_runtimes,
+    wait_for as _wait_for,
+)
 from tui_gateway.hosted_room_driver import (
     MAX_TERMINAL_TEXT_BYTES,
     ROOM_SESSION_SOURCE,
@@ -34,27 +40,6 @@ BINDING = HostedRoomBinding(
     gateway_id="gateway-a",
     authority_epoch=1,
 )
-
-
-class RecordingTurnLocks:
-    """Record the profile lock and expose ownership to the fake RPC."""
-
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str]] = []
-        self.local = threading.local()
-
-    @contextmanager
-    def __call__(self, profile: str):
-        self.events.append(("lock-enter", profile))
-        self.local.profile = profile
-        try:
-            yield
-        finally:
-            self.events.append(("lock-exit", profile))
-            self.local.profile = None
-
-    def held_for(self, profile: str) -> bool:
-        return getattr(self.local, "profile", None) == profile
 
 
 class FakeSessionRPC:
@@ -411,24 +396,19 @@ def _runtime(
     locks: RecordingTurnLocks | None = None,
     **kwargs,
 ) -> HostedRoomRuntime:
+    # Task-fence tests must not expire their lease during unrelated filesystem stalls.
+    # Recovery tests that advance time pass their own clock explicitly.
+    now = time.time()
     return HostedRoomRuntime(
         db_path=db,
         rooms=[BINDING],
         rpc=rpc,
         turn_lock=locks or RecordingTurnLocks(),
+        clock=kwargs.pop("clock", lambda: now),
         lease_ttl_seconds=kwargs.pop("lease_ttl_seconds", 0.4),
         poll_interval_seconds=kwargs.pop("poll_interval_seconds", 0.01),
         **kwargs,
     )
-
-
-def _wait_for(predicate, *, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.01)
-    raise AssertionError("condition was not reached before timeout")
 
 
 def test_runtime_uses_unique_process_generation(db: Path):
@@ -532,6 +512,7 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
         rooms=[BINDING],
         transport_resolver=resolve_transport,
         turn_lock=RecordingTurnLocks(),
+        clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
         poll_interval_seconds=0.01,
     )
@@ -665,13 +646,14 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
             waiting if binding.room_id == "room-waiting" else healthy
         ),
         turn_lock=RecordingTurnLocks(),
+        clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
 
     runtime.start()
-    assert waiting.submitted.wait(1.0)
+    assert waiting.submitted.wait(WAIT_TIMEOUT)
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
     assert state.get_task(db, identities[0])["status"] == "running"
     assert runtime.stop(timeout=5.0)
@@ -713,6 +695,7 @@ def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
         rooms=bindings,
         rpc=FakeSessionRPC(),
         turn_lock=RecordingTurnLocks(),
+        clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
@@ -863,14 +846,15 @@ def test_expired_local_attempt_defers_without_hydrating_or_resubmitting(db: Path
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
-def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Path):
+def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Path, monkeypatch):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
+    DeadlineClock(monkeypatch)  # Completion must settle even though the deadline never advances.
     runtime = _runtime(db, rpc, turn_timeout_seconds=30)
 
     runtime.start()
-    assert rpc.submitted.wait(timeout=5.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     rpc.complete(
         identity.task_id,
         content="é" * (MAX_TERMINAL_TEXT_BYTES + 100),
@@ -945,10 +929,18 @@ def test_peer_recovery_probe_is_bounded_by_attempt_and_stale_age(db: Path):
     assert state.get_task(db, identity)["status"] == "deferred"
 
 
-def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Path):
+def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Path, monkeypatch):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
+    deadline = DeadlineClock(monkeypatch)
+
+    def expire_after_observation():
+        if deadline.monotonic() == 100.0:
+            assert state.get_task(db, identity)["status"] == "running"
+        deadline.expire()
+
+    rpc.on_info = expire_after_observation
     published = []
     runtime = _runtime(
         db,
@@ -967,11 +959,13 @@ def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Pat
     assert failed["result"]["timeout_seconds"] == 0.05
     assert failed["result"]["error"]
     assert failed["cancel_id"] == "deadline:1"
-    assert [call for call in rpc.calls if call[0] == "interrupt"]
+    interrupts = [params for method, params in rpc.calls if method == "interrupt"]
+    assert [params["expected_task_id"] for params in interrupts] == [identity.task_id]
+    assert failed["execution_generation"] == 1
     assert [task["status"] for task in published] == ["failed"]
 
 
-def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
+def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path, monkeypatch):
     db = tmp_path / "state.db"
     bindings = [
         HostedRoomBinding("room-stuck", "gateway-a", 1),
@@ -1008,11 +1002,14 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
             return result
 
     rpc = FirstRoomStallsRPC(auto_complete=False)
+    deadline = DeadlineClock(monkeypatch)
+    rpc.on_info = deadline.expire
     runtime = HostedRoomRuntime(
         db_path=db,
         rooms=bindings,
         rpc=rpc,
         turn_lock=RecordingTurnLocks(),
+        clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
         poll_interval_seconds=0.02,
         active_poll_interval_seconds=0.01,
@@ -1091,9 +1088,12 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
     )
     runtime = _runtime(db, rpc, clock=clock)
 
+    # Observe the prior receipt before stopping; elapsed sleep proves no observation.
+    observed = threading.Event()
+    rpc.on_info = observed.set
     runtime.start()
-    assert rpc.submitted.wait(1.0)
-    time.sleep(0.04)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
+    assert observed.wait(WAIT_TIMEOUT)
     assert runtime.stop(timeout=5.0)
 
     task = state.get_task(db, identity)
@@ -1124,8 +1124,7 @@ def test_active_recovered_turn_is_never_resubmitted(db: Path):
     rpc.add_session(active=True, task_id=identity.task_id)
     runtime = _runtime(db, rpc)
 
-    runtime.start()
-    time.sleep(0.08)
+    runtime._run_cycle()
     assert runtime.stop(timeout=5.0)
 
     assert state.get_task(db, identity)["status"] == "running"
@@ -1463,7 +1462,7 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
     runtime = _runtime(db, rpc)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     _wait_for(
         lambda: (
             "observation failed after submit"
@@ -1494,11 +1493,10 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     )
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     cancelled = runtime.cancel(identity, cancel_id="cancel-user")
     rpc.complete(identity.task_id, content="Too late.")
     runtime.wakeup()
-    time.sleep(0.05)
     assert runtime.stop(timeout=5.0)
 
     assert cancelled["status"] == "cancelled"
@@ -1519,12 +1517,13 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
         attempts += 1
         if attempts == 1:
             raise RuntimeError("temporary stop transport failure")
-        assert retry_allowed.wait(1.0)
+        if not retry_allowed.is_set():
+            raise RuntimeError("stop retry not released yet")
         return original_interrupt(**kwargs)
 
     rpc.interrupt = flaky_interrupt
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     stopping = runtime.cancel(identity, cancel_id="cancel-retry")
     assert stopping["status"] == "stopping"
     assert state.get_task(db, identity)["status"] == "stopping"
@@ -1670,7 +1669,7 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     runtime = _runtime(db, rpc)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
 
     def finish_only_after_stop_intent():
         if state.get_task(db, identity)["status"] == "stopping":
@@ -1863,7 +1862,7 @@ def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
     )
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     session_id = next(iter(rpc.states))
     with rpc._lock:
         rpc.states[session_id]["pending_approval"] = {
@@ -1888,7 +1887,7 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
     runtime = _runtime(db, rpc)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     session_id = next(iter(rpc.states))
 
     def switch_to_newer_task() -> None:
@@ -1951,7 +1950,7 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(WAIT_TIMEOUT)
     hosted_rooms.claim_authority(
         db,
         room_id=ROOM_ID,
