@@ -3618,7 +3618,7 @@ class TestOrphanedOwnerReclaim:
             if pid not in procs:
                 raise fake_psutil.NoSuchProcess(pid)
             if pid not in made:
-                proc = MagicMock()
+                proc = MagicMock(_proc=None)  # public-only psutil fake
                 proc.pid = pid
                 proc.create_time.return_value = procs[pid]
                 made[pid] = proc

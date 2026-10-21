@@ -40,6 +40,7 @@ def _fake_psutil(procs: dict[int, float]):
         if pid not in procs:
             raise _FakeNoSuchProcess(pid)
         proc = MagicMock()
+        proc._proc = None  # this fake exposes only psutil's public creation-time API
         proc.pid = pid
         proc.create_time.return_value = procs[pid]
         return proc

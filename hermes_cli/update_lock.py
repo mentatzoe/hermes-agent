@@ -229,7 +229,9 @@ def process_create_time(pid: int | None = None) -> float | None:
     except ImportError:
         return _stdlib_create_time(target)
     try:
-        return float(psutil.Process(target).create_time())
+        from hermes_cli.process_start_time import process_create_time as psutil_create_time
+
+        return psutil_create_time(psutil.Process(target))
     except Exception:  # health: allow BLE001 -- liveness probe: any psutil failure degrades to the stdlib probe
         return _stdlib_create_time(target)
 

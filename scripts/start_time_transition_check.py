@@ -22,11 +22,18 @@ with ``--restarting``, and again after it without.
 The report ends with the live owner pids: each must run the new code or be gone once the
 restart is done, because an old-code owner that survives it can stamp a shifted record later.
 
-One comparator for every family: the recorded start must EQUAL the pid's unadjusted reading (a
-composed Kanban fingerprint also needs the same epoch). psutil's adjustment is whole seconds, a
-new-code writer records the unadjusted value, and an old-code writer with no step active records
-the same value, so any difference means a shifted record. That is stricter than every reader
-(several tolerate 2 s), so DRAINED holds for all of them, including the exact ones.
+Native fingerprints must match exactly (a composed Kanban fingerprint also needs the same epoch).
+Float births are compared separately in epoch seconds at their writer's precision: exact floats,
+rounded milliseconds for spawn tags / ct: stamps, or whole seconds for the stdlib updater probe.
+A one-second psutil adjustment fails even for those rounded formats. The gate is intentionally
+stricter than tolerant production readers; it does not add a tolerance to any runtime guard.
+
+The check is a snapshot, not proof of a coordinated stop. Stop every old-code reader and writer
+before starting any new reader, including CLI/Kanban sessions, surviving spawners, dashboards,
+local runtimes and restart-safe cron children. --restarting is only a preflight declaration;
+verify those exact process incarnations exited, then run without it while stopped and again
+after startup. Inventory owners without retained records as well. Verify the pinned macOS psutil
+private API: an unsupported monotonic=True path falls back to the public, adjustable reading.
 
 Read-only: JSON and text are only read; SQLite opens with ``immutable=1`` when there is no
 ``-wal``, ``mode=ro`` when both ``-wal`` and ``-shm`` exist (no file is created and no database
@@ -82,18 +89,27 @@ Records checked (writer -> new-code readers):
   and ``.hermes-update-paused-gateways.*.json`` (``target_start_time``, ``ct``):
   gateway/status.py:1952, :1687 and hermes_cli/update_pause_record.py:828,
   update_cmd_posix_pause.py:392.
-Not checked, because their readers never used ``get_process_start_time`` and this change doesn't
-touch them: hermes_cli/active_sessions.py:301, hermes_cli/process_identity.py:64 and
-gateway/lifecycle_ledger.py:110 (public ``create_time()`` floats); in-memory baselines (MCP,
-terminal pgid, browser daemon, ``--replace`` and profile kill guards), which end with their
-process. Every ``<home>/profiles/*`` home is checked the same way unless ``--no-profiles``.
+Additional float records (aleph-vault #233): ``spawn-ledger.json`` child and spawner births;
+``runtime/active_sessions.json`` lease births; local-runtime child and owner births (including
+float-only records); legacy host ``createTime``; running ``state/gateway.lifecycle.json`` and
+``logs/update_receipts/*.json``. Pause records and claim files distinguish their native integer
+``ct`` from rounded ``ct:<seconds>`` owner/claimer stamps and token.identities mappings.
+``.hermes-update-in-progress`` includes owner and delegate stamps. Bot Desktop's launcher.pid
+has an epoch-seconds birth (launching the desktop itself remains Linux-only).
+
+Not checked: in-memory baselines, which end with their process; legacy records without a birth;
+and checkout-scoped update locks outside --home. Stop their verified owners with the coordinated
+transition; the scan never substitutes for that inventory. Every ``<home>/profiles/*`` home is
+checked the same way unless ``--no-profiles``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -107,13 +123,16 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-EXACT, KANBAN = "exact", "kanban"
+EXACT, KANBAN, SECONDS, MILLIS = "exact", "kanban", "seconds", "millis"
 _TERMINAL_RUN_STATUSES = ("completed", "failed", "cancelled", "interrupted")  # api_server_run_idempotency.py:19
-# JSON (pid key, start key) pairs persisted by the writers above; the generic walk finds them at
-# any depth (``gateway_state.json``'s per-platform writer stamps, update-pause entries).
+# These fields carry native fingerprints. Epoch-second births below must never be
+# compared with rounded centiseconds (or Linux's /proc ticks).
 _JSON_PAIRS = (("pid", "start_time"), ("pid", "startTime"), ("pid", "ct"), ("pid", "host_start_time"),
                ("owner_pid", "owner_start_time"), ("target_pid", "target_start_time"),
                ("writer_pid", "writer_start_time"))
+_JSON_FLOAT_PAIRS = (("pid", "create_time"), ("pid", "createTime"), ("pid", "process_start_time"),
+                     ("pid", "pid_create_time"), ("writer_pid", "writer_create_time"),
+                     ("spawner_pid", "spawner_create"), ("owner_pid", "owner_create_time"))
 
 
 @dataclass(frozen=True)
@@ -121,7 +140,7 @@ class Record:
     source: str  # file and row/key, for the report
     pid: int
     recorded: Any
-    rule: str  # EXACT | KANBAN (composed fingerprint: same epoch too)
+    rule: str  # native EXACT/KANBAN fingerprint, or epoch SECONDS/MILLIS birth
 
 
 @dataclass(frozen=True)
@@ -202,16 +221,27 @@ def _walk_json(source: str, data: Any, rule: str) -> Iterator[Record]:
         return
     if data.get("pid_scope") not in (None, "host"):
         return  # a sandbox/container pid (tools/process_registry.py:552) isn't a host pid
-    for pid_key, start_key in _JSON_PAIRS:
-        pid = _as_pid(data.get(pid_key))
-        if pid is not None and data.get(start_key) is not None:
-            yield Record(f"{source}:{start_key}", pid, data[start_key], rule)
+    pairs = _JSON_FLOAT_PAIRS if rule == SECONDS else _JSON_PAIRS
+    for pid_key, start_key in pairs:
+        pid, started = _as_pid(data.get(pid_key)), data.get(start_key)
+        if pid is not None and started is not None:
+            pair_rule = MILLIS if start_key == "spawner_create" else rule
+            if start_key == "ct" and isinstance(started, str) and started.startswith("ct:"):
+                started, pair_rule = started[3:], MILLIS
+            yield Record(f"{source}:{start_key}", pid, started, pair_rule)
+    if rule == EXACT and isinstance(data.get("identities"), dict):
+        for pid_text, started in data["identities"].items():
+            pid = _as_pid(pid_text)
+            if pid is not None and started is not None:
+                value = started.removeprefix("ct:") if isinstance(started, str) else started
+                yield Record(f"{source}.identities.{pid_text}", pid, value, MILLIS)
     for key, value in data.items():
         if isinstance(value, (dict, list)):
             yield from _walk_json(f"{source}.{key}", value, rule)
 
 
-def _json_records(paths: list[Path], rule: str = EXACT) -> Iterator[Record]:
+def _json_records(paths: list[Path], rule: str = EXACT,
+                  active: Optional[Callable[[Any], bool]] = None) -> Iterator[Record]:
     for path in paths:
         if path.is_file():
             try:
@@ -219,7 +249,8 @@ def _json_records(paths: list[Path], rule: str = EXACT) -> Iterator[Record]:
             except _Unparsed:
                 yield Record(f"{path} (unparseable)", 0, None, "unparsed")
                 continue
-            yield from _walk_json(str(path), data, rule)
+            if active is None or active(data):
+                yield from _walk_json(str(path), data, rule)
 
 
 # ── record families ───────────────────────────────────────────────────────────────────────────
@@ -277,20 +308,58 @@ def whatsapp_records(home: Path) -> Iterator[Record]:
             yield Record(f"{path}:line 2", pid, start, EXACT)
 
 
+def update_marker_records(path: Path) -> Iterator[Record]:
+    """Update-marker owner/delegate births are rounded to milliseconds, not native ticks."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return
+    if len(lines) >= 3 and lines[2].strip().startswith("ct:"):
+        pid = _as_pid(lines[0])
+        if pid is not None:
+            yield Record(f"{path}:owner", pid, lines[2].strip()[3:], MILLIS)
+    for line in lines[3:]:
+        match = re.fullmatch(r"delegate:([0-9]+) ct:([0-9]+(?:\.[0-9]+)?)", line.strip())
+        if match and _as_pid(match[1]) is not None:
+            yield Record(f"{path}:delegate", int(match[1]), match[2], MILLIS)
+            break  # the production reader uses the first well-formed delegate
+
+
+def float_file_records(home: Path) -> Iterator[Record]:
+    paths = [home / "spawn-ledger.json", home / "runtime" / "active_sessions.json",
+             home / "runtimes" / "llamacpp" / "server.json"]
+    yield from _json_records(paths, SECONDS)
+    yield from _json_records([home / "state" / "gateway.lifecycle.json"], SECONDS,
+                            active=lambda data: isinstance(data, dict) and data.get("phase") == "running")
+    yield from _json_records(sorted((home / "logs" / "update_receipts").glob("*.json")), SECONDS,
+                            active=lambda data: isinstance(data, dict) and data.get("outcome") == "running")
+    yield from update_marker_records(home / ".hermes-update-in-progress")
+    path = home / "bot-desktop" / "launcher.pid"
+    if path.is_file():
+        fields = path.read_text(encoding="utf-8-sig").split()
+        if len(fields) == 2 and _as_pid(fields[0]) is not None:
+            yield Record(str(path), int(fields[0]), fields[1], SECONDS)
+
+
 def home_file_records(home: Path) -> Iterator[Record]:
+    pauses = [p for p in sorted(home.glob(".hermes-update-paused-gateways.*"))
+              if p.suffix in (".json", ".claim")]
     exact = [home / "gateway.pid", home / "gateway.lock", home / "gateway_state.json",
              home / "processes.json", home / ".gateway-planned-stop.json", home / ".gateway-takeover.json",
-             *sorted(home.glob(".hermes-update-paused-gateways.*.json"))]
+             *pauses]
     for sub in ("process_markers", "provider_setup_markers"):
         exact += sorted((home / "telemetry" / "shared_metrics" / sub).glob("*.json*"))
     exact += sorted((home / "cache" / "browser-use" / "lightpanda").glob("*.json"))
     exact.append(home / "runtimes" / "llamacpp" / "server.json")
     yield from _json_records(exact)
+    yield from float_file_records(home)
     yield from whatsapp_records(home)
 
 
 def lock_dir_records(lock_dir: Path) -> Iterator[Record]:
-    yield from _json_records(sorted(lock_dir.glob("*.lock")) + sorted(lock_dir.glob("host-*.json")))
+    paths = sorted(lock_dir.glob("*.lock")) + sorted(lock_dir.glob("host-*.json"))
+    yield from _json_records(paths)
+    yield from _json_records(paths, SECONDS)
 
 
 def default_lock_dir() -> Path:
@@ -360,13 +429,50 @@ def _matches(record: Record, current: Any) -> bool:
     return recorded_half is not None and recorded_half == current_half
 
 
+def _raw_birth(pid: int) -> Optional[float]:
+    import psutil
+    from hermes_cli.process_start_time import process_create_time
+
+    try:
+        return process_create_time(psutil.Process(pid))
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
+
+
+def _as_birth(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _judge_birth(record: Record, current: Any) -> Verdict:
+    recorded, actual = _as_birth(record.recorded), _as_birth(current)
+    if actual is None:
+        return Verdict(record, "unreadable")
+    matches = recorded == actual
+    if record.rule == MILLIS and recorded is not None:
+        # Spawn tags / ct: stamps round to 3 decimals. The stdlib-only updater's
+        # ps lstart probe has whole-second precision, represented as .000.
+        matches = (matches or recorded == round(actual, 3)
+                   or (recorded.is_integer() and recorded == math.floor(actual)))
+    diff = None if recorded is None else int(round((recorded - actual) * 100))
+    return Verdict(record, "ok" if matches else "differs", current, diff)
+
+
 def judge(record: Record, alive: Callable[[int], bool] = _pid_alive,
           raw: Callable[[int], Optional[int]] = _raw_start,
-          kanban: Callable[[int], Optional[str]] = _kanban_current) -> Verdict:
+          kanban: Callable[[int], Optional[str]] = _kanban_current,
+          birth: Callable[[int], Optional[float]] = _raw_birth) -> Verdict:
     if record.rule == "unparsed":
         return Verdict(record, "unparsed")
     if not alive(record.pid):
         return Verdict(record, "dead")
+    if record.rule in (SECONDS, MILLIS):
+        return _judge_birth(record, birth(record.pid))
     composed = record.rule == KANBAN and isinstance(record.recorded, str) and "|" in record.recorded
     current = kanban(record.pid) if composed else raw(record.pid)
     if current is None:

@@ -303,7 +303,9 @@ def _process_start_time(pid: int) -> Optional[float]:
     # keep a stale lease alive indefinitely.
     try:
         import psutil  # type: ignore
-        return float(psutil.Process(pid).create_time())
+        from hermes_cli.process_start_time import process_create_time
+
+        return process_create_time(psutil.Process(pid))
     except Exception:
         return None
 
