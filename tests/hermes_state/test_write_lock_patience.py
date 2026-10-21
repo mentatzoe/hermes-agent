@@ -46,6 +46,25 @@ def db(tmp_path):
     d.close()
 
 
+@pytest.fixture
+def write_lock(db):
+    """Keep a real lock until the caller releases it; exercise Python's retry budget.
+
+    A native SQLite busy wait can outlast a shortened application budget and
+    succeed without ever returning SQLITE_BUSY. Disable only that inner wait on
+    this test connection. The multi-second tests retain production timeouts.
+    """
+    previous_ms = db._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    db._conn.execute("PRAGMA busy_timeout=0")
+    holder = sqlite3.connect(str(db.db_path), timeout=0, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        yield holder
+    finally:
+        holder.close()  # rolls back if the test has not already released the lock
+        db._conn.execute(f"PRAGMA busy_timeout={previous_ms}")
+
+
 class TestTranscriptWritePatience:
     def test_append_message_survives_multi_second_lock_hold(self, db, tmp_path):
         """A transcript append must ride out a lock held well past the old
@@ -81,26 +100,43 @@ class TestTranscriptWritePatience:
         assert db._WRITE_PATIENCE_S >= 10.0
         assert db._TRANSCRIPT_WRITE_PATIENCE_S >= 30.0
 
-    def test_exhausted_patience_names_the_real_cause(self, db, monkeypatch):
-        """When patience genuinely runs out, the error must say the lock was
-        held by another process — not read like disk/permission damage."""
-        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
+    def test_exhausted_patience_names_the_real_cause(self, db, monkeypatch, write_lock):
+        """A lock still held at exhaustion must not read like disk/permission damage."""
+        patience_s = 0.2
+        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", patience_s)
 
-        started = threading.Event()
-        holder = threading.Thread(
-            target=_hold_write_lock, args=(db.db_path, 2.0, started)
-        )
-        holder.start()
-        try:
-            assert started.wait(5.0)
-            with pytest.raises(sqlite3.OperationalError) as excinfo:
-                db.set_meta("k", "v")  # routine write, short patience
-        finally:
-            holder.join(timeout=10.0)
-        assert not holder.is_alive()
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            db.set_meta("k", "v")  # routine write, short patience
+        assert time.monotonic() - t0 >= patience_s
         text = str(excinfo.value)
         assert "another Hermes process" in text
         assert "healthy" in text
+        cause = excinfo.value.__cause__
+        assert isinstance(cause, sqlite3.OperationalError)
+        assert cause.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
+        assert db.get_meta("k") is None
+
+        # Exhaustion did not persist the write or damage the store: release the
+        # very same lock and retry successfully on the same SessionDB connection.
+        write_lock.execute("COMMIT")
+        db.set_meta("k", "v")
+        assert db.get_meta("k") == "v"
+
+    def test_write_retries_after_lock_is_released(self, db, monkeypatch, write_lock):
+        """A genuine SQLite busy error followed by release must recover, not exhaust."""
+        real_retry = db._sleep_before_write_retry
+        retries = []
+
+        def release_before_retry(deadline, patience_s):
+            retries.append(patience_s)
+            write_lock.execute("COMMIT")
+            return real_retry(deadline, patience_s)
+
+        monkeypatch.setattr(db, "_sleep_before_write_retry", release_before_retry)
+        db.set_meta("released", "persisted")
+        assert retries == [db._WRITE_PATIENCE_S]
+        assert db.get_meta("released") == "persisted"
 
     def test_write_succeeds_immediately_when_uncontended(self, db):
         """Patience must cost nothing when there is no contention."""
