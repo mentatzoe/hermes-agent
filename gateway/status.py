@@ -26,6 +26,7 @@ from gateway.status_inline_source import (
     inline_bootstrap_argv,
     inline_source_flag_index,
 )
+from gateway.status_persistence import merge_runtime_status_on_disk
 from gateway.status_start_time import (  # noqa: F401 -- re-exported for callers
     START_TIME_DRIFT_TOLERANCE,
     _start_times_agree,
@@ -132,21 +133,23 @@ class _RuntimeStatusWriter:
                 self._pending = None
                 self._writing_generation = generation
             error: Optional[BaseException] = None
+            persisted = False
             try:
-                (self._write_fn or _write_json_file)(path, _merge_over_on_disk(path, payload))
+                merged = merge_runtime_status_on_disk(path, payload)
+                if merged is not None:
+                    (self._write_fn or _write_json_file)(path, merged)
+                    persisted = True
             except BaseException as exc:
                 error = exc
             with self._condition:
                 self._writing_generation = 0
                 self._completed_generation = max(self._completed_generation, generation)
-                if error is None:
+                if persisted:
                     self._successful_generation = max(self._successful_generation, generation)
-                    self._last_error = None
-                else:
-                    self._last_error = error
+                self._last_error = error
                 self._condition.notify_all()
             if error is None:
-                if self._failure_logged:
+                if persisted and self._failure_logged:
                     logger.info("Gateway runtime-status persistence recovered")
                     self._failure_logged = False
             elif not self._failure_logged:
@@ -160,14 +163,6 @@ class _RuntimeStatusWriter:
 _runtime_status_state_lock = threading.RLock()
 _runtime_status_state_path: Optional[Path] = None
 _runtime_status_state: Optional[dict[str, Any]] = None
-
-
-def _merge_over_on_disk(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
-    """Lay the canonical snapshot over whatever is on disk right before writing. Out-of-process
-    writers (the migration's compensator clearing multiplex-owned status, container_boot
-    seeding ``desired_state``) stamp this file directly; the gateway's fields win, theirs survive."""
-    existing = _read_json_file(path)
-    return {**existing, **payload} if isinstance(existing, dict) else payload
 
 
 _runtime_status_writer: Optional[_RuntimeStatusWriter] = None
