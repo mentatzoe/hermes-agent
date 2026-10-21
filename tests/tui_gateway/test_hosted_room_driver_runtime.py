@@ -398,6 +398,7 @@ def _runtime(
 ) -> HostedRoomRuntime:
     # Task-fence tests must not expire their lease during unrelated filesystem stalls.
     # Recovery tests that advance time pass their own clock explicitly.
+    # Wakeups drive progress; keep production idle polling instead of 100Hz DB scans.
     now = time.time()
     return HostedRoomRuntime(
         db_path=db,
@@ -406,7 +407,7 @@ def _runtime(
         turn_lock=locks or RecordingTurnLocks(),
         clock=kwargs.pop("clock", lambda: now),
         lease_ttl_seconds=kwargs.pop("lease_ttl_seconds", 0.4),
-        poll_interval_seconds=kwargs.pop("poll_interval_seconds", 0.01),
+        poll_interval_seconds=kwargs.pop("poll_interval_seconds", 5.0),
         **kwargs,
     )
 
@@ -514,7 +515,6 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
         turn_lock=RecordingTurnLocks(),
         clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
-        poll_interval_seconds=0.01,
     )
 
     runtime.start()
@@ -597,7 +597,6 @@ def test_not_admitted_room_does_not_block_other_rooms(tmp_path: Path):
         turn_lock=RecordingTurnLocks(),
         clock=lambda: 100.0,
         lease_ttl_seconds=30,
-        poll_interval_seconds=0.01,
     )
 
     runtime._run_cycle()
@@ -648,7 +647,6 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
         turn_lock=RecordingTurnLocks(),
         clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
-        poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
 
@@ -656,6 +654,10 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
     assert waiting.submitted.wait(WAIT_TIMEOUT)
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
     assert state.get_task(db, identities[0])["status"] == "running"
+    # Independence is proven above. Finish the fake turn before general teardown;
+    # active-turn Stop's exact bounds and non-interruption have their own test.
+    waiting.complete(identities[0].task_id)
+    _wait_for(lambda: state.get_task(db, identities[0])["status"] == "settled")
     assert runtime.stop(timeout=5.0)
 
 
@@ -697,7 +699,6 @@ def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
         turn_lock=RecordingTurnLocks(),
         clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
-        poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
 
@@ -1011,7 +1012,6 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path, monkey
         turn_lock=RecordingTurnLocks(),
         clock=lambda: 100.0,
         lease_ttl_seconds=0.4,
-        poll_interval_seconds=0.02,
         active_poll_interval_seconds=0.01,
         turn_timeout_seconds=0.05,
         max_concurrent_rooms=1,
