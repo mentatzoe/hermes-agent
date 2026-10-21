@@ -2664,11 +2664,10 @@ def clear_run_claim(job_id: str) -> bool:
     """
     def apply(jobs, _i, job):
         claim = job.get("run_claim")
-        if job.get("schedule", {}).get("kind") != "once" or claim in (None, {"outage": True}):
+        kept = oneshot_lateness.retry_claim(claim)  # or the skipped late one-shot is retired
+        if job.get("schedule", {}).get("kind") != "once" or claim == kept:
             return False  # recurring, already cleared, or already reduced to the outage marker
-        # Keep the outage marker (no "at": a stale claim, so it re-dispatches) or the skipped
-        # one-shot, past its grace, is retired as missed on the next scan.
-        job["run_claim"] = {"outage": True} if isinstance(claim, dict) and claim.get("outage") else None
+        job["run_claim"] = kept
         save_jobs(jobs)
         return True
 
@@ -2990,6 +2989,7 @@ class _DueJob:
     next_run: str  # stored ISO string, compared string-exact against manual_run_at
     raw_next_run_dt: datetime  # as stored (may carry a pre-migration offset)
     next_run_dt: datetime  # normalized to the configured tz
+    claim_until: Optional[float] = None  # a hold-admitted late one-shot's retry deadline (epoch)
 
     @property
     def schedule(self) -> Dict[str, Any]:
@@ -3148,20 +3148,24 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     claim stamped, retire it with a diagnostic and a queued notice (never silently delete). A claim
     may mean a run is still in flight elsewhere — skip but keep the record so its mark_job_run can
     land. Two windows let a past-grace one-shot fire once instead: an outage of its store, and a
-    hold on dispatch (restart wait, drain) that no dispatching scan has closed yet."""
+    recent hold on dispatch (restart wait, drain; see ``cron/oneshot_lateness.py``)."""
     if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
         return False
+    due_at, now = d.next_run_dt.timestamp(), d.scan.now.timestamp()
     # Due during an outage of its store: it was skipped, not missed; fire it once on recovery.
-    if store_health.outage_covers(_current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS):
+    if store_health.outage_covers(_current_cron_store().cron_dir, due_at, ONESHOT_GRACE_SECONDS):
         return False
-    claim = d.job.get("run_claim")
+    claim, fire_claim = oneshot_lateness.unexpired_claim(d.job, now), d.job.get("fire_claim")
     # A covered claim that never reached its fire claim never started: it stays covered.
-    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
+    if isinstance(claim, dict) and claim.get("outage") and not fire_claim:
+        d.claim_until = claim.get("until")
         return False
-    # Due while dispatch was held: the ticker skipped it on purpose; fire it once now.
-    if not claim and oneshot_lateness.hold_covers(d.next_run_dt.timestamp(), d.scan.now.timestamp()):
+    # Due while dispatch was held: fire it once now. Never over a claim: a fire claim may be
+    # another process's run, which has already used the job's one dispatch.
+    if not (claim or fire_claim) and oneshot_lateness.hold_covers(due_at, now):
+        d.claim_until = due_at + oneshot_lateness.HELD_ONESHOT_MAX_LATE_SECONDS
         return False
-    if not (claim or d.job.get("fire_claim")):
+    if not (claim or fire_claim):
         oneshot_lateness.write_missed_oneshot_diagnostic(d.job, d.next_run)
         d.scan.retire(d.job["id"])
         d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
@@ -3289,10 +3293,10 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         # same HERMES_HOME must not re-dispatch it while in flight, and advancing next_run_at by a
         # fixed window is not enough for a run that outlives a tick. The other process sees the
         # fresh claim and skips; mark_job_run() clears it. The TTL only covers a tick that DIES.
-        claim = {"at": now.isoformat(), "by": _machine_id()}
+        claim: Dict[str, Any] = {"at": now.isoformat(), "by": _machine_id()}
         lateness = _elapsed_seconds(now, d.next_run_dt)
         if lateness > ONESHOT_GRACE_SECONDS:  # only an outage or a dispatch hold lets it through
-            claim["outage"] = True
+            claim.update(oneshot_lateness.late_claim_fields(d.claim_until))
             # A late fire must not look like an on-time one (`cron list`, the run's prompt).
             job["last_dispatch"] = oneshot_lateness.late_dispatch_stamp(next_run, now, lateness)
             scan.persist(job["id"], last_dispatch=job["last_dispatch"])
@@ -3364,7 +3368,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             return due
     # Only now is a skipped one-shot claimed or durably due on disk: normal grace applies again.
     store_health.end_recovery_window(_current_cron_store().cron_dir)
-    oneshot_lateness.end_hold_window()
+    oneshot_lateness.end_hold_window(scan.now.timestamp())
     for emit in scan.on_saved:
         emit()
     return due

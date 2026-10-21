@@ -158,11 +158,13 @@ dropped silently. The mechanics, in the order the due scan applies them
    late — with two exceptions that fire them once: a one-shot due while its
    store was unwritable (`store_health.outage_covers`), and one due while the
    ticker held dispatch (`can_dispatch` false during a restart's wait or a
-   drain). The held ticker keeps `cron/dispatch_held` in each store, so the
-   replacement gateway's first scan fires such a one-shot (at most 2 h late,
-   stamped `last_dispatch.kind = catch_up`, its prompt opening with when it
-   was due), and that scan's save removes the marker
-   (`cron/oneshot_lateness.py`).
+   drain). The held ticker stamps `cron/dispatch_held` in each store on every
+   tick, so the replacement gateway's first scan fires such a one-shot (at
+   most 2 h late, stamped `last_dispatch.kind = catch_up`, its prompt opening
+   with when it was due). The marker covers jobs only while its last stamp is
+   under 15 minutes old, and a scan removes it once nobody has stamped it for
+   150 s. A failed late dispatch is retried only until due + 2 h
+   (`run_claim.until`; `cron/oneshot_lateness.py`).
 6. **Paused / disabled / terminal jobs never fire**; the due scan drops them
    before any of the above, and pause/resume clears any pending slot. A
    recurring occurrence that came due *while paused* is not lost, though:

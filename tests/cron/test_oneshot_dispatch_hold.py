@@ -35,7 +35,6 @@ def cron_store(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock["now"])
     monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "cron" / "deliveries.db")
-    monkeypatch.setattr(oneshot_lateness, "_holding", {})
     return clock
 
 
@@ -62,7 +61,7 @@ def _queued_notices():
 
 def _hold_through_restart_wait(clock, monkeypatch, end=datetime(2026, 10, 20, 10, 12, tzinfo=timezone.utc)):
     """Run the real in-process ticker with dispatch held, one loop per minute of the restart wait,
-    then end the process (its in-memory hold state goes with it)."""
+    then stop it (the old gateway exits)."""
     from cron import scheduler
     from cron.scheduler_provider import InProcessCronScheduler
 
@@ -87,7 +86,6 @@ def _hold_through_restart_wait(clock, monkeypatch, end=datetime(2026, 10, 20, 10
     thread.join(timeout=30)
     assert not thread.is_alive(), "ticker did not stop"
     assert ticks == [], "no tick may run while dispatch is held"
-    oneshot_lateness._holding.clear()  # the old gateway process exits
 
 
 def test_oneshot_due_during_restart_wait_fires_once_after_restart(cron_store, monkeypatch):
@@ -145,12 +143,15 @@ def test_a_held_oneshot_more_than_two_hours_late_is_not_fired(cron_store, monkey
     assert load_jobs() == []
 
 
-def test_hold_window_closes_after_the_first_dispatching_scan(cron_store, monkeypatch):
-    """The marker is removed once a dispatching scan saves, so a one-shot missed later while the
-    store is writable and nothing is held is retired as before."""
+def test_hold_window_closes_once_the_marker_goes_unstamped(cron_store, monkeypatch):
+    """A scan removes the marker once no ticker has stamped it for 150 s, so a one-shot missed later
+    while nothing is held is retired as before."""
     save_jobs([])
     _hold_through_restart_wait(cron_store, monkeypatch)
-    cron_store["now"] = NEW_GATEWAY_FIRST_SCAN
+    cron_store["now"] = NEW_GATEWAY_FIRST_SCAN  # 84 s after the last stamp: a hold may still be live
+    get_due_jobs()
+    assert (cronjobs.CRON_DIR / "dispatch_held").exists()
+    cron_store["now"] = datetime(2026, 10, 20, 10, 15, tzinfo=timezone.utc)
     get_due_jobs()
     assert not (cronjobs.CRON_DIR / "dispatch_held").exists()
 
@@ -161,14 +162,15 @@ def test_hold_window_closes_after_the_first_dispatching_scan(cron_store, monkeyp
     assert load_jobs() == []
 
 
-def test_a_live_hold_in_this_process_is_not_closed_by_a_scan(cron_store):
-    """While this process still holds dispatch (a CLI `cron tick` scan can run meanwhile), the
-    marker survives so the post-restart scan still sees the hold."""
+def test_a_marker_still_being_stamped_is_not_closed_by_a_scan(cron_store):
+    """While a ticker keeps stamping the marker (a CLI `cron tick` scan can run meanwhile), it
+    survives, so the post-restart scan still sees the hold."""
     oneshot_lateness.note_dispatch_held()
     save_jobs([])
+    cron_store["now"] += timedelta(seconds=60)
     get_due_jobs()
     assert (cronjobs.CRON_DIR / "dispatch_held").exists()
-    oneshot_lateness.note_dispatch_resumed()
+    cron_store["now"] += timedelta(seconds=120)
     get_due_jobs()
     assert not (cronjobs.CRON_DIR / "dispatch_held").exists()
 
@@ -198,7 +200,6 @@ def test_hold_marker_survives_a_ticker_stop_mid_hold(cron_store, monkeypatch):
     hold's start, and a fresh process that holds again keeps that start (one continuous gap)."""
     oneshot_lateness.note_dispatch_held()
     first = (cronjobs.CRON_DIR / "dispatch_held").read_text(encoding="utf-8").split()[0]
-    oneshot_lateness._holding.clear()
     cron_store["now"] += timedelta(minutes=3)
     oneshot_lateness.note_dispatch_held()
     assert (cronjobs.CRON_DIR / "dispatch_held").read_text(encoding="utf-8").split()[0] == first

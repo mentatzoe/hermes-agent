@@ -80,11 +80,6 @@ def _note_dispatch_held(homes=None) -> None:
             _guarded_store_write(note_dispatch_held, "dispatch-held marker")
 
 
-def _note_dispatch_resumed() -> None:
-    from cron.oneshot_lateness import note_dispatch_resumed
-    note_dispatch_resumed()
-
-
 def _profile_entry(entry) -> tuple:
     """Normalize a ``profile_homes`` entry (``(name, home)`` tuple or bare home) to ``(name,
     home)``."""
@@ -511,7 +506,6 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                     _note_dispatch_held()
                 else:
-                    _guarded_store_write(_note_dispatch_resumed, "dispatch-held marker")
                     cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
@@ -642,7 +636,6 @@ class InProcessCronScheduler(CronScheduler):
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
-                                _guarded_store_write(_note_dispatch_resumed, "dispatch-held marker")
                                 cron_tick(
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
