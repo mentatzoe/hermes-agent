@@ -345,10 +345,10 @@ def test_off_macos_there_is_no_compatibility_reading():
 
 @pytest.mark.parametrize(("current", "public", "same"), [
     ("e|179246502392", None, True),                  # raw reading matches
-    ("e|179246502092", "e|179246502392", True),      # only the adjusted reading matches (old row)
-    ("e|179246502092", "e|179246502092", False),     # neither: off by 3 s
-    (None, "e|179246502392", False),                 # unreadable now: the public reading can't rescue it
-    ("e|179246502092", "other|179246502392", False), # the epoch still has to agree
+    ("e|179246502092", 179246502392, True),          # only the adjusted reading matches (old row)
+    ("e|179246502092", 179246502092, False),         # neither: off by 3 s
+    (None, 179246502392, False),                     # unreadable now: the public reading can't rescue it
+    ("other|179246502392", 179246502392, False),     # the epoch still has to agree, for both readings
     ("e|179246502092", None, False),                 # off macOS / no public reading
 ])
 def test_recorded_fingerprint_matches_either_reading(current, public, same):
@@ -358,3 +358,4 @@ def test_recorded_fingerprint_matches_either_reading(current, public, same):
 def test_integer_row_keeps_exact_comparison_against_either_reading():
     assert recorded_fingerprint_matches(179246502392, 179246502092, 179246502392) is True
     assert recorded_fingerprint_matches(179246502392, 179246502092, 179246502492) is False
+    assert recorded_fingerprint_matches(179246502392, None, 179246502392) is False

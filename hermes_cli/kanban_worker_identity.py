@@ -28,31 +28,38 @@ def public_start_time(pid: int) -> Optional[int]:
         return None
     try:
         import psutil
-
+    except ImportError:
+        return None
+    try:
         return int(round(psutil.Process(int(pid)).create_time() * 100))
-    except Exception:
+    except (psutil.Error, OSError, TypeError, ValueError):
         return None
 
 
-def recorded_fingerprint_matches(recorded: Any, current: Any, public: Any) -> bool:
-    """True when ``recorded`` matches the current reading of the same PID, or (only while that
-    reading is readable) its public, psutil-adjusted reading ``public``.
+def recorded_fingerprint_matches(recorded: Any, current: Any, public: Optional[int]) -> bool:
+    """True when ``recorded`` matches ``current``, the reading of the PID now, or (only while
+    ``current`` is readable) the same PID's public, psutil-adjusted start time ``public``
+    (``public_start_time``), put in ``current``'s form: the same epoch prefix for a composed
+    fingerprint, the bare value for an integer one.
 
     Compatibility rule for the switch to the unadjusted macOS start time: a row written by an
-    older process carries the writer's psutil adjustment, so an exact-or-tolerant comparison with
-    the unadjusted value alone could turn a live worker the older code kept alive into a
-    "recycled" PID and reclaim its card. Accepting either reading makes the decision the union of
-    the old rule (public reading) and the new one (unadjusted reading): never stricter than either
-    version, so mixed versions can't cause a false crash, and never looser than what one of the
-    two versions would accept by itself. Both readings come from the same live process and pass
-    through the same comparator, so the epoch half and the integer-row exactness still apply. An
+    older process carries the writer's psutil adjustment, so comparing it with the unadjusted value
+    alone could turn a live worker the older code kept alive into a "recycled" PID and reclaim its
+    card. Accepting either reading makes the decision the union of the old rule (public reading)
+    and the new one (unadjusted reading): never stricter than either version, so mixed versions
+    can't cause a false crash, and never looser than one of the two versions by itself. Both arms
+    use ``fingerprints_match``, so the epoch half and the integer-row exactness still apply. An
     unreadable current process never matches, whatever ``public`` says.
     """
     if current is None:
         return False
     if fingerprints_match(recorded, current):
         return True
-    return public is not None and fingerprints_match(recorded, public)
+    if public is None:
+        return False
+    if isinstance(current, str) and "|" in current:
+        return fingerprints_match(recorded, f"{current.rpartition('|')[0]}|{public}")
+    return fingerprints_match(recorded, public)
 
 
 def fingerprints_match(recorded: Any, current: Any) -> bool:

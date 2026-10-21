@@ -384,18 +384,6 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     return f"{current_instantiation_epoch()}|{start}"
 
 
-def _public_process_fingerprint(pid: int) -> Optional[str]:
-    """``_process_fingerprint`` as older code wrote it on macOS, with psutil's boot-time adjustment
-    (``kanban_worker_identity.public_start_time``). Only compared, never recorded. ``None`` off macOS
-    or when unreadable."""
-    from gateway.drain_control import current_instantiation_epoch
-    from hermes_cli.kanban_worker_identity import public_start_time
-    start = public_start_time(int(pid))
-    if start is None:
-        return None
-    return f"{current_instantiation_epoch()}|{start}"
-
-
 def _worker_alive(pid: Optional[int], started_at) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
@@ -414,21 +402,17 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. ``kanban_worker_identity.fingerprints_match``
-    compares the rest; a composed fingerprint's start time may drift up to 2 s between processes. A
-    row recorded by older code with psutil's macOS adjustment also matches the public reading
-    (``recorded_fingerprint_matches``), so a mixed-version window can't reclaim a live worker."""
+    recycled; the UNVERIFIED marker is always foreign. ``kanban_worker_identity`` compares the rest:
+    the start time may drift up to 2 s between processes, and a row recorded by older code with
+    psutil's macOS adjustment also matches the public reading (``recorded_fingerprint_matches``)."""
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    from hermes_cli.kanban_worker_identity import public_start_time, recorded_fingerprint_matches
-    if isinstance(started_at, str) and "|" in started_at:
-        current = _process_fingerprint(int(pid))
-        public = _public_process_fingerprint(int(pid)) if current is not None else None
-        return not recorded_fingerprint_matches(started_at, current, public)
     from gateway.status import get_process_start_time
-    current = get_process_start_time(int(pid))
+    from hermes_cli.kanban_worker_identity import public_start_time, recorded_fingerprint_matches
+    composed = isinstance(started_at, str) and "|" in started_at
+    current = _process_fingerprint(int(pid)) if composed else get_process_start_time(int(pid))
     public = public_start_time(int(pid)) if current is not None else None
     return not recorded_fingerprint_matches(started_at, current, public)
 
