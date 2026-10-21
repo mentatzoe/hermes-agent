@@ -60,7 +60,9 @@ def process_started_at() -> float | None:
     try:
         import psutil
 
-        return float(psutil.Process(os.getpid()).create_time())
+        from hermes_cli.process_start_time import process_create_time
+
+        return process_create_time(psutil.Process(os.getpid()))
     except Exception:
         return None
 

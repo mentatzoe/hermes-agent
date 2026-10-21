@@ -172,7 +172,9 @@ def _pid_alive(pid: int) -> bool:
 def _create_time(pid: int) -> Optional[float]:
     import psutil
     try:
-        return psutil.Process(pid).create_time()
+        from hermes_cli.process_start_time import process_create_time
+
+        return process_create_time(psutil.Process(pid))
     except (psutil.Error, OverflowError, ValueError):
         return None
 

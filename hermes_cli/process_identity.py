@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
+from hermes_cli.process_start_time import process_create_time
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ def _process_create_time(pid: Optional[int] = None) -> Optional[float]:
     try:
         import psutil
 
-        return float(psutil.Process(os.getpid() if pid is None else pid).create_time())
+        return process_create_time(psutil.Process(os.getpid() if pid is None else pid))
     except Exception:
         return None
 
@@ -182,7 +183,7 @@ def _read_ledger_or_quarantine(path: Path) -> Optional[list[dict]]:
 
 def _same_incarnation(proc, create_time: Optional[float]) -> bool:
     """Does the live ``proc`` match a recorded ``create_time`` (2 s tolerance; ``None`` matches)?"""
-    return create_time is None or abs(float(proc.create_time()) - float(create_time)) < 2.0
+    return create_time is None or abs(process_create_time(proc) - float(create_time)) < 2.0
 
 
 def _pid_alive_matches(pid: int, create_time: Optional[float], *, strict: bool = False) -> Optional[bool]:
@@ -194,7 +195,7 @@ def _pid_alive_matches(pid: int, create_time: Optional[float], *, strict: bool =
     try:
         proc = psutil.Process(int(pid))
         if strict:
-            return (create_time is not None and proc.create_time() == create_time
+            return (create_time is not None and process_create_time(proc) == create_time
                     and proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE)
         # A zombie keeps its create_time until its parent reaps it, but it is already dead: the
         # dashboard stop check (``gateway.status._pid_exists``) books it stopped, so the ledger must
@@ -416,7 +417,7 @@ def _reparented_orphan(pid: int) -> bool:
         import time as _time
 
         import psutil
-        return max(0.0, _time.time() - psutil.Process(pid).create_time()) >= _REAP_MIN_AGE_SECONDS
+        return max(0.0, _time.time() - process_create_time(psutil.Process(pid))) >= _REAP_MIN_AGE_SECONDS
     except Exception:
         return False  # unprovable → never touch
 

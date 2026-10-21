@@ -9,6 +9,8 @@ from pathlib import Path
 
 import psutil
 
+from hermes_cli.process_start_time import process_create_time
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +47,7 @@ def _same_birth(proc, state: dict, prefix: str = "") -> bool:
 
     recorded = state.get(f"{prefix}start_time")
     if not _valid_birth(recorded):
-        return proc.create_time() == state[f"{prefix}create_time"]
+        return process_create_time(proc) == state[f"{prefix}create_time"]
     current = get_process_start_time(proc.pid)
     return current is not None and start_time_fingerprints_match(recorded, current)
 
@@ -92,7 +94,7 @@ def _owner_is_dead(state: dict) -> bool:
                 return not _same_birth(owner, state, "owner_")
             # Records that predate start_time: only a NEWER incarnation proves the owner exited. A
             # stepped clock (WSL) moves create_time, so inequality alone would bury a live owner.
-            return owner.create_time() > created
+            return process_create_time(owner) > created
         except psutil.NoSuchProcess:
             return True
     except (KeyError, TypeError, ValueError, OverflowError, OSError, psutil.Error):
@@ -122,7 +124,7 @@ def legacy_recorded_process(state: dict):
         exe.relative_to(root)
         if exe.name.lower() not in ("llama-server", "llama-server.exe"):
             return None
-        if proc.create_time() > state_path().stat().st_mtime:
+        if process_create_time(proc) > state_path().stat().st_mtime:
             return None  # the PID was reused after this record was written
         url = urlsplit(state["base_url"])
         if url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port or not state["api_key"]:
