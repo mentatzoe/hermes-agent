@@ -26,7 +26,7 @@ from gateway.status_inline_source import (
     inline_bootstrap_argv,
     inline_source_flag_index,
 )
-from gateway.status_persistence import merge_runtime_status_on_disk
+from gateway.status_persistence import persist_runtime_status
 from gateway.status_start_time import (  # noqa: F401 -- re-exported for callers
     START_TIME_DRIFT_TOLERANCE,
     _start_times_agree,
@@ -135,10 +135,7 @@ class _RuntimeStatusWriter:
             error: Optional[BaseException] = None
             persisted = False
             try:
-                merged = merge_runtime_status_on_disk(path, payload)
-                if merged is not None:
-                    (self._write_fn or _write_json_file)(path, merged)
-                    persisted = True
+                persisted = persist_runtime_status(path, payload, self._write_fn or _write_json_file)
             except BaseException as exc:
                 error = exc
             with self._condition:

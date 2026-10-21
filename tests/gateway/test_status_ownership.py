@@ -35,10 +35,10 @@ def owner(tmp_path, monkeypatch):
     monkeypatch.setattr(status, "_runtime_status_state", None)
     process = None
 
-    def start():
+    def start(script=_OWNER, before_ready=None):
         nonlocal process
         process = subprocess.Popen(
-            [sys.executable, "-c", _OWNER],
+            [sys.executable, "-c", script],
             cwd=Path(__file__).resolve().parents[2],
             env={**os.environ, "HERMES_HOME": str(tmp_path)},
             stdin=subprocess.PIPE,
@@ -46,6 +46,8 @@ def owner(tmp_path, monkeypatch):
             stderr=subprocess.PIPE,
             text=True,
         )
+        if before_ready is not None:
+            before_ready(process)
         record = json.loads(process.stdout.readline())
         assert record["pid"] == process.pid
         assert record["start_time"] == status._get_process_start_time(process.pid)
@@ -162,14 +164,14 @@ def test_queued_snapshot_rechecks_owner_when_writer_reaches_disk(
 
     entered = threading.Event()
     release = threading.Event()
-    merge = status.merge_runtime_status_on_disk
+    persist = status.persist_runtime_status
 
-    def delayed_merge(path, payload):
+    def delayed_persist(path, payload, write_fn):
         entered.set()
         assert release.wait(timeout=10)
-        return merge(path, payload)
+        return persist(path, payload, write_fn)
 
-    monkeypatch.setattr(status, "merge_runtime_status_on_disk", delayed_merge)
+    monkeypatch.setattr(status, "persist_runtime_status", delayed_persist)
     generation = status.publish_runtime_status(gateway_state="starting")
     try:
         assert entered.wait(timeout=2)
@@ -182,3 +184,44 @@ def test_queued_snapshot_rechecks_owner_when_writer_reaches_disk(
     assert not status._get_runtime_status_writer().wait(generation, timeout=2)
     assert path.read_bytes() == before
     assert status.read_runtime_status() == record
+
+
+def test_status_validation_and_replacement_are_one_cross_process_transaction(
+    tmp_path, owner
+):
+    paused_owner = """
+from gateway import status
+original = status._write_json_file
+
+def pause_before_replace(path, payload):
+    print("validated", flush=True)
+    assert input() == "release"
+    status._write_json_file = original
+    original(path, payload)
+
+status._write_json_file = pause_before_replace
+""" + _OWNER
+    generations = []
+
+    def contend(process):
+        assert process.stdout.readline().strip() == "validated"
+        try:
+            generation = status.publish_runtime_status(gateway_state="starting")
+            generations.append(generation)
+            writer = status._get_runtime_status_writer()
+            # The first writer has validated but not replaced the file. A second
+            # writer must stay blocked, rather than publishing its own identity.
+            assert not writer.wait(generation, timeout=2.0)
+            assert writer.settled(generation) is None
+            assert not (tmp_path / "gateway_state.json").exists()
+        finally:
+            process.stdin.write("release\n")
+            process.stdin.flush()
+
+    process, record = owner(paused_owner, before_ready=contend)
+    assert not status._get_runtime_status_writer().wait(generations[0], timeout=2.0)
+    assert status.read_runtime_status() == record
+    process.stdin.write("update\n")
+    process.stdin.flush()
+    assert process.stdout.readline().strip() == "updated"
+    assert status.read_runtime_status()["active_agents"] == 2
