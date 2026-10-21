@@ -3,11 +3,12 @@
 ``worker_started_at`` is written by whichever process spawned the worker (a one-shot
 ``hermes kanban dispatch`` or the gateway's dispatcher) and read later by whichever process runs the
 next sweep. On macOS psutil shifts ``create_time()`` by however far ``kern.boottime`` has moved since
-psutil was imported, so a gateway that has been up a day and a fresh CLI read the same worker's start
-about a second apart (aleph-vault #215: ``|179246502392`` recorded, ``|179246502492`` read). The exact
-comparison read that as a recycled PID, reclaimed the card and started a second worker beside the
-first. The composed fingerprint's start half now agrees within ``START_TIME_DRIFT_TOLERANCE``; the
-epoch half, a malformed reading and an integer (pre-epoch) fingerprint stay exact.
+psutil was imported, so a gateway and a fresh CLI read the same worker's start 1 s apart on 20 Oct
+(``|179246502392`` recorded, ``|179246502492`` read) and 3 s apart on 21 Oct. The exact comparison
+read that as a recycled PID, reclaimed the card and started a second worker beside the first
+(aleph-vault #215). The fingerprint now carries the kernel's unadjusted start time, which every
+process reads alike, and its start half agrees within ``START_TIME_DRIFT_TOLERANCE`` for rows recorded
+before that. The epoch half, a malformed reading and an integer (pre-epoch) fingerprint stay exact.
 """
 
 from __future__ import annotations
@@ -178,11 +179,51 @@ def test_fingerprint_recorded_in_one_process_is_checked_in_another(recorded_chil
 
 
 @pytest.mark.platforms("macos")
-@pytest.mark.parametrize("shift", [1.0, 2.0])
-def test_reader_whose_psutil_saw_boottime_move_still_finds_the_worker(recorded_child, shift):
-    """The #215 mechanism itself: the reading process's psutil adds the boot-time movement since
-    it was imported, so its reading is ``shift`` seconds later than the recorded one."""
+@pytest.mark.parametrize("shift", [1.0, 3.0, -3.0, 600.0])
+def test_reader_whose_psutil_saw_boottime_move_reads_the_same_start(recorded_child, shift):
+    """The #215 mechanism itself: the reading process imported psutil before ``kern.boottime`` moved,
+    so psutil's ``create_time()`` there is off by ``|shift|`` (3 s on 21 Oct, past the 2 s tolerance).
+    The fingerprint must still read exactly what the spawning process recorded."""
     pid, recorded = recorded_child
     read, alive = _read_in_another_process(pid, recorded, shift)
-    assert int(read.rpartition("|")[2]) - int(recorded.rpartition("|")[2]) == round(shift * 100), (recorded, read)
+    assert read == recorded
     assert alive == "True", (recorded, read)
+
+
+@pytest.mark.platforms("macos")
+def test_start_time_ignores_psutil_boottime_adjustment(monkeypatch):
+    """In one process: whatever boot time psutil saw at import, the start time doesn't move, while the
+    ordinary reading does (which is what made a long-running gateway disagree with a fresh CLI)."""
+    from psutil import _psosx
+
+    from gateway.status import get_process_start_time
+    from hermes_cli.kanban_worker_identity import process_start_time
+
+    pid = os.getpid()
+    before = process_start_time(pid)
+    monkeypatch.setattr(_psosx, "INIT_BOOT_TIME", _psosx.boot_time() + 3)
+    assert get_process_start_time(pid) != before
+    assert process_start_time(pid) == before
+
+
+def test_start_time_falls_back_to_the_ordinary_reading(monkeypatch):
+    """Off macOS, or when psutil can't give the kernel's value, the reading is the ordinary one, and an
+    unreadable process stays unreadable."""
+    import psutil
+
+    import hermes_cli.kanban_worker_identity as identity
+
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 12345)
+    monkeypatch.setattr(identity.sys, "platform", "linux")
+    assert identity.process_start_time(os.getpid()) == 12345
+
+    monkeypatch.setattr(identity.sys, "platform", "darwin")
+
+    def no_kernel_value(pid):
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", no_kernel_value)
+    assert identity.process_start_time(os.getpid()) == 12345
+
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: None)
+    assert identity.process_start_time(os.getpid()) is None

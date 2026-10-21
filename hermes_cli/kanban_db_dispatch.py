@@ -374,10 +374,11 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
     survives a reboot could match an unrelated process with the same PID and the same tick value;
     ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
+    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable.
+    The start time is ``kanban_worker_identity.process_start_time``: every process reads it alike."""
     from gateway.drain_control import current_instantiation_epoch
-    from gateway.status import get_process_start_time
-    start = get_process_start_time(int(pid))
+    from hermes_cli.kanban_worker_identity import process_start_time
+    start = process_start_time(int(pid))
     if start is None:
         return None
     return f"{current_instantiation_epoch()}|{start}"
