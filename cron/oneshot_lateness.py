@@ -26,10 +26,13 @@ def _duration(seconds):
 
 
 def _local_due(due, now):
-    """Use the scheduler's configured timezone, including its local calendar date."""
-    local = due.astimezone(now.tzinfo)
+    """Use configured or system-local rules at each instant, not today's fixed offset."""
+    from hermes_time import get_timezone
+    zone = get_timezone()
+    local, today = (instant.astimezone(zone) if zone is not None else instant.astimezone()
+                    for instant in (due, now))
     text = local.strftime("%H:%M")
-    if local.date() != now.date():
+    if local.date() != today.date():
         text += f" on {local:%a} {local.day} {local:%b}"
     return text
 

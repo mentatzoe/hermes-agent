@@ -3,12 +3,21 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import hermes_time
 from cron import jobs, scheduler
+
+
+@pytest.fixture(autouse=True)
+def fresh_timezone_cache():
+    hermes_time.reset_cache()
+    yield
+    hermes_time.reset_cache()
 
 
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     clock = [datetime(2026, 10, 21, 12, tzinfo=timezone.utc)]
+    monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
     monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
@@ -357,7 +366,8 @@ def test_note_rounds_elapsed_minutes(rig, seconds, elapsed):
     assert late_note(claimed).endswith(f", {elapsed} ago.\n")
 
 
-def test_note_uses_scheduler_local_date_across_midnight(rig):
+def test_note_uses_scheduler_local_date_across_midnight(rig, monkeypatch):
+    monkeypatch.setenv("HERMES_TIMEZONE", "Europe/London")
     from zoneinfo import ZoneInfo
     from cron.oneshot_lateness import late_note
     rig[1][0] = datetime(2026, 10, 22, 0, 5, tzinfo=ZoneInfo("Europe/London"))
@@ -374,7 +384,8 @@ def test_note_uses_scheduler_local_date_across_midnight(rig):
     assert expected in late_note(claimed, agent=True) and utc_due in late_note(claimed, agent=True)
 
 
-def test_skip_has_local_date_name_and_limit(rig):
+def test_skip_has_local_date_name_and_limit(rig, monkeypatch):
+    monkeypatch.setenv("HERMES_TIMEZONE", "Europe/London")
     from zoneinfo import ZoneInfo
     rig[1][0] = datetime(2026, 10, 22, 0, 5, tzinfo=ZoneInfo("Europe/London"))
     job, _ = late_job(rig, 7 * 3600 + 5 * 60)
@@ -384,7 +395,8 @@ def test_skip_has_local_date_name_and_limit(rig):
                             "and is now 7 h 5 min late, past the 6 h limit for late one-off jobs.")
 
 
-def test_note_compares_local_dates_not_stored_offset(rig):
+def test_note_compares_local_dates_not_stored_offset(rig, monkeypatch):
+    monkeypatch.setenv("HERMES_TIMEZONE", "Europe/London")
     from zoneinfo import ZoneInfo
     from cron.oneshot_lateness import late_note
     rig[1][0] = datetime(2026, 10, 22, 0, 45, tzinfo=ZoneInfo("Europe/London"))
@@ -394,3 +406,68 @@ def test_note_compares_local_dates_not_stored_offset(rig):
     rows[0]["schedule"]["run_at"] = rows[0]["next_run_at"]
     jobs.save_jobs(rows)
     assert late_note(jobs.get_due_jobs()[0]) == "Running late: this was due at 00:15, 30 min ago.\n"
+
+
+@pytest.fixture
+def notice_timezone(rig, monkeypatch):
+    import time
+    if not hasattr(time, "tzset"):
+        pytest.skip("system timezone changes require time.tzset")
+    try:
+        with monkeypatch.context() as patch:
+            def configure(configured):
+                # A configured zone must override the system zone, not now.tzinfo.
+                patch.setenv("TZ", "UTC" if configured else "Europe/London")
+                patch.delenv("HERMES_TIMEZONE", raising=False)
+                if configured:
+                    with (rig[0] / "config.yaml").open("a") as f:
+                        f.write(f"timezone: {configured}\n")
+                time.tzset()
+                hermes_time.reset_cache()
+                assert hermes_time.get_timezone_name() == (configured or "")
+                assert (hermes_time.get_timezone() is None) == (configured is None)
+            yield configure
+    finally:
+        # monkeypatch.context restores TZ before libc and the clock cache reset.
+        time.tzset()
+        hermes_time.reset_cache()
+
+
+@pytest.mark.parametrize("path", ["script", "agent", "skip"])
+@pytest.mark.parametrize("configured,now_text,due,local_due,elapsed", [
+    pytest.param(None, "2026-10-25T02:00:00+00:00", "2026-10-25T00:30:00+01:00",
+                 "00:30", "2 h 30 min", id="system-autumn"),
+    pytest.param(None, "2026-03-29T03:00:00+01:00", "2026-03-29T00:30:00+00:00",
+                 "00:30", "1 h 30 min", id="system-spring"),
+    pytest.param("Europe/London", "2026-10-25T02:00:00+00:00", "2026-10-25T00:30:00+01:00",
+                 "00:30", "2 h 30 min", id="configured-autumn"),
+    pytest.param("Europe/London", "2026-10-21T23:45:00+00:00", "2026-10-21T23:10:00+00:00",
+                 "00:10", "35 min", id="configured-today"),
+])
+def test_notices_use_timezone_rules_at_each_instant(
+    rig, monkeypatch, notice_timezone, path, configured, now_text, due, local_due, elapsed,
+):
+    notice_timezone(configured)
+    # ISO parsing reproduces hermes_time.now()'s fixed-offset system-local result.
+    rig[1][0] = datetime.fromisoformat(now_text)
+    late_job(rig, no_agent=path == "script", script="fixture.py" if path == "script" else None)
+    rows = jobs.load_jobs()
+    rows[0]["next_run_at"] = due
+    rows[0]["schedule"]["run_at"] = due
+    jobs.save_jobs(rows)
+    if path == "skip":
+        config = rig[0] / "config.yaml"
+        config.write_text(config.read_text().replace("21600", "60"))
+        assert scheduler.tick(verbose=False) == 0
+        assert rig[3][0][0] == (
+            f"Skipped 'reminder': it was due at {local_due} and is now {elapsed} late, "
+            "past the 1 min limit for late one-off jobs.")
+    else:
+        monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat",
+                            lambda *a, **kw: (True, "script result"))
+        assert scheduler.tick(verbose=False) == 1
+        expected = f"Running late: this was due at {local_due}, {elapsed} ago."
+        if path == "script":
+            assert rig[3][0][0] == expected + "\nscript result"
+        else:
+            assert rig[2][0].startswith(expected + f" Scheduled timestamp: {due}.")
