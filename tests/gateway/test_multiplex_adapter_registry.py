@@ -894,6 +894,8 @@ class TestSecondaryProfileConfigHandling:
         from gateway.status import read_runtime_status
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # This is the previous gateway's exited process, not the host's live PID 1.
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         (tmp_path / "gateway_state.json").write_text(json.dumps(
             {"pid": 1, "gateway_state": "stopped", "served_profiles": ["default", "coder"]}))
         runner = GatewayRunner.__new__(GatewayRunner)
