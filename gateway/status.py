@@ -26,6 +26,11 @@ from gateway.status_inline_source import (
     inline_bootstrap_argv,
     inline_source_flag_index,
 )
+from gateway.status_start_time import (  # noqa: F401 -- re-exported for callers
+    START_TIME_DRIFT_TOLERANCE,
+    _start_times_agree,
+    start_time_fingerprints_match,
+)
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import pid_exists_stdlib
 from utils import atomic_json_write
@@ -438,26 +443,6 @@ def terminate_pid(
         raise OSError(details or f"taskkill failed for PID {pid}")
 
 
-def _start_times_agree(current: Any, *recorded: Any) -> bool:
-    """Same process object: all fingerprints > 0 and within 1ms of ``current``; raises on junk."""
-    cur = float(current)
-    return cur > 0 and all(r > 0 and abs(r - cur) <= 0.001 for r in map(float, recorded))
-
-
-# Same-host start-time readings can drift by ~1 s between the claim-time and a later liveness read
-# (macOS ``kern.boottime`` adjustment, #117505). Both fingerprint scales are ×100 (Linux /proc ticks,
-# psutil centiseconds), so 200 means 2 s on either platform — a recycled PID is essentially never
-# that close to the original's start time.
-START_TIME_DRIFT_TOLERANCE = 200
-
-
-def start_time_fingerprints_match(recorded: Any, current: Any, tolerance: int = START_TIME_DRIFT_TOLERANCE) -> bool:
-    """Liveness-reconciliation comparator for :func:`get_process_start_time` fingerprints: the
-    recorded owner and the current reading are the same incarnation when they agree within
-    ``tolerance``. Raises on junk; callers decide what an unreadable (``None``) side means."""
-    return abs(int(current) - int(recorded)) <= tolerance
-
-
 def _scope_hash(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
@@ -496,7 +481,18 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     # of the same process compare equal without float-precision fragility.
     try:
         import psutil  # type: ignore
-        return int(round(psutil.Process(pid).create_time() * 100))
+        proc = psutil.Process(pid)
+        # macOS: public create_time() adds (boot time cached at psutil import - kern.boottime
+        # now) once they differ by >= 1 s, so after a clock step a long-lived gateway reads
+        # every start time shifted (21 Oct 2026: +3 s, false Kanban crashes). The kernel's
+        # p_starttime doesn't move; read it unadjusted so every process agrees.
+        raw = getattr(getattr(proc, "_proc", None), "create_time", None)
+        if sys.platform == "darwin" and raw is not None:
+            try:
+                return int(round(raw(monotonic=True) * 100))
+            except TypeError:
+                pass  # psutil without the keyword: fall back to the public value
+        return int(round(proc.create_time() * 100))
     except Exception:
         return None
 
