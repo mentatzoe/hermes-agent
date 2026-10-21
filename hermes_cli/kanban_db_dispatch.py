@@ -375,10 +375,22 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     survives a reboot could match an unrelated process with the same PID and the same tick value;
     ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
     reboot / container recreate, so the composed value never survives one. ``None`` when unreadable.
-    The start time is ``kanban_worker_identity.process_start_time``: every process reads it alike."""
+    On macOS the start time is the kernel's unadjusted value, which every process reads alike."""
     from gateway.drain_control import current_instantiation_epoch
-    from hermes_cli.kanban_worker_identity import process_start_time
-    start = process_start_time(int(pid))
+    from gateway.status import get_process_start_time
+    start = get_process_start_time(int(pid))
+    if start is None:
+        return None
+    return f"{current_instantiation_epoch()}|{start}"
+
+
+def _public_process_fingerprint(pid: int) -> Optional[str]:
+    """``_process_fingerprint`` as older code wrote it on macOS, with psutil's boot-time adjustment
+    (``kanban_worker_identity.public_start_time``). Only compared, never recorded. ``None`` off macOS
+    or when unreadable."""
+    from gateway.drain_control import current_instantiation_epoch
+    from hermes_cli.kanban_worker_identity import public_start_time
+    start = public_start_time(int(pid))
     if start is None:
         return None
     return f"{current_instantiation_epoch()}|{start}"
@@ -403,16 +415,22 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. ``kanban_worker_identity.fingerprints_match``
-    compares the rest; a composed fingerprint's start time may drift up to 2 s between processes."""
+    compares the rest; a composed fingerprint's start time may drift up to 2 s between processes. A
+    row recorded by older code with psutil's macOS adjustment also matches the public reading
+    (``recorded_fingerprint_matches``), so a mixed-version window can't reclaim a live worker."""
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    from hermes_cli.kanban_worker_identity import fingerprints_match
+    from hermes_cli.kanban_worker_identity import public_start_time, recorded_fingerprint_matches
     if isinstance(started_at, str) and "|" in started_at:
-        return not fingerprints_match(started_at, _process_fingerprint(int(pid)))
+        current = _process_fingerprint(int(pid))
+        public = _public_process_fingerprint(int(pid)) if current is not None else None
+        return not recorded_fingerprint_matches(started_at, current, public)
     from gateway.status import get_process_start_time
-    return not fingerprints_match(started_at, get_process_start_time(int(pid)))
+    current = get_process_start_time(int(pid))
+    public = public_start_time(int(pid)) if current is not None else None
+    return not recorded_fingerprint_matches(started_at, current, public)
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:

@@ -6,9 +6,12 @@ next sweep. On macOS psutil shifts ``create_time()`` by however far ``kern.boott
 psutil was imported, so a gateway and a fresh CLI read the same worker's start 1 s apart on 20 Oct
 (``|179246502392`` recorded, ``|179246502492`` read) and 3 s apart on 21 Oct. The exact comparison
 read that as a recycled PID, reclaimed the card and started a second worker beside the first
-(aleph-vault #215). The fingerprint now carries the kernel's unadjusted start time, which every
-process reads alike, and its start half agrees within ``START_TIME_DRIFT_TOLERANCE`` for rows recorded
-before that. The epoch half, a malformed reading and an integer (pre-epoch) fingerprint stay exact.
+(aleph-vault #215). ``gateway.status.get_process_start_time`` now reads the kernel's unadjusted start
+time on macOS, which every process reads alike, and the start half agrees within
+``START_TIME_DRIFT_TOLERANCE`` for rows recorded before that. A row recorded by older code, with the
+writer's adjustment baked in, also matches the reader's public (adjusted) reading, so a mixed-version
+window can't reclaim a worker the older code would have kept. The epoch half, a malformed reading and an
+integer (pre-epoch) fingerprint stay exact.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.kanban_worker_identity import fingerprints_match
+from hermes_cli.kanban_worker_identity import recorded_fingerprint_matches
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -125,26 +129,44 @@ def test_expired_claim_of_a_drifted_live_worker_is_extended(board, monkeypatch):
     assert "claim_extended" in [e.kind for e in kb.list_events(board, tid)]
 
 
-_READER = (
+_SHIFT = (
     "import sys\n"
     "shift = float(sys.argv[3])\n"
     "if shift:\n"
     "    # What a long-lived process sees after kern.boottime moves: psutil adds the movement.\n"
     "    from psutil import _psosx\n"
     "    _psosx.INIT_BOOT_TIME = _psosx.boot_time() + shift\n"
+)
+_READER = _SHIFT + (
     "from hermes_cli import kanban_db_dispatch as kbd\n"
     "pid, recorded = int(sys.argv[1]), sys.argv[2]\n"
     "print(kbd._process_fingerprint(pid), kbd._worker_alive(pid, recorded))\n"
 )
+# The fingerprint an unpatched process (base e23f76de) wrote on macOS: psutil's public create_time(),
+# adjusted by however far kern.boottime had moved since that process imported psutil.
+_OLD_WRITER = _SHIFT + (
+    "import psutil\n"
+    "from gateway.drain_control import current_instantiation_epoch\n"
+    "pid = int(sys.argv[1])\n"
+    "print(f'{current_instantiation_epoch()}|{int(round(psutil.Process(pid).create_time() * 100))}')\n"
+)
+
+
+def _run(source: str, pid: int, recorded: str, shift: float) -> str:
+    env = {**os.environ, "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    out = subprocess.run([sys.executable, "-c", source, str(pid), recorded, str(shift)], cwd=ROOT, env=env,
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return out.stdout
 
 
 def _read_in_another_process(pid: int, recorded: str, shift: float = 0.0) -> tuple[str, str]:
-    env = {**os.environ, "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    out = subprocess.run([sys.executable, "-c", _READER, str(pid), recorded, str(shift)], cwd=ROOT, env=env,
-                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
-    assert out.returncode == 0, out.stderr[-2000:]
-    read, alive = out.stdout.split()
+    read, alive = _run(_READER, pid, recorded, shift).split()
     return read, alive
+
+
+def _record_with_old_code(pid: int, shift: float) -> str:
+    return _run(_OLD_WRITER, pid, "", shift).strip()
 
 
 @pytest.fixture
@@ -191,39 +213,148 @@ def test_reader_whose_psutil_saw_boottime_move_reads_the_same_start(recorded_chi
 
 
 @pytest.mark.platforms("macos")
-def test_start_time_ignores_psutil_boottime_adjustment(monkeypatch):
-    """In one process: whatever boot time psutil saw at import, the start time doesn't move, while the
-    ordinary reading does (which is what made a long-running gateway disagree with a fresh CLI)."""
+@pytest.mark.parametrize("reader_shift", [3.0, 1.0])
+def test_row_an_old_gateway_recorded_during_the_step_stays_alive_to_a_patched_reader(recorded_child, reader_shift):
+    """Codex's reproduction against 25afef39: the row was written by unpatched code whose psutil saw
+    kern.boottime move 3 s (``|S+300``), and the reader is patched code whose psutil sees 3 s or 1 s.
+    Older code kept this worker alive; the unadjusted reading alone (S) would reclaim its card."""
+    pid, _ = recorded_child
+    recorded = _record_with_old_code(pid, 3.0)
+    epoch, _, start = recorded.rpartition("|")
+    read, alive = _read_in_another_process(pid, recorded, reader_shift)
+    assert int(start) - int(read.rpartition("|")[2]) == 300  # the raw reading alone would say "recycled"
+    assert alive == "True", (recorded, read)
+
+
+@pytest.mark.platforms("macos")
+def test_old_row_out_of_reach_of_both_readings_is_judged_as_older_code_judged_it(recorded_child):
+    """The compatibility rule only adds what older code accepted. A +3 s row read by a process whose
+    psutil saw no move is 3 s from both readings, as it was for older code (runs 180/182): no looser."""
+    pid, _ = recorded_child
+    recorded = _record_with_old_code(pid, 3.0)
+    assert _read_in_another_process(pid, recorded, 0.0)[1] == "False"
+
+
+def _shift_boottime(monkeypatch, seconds):
+    """kern.boottime moved ``seconds`` earlier after this process imported psutil (21 Oct: 3 s)."""
     from psutil import _psosx
 
+    real = _psosx.boot_time()
+    monkeypatch.setattr(_psosx, "INIT_BOOT_TIME", real)
+    monkeypatch.setattr(_psosx, "boot_time", lambda: real - seconds)
+
+
+@pytest.mark.platforms("macos")
+def test_215_cli_recorded_worker_survives_a_gateway_sweep_during_the_step(monkeypatch):
+    """Run 179: a fresh CLI recorded the worker, then the gateway swept while boot time sat 3 s off."""
+    recorded = kbd._process_fingerprint(os.getpid())
+    _shift_boottime(monkeypatch, 3)
+    assert kbd._worker_alive(os.getpid(), recorded) is True
+
+
+@pytest.mark.platforms("macos")
+def test_215_worker_recorded_during_the_step_survives_the_step_back(monkeypatch):
+    """Runs 180/182: the gateway recorded during the step and swept after boot time stepped back."""
+    with monkeypatch.context() as m:
+        _shift_boottime(m, 3)
+        recorded = kbd._process_fingerprint(os.getpid())
+    assert kbd._worker_alive(os.getpid(), recorded) is True
+
+
+@pytest.mark.platforms("macos")
+def test_215_old_gateway_row_survives_a_patched_sweep_during_the_step(monkeypatch):
+    """Run 181's shape across the upgrade: the old gateway wrote ``|S+300`` during the step, and the
+    patched one sweeps while its psutil still sees the step."""
+    from gateway.drain_control import current_instantiation_epoch
     from gateway.status import get_process_start_time
-    from hermes_cli.kanban_worker_identity import process_start_time
+
+    raw = get_process_start_time(os.getpid())
+    _shift_boottime(monkeypatch, 3)
+    recorded = f"{current_instantiation_epoch()}|{raw + 300}"
+    assert fingerprints_match(recorded, kbd._process_fingerprint(os.getpid())) is False
+    assert kbd._worker_alive(os.getpid(), recorded) is True
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("offset", [300 + START_TIME_DRIFT_TOLERANCE + 1, -START_TIME_DRIFT_TOLERANCE - 1, -360000])
+def test_recycled_pid_is_still_recycled_when_either_reading_is_tried(monkeypatch, offset):
+    """A PID whose start is past the tolerance of both the raw and the adjusted (+3 s) reading is a
+    stranger: not alive, and the reclaim path reports it recycled without signalling it."""
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import get_process_start_time
+
+    raw = get_process_start_time(os.getpid())
+    _shift_boottime(monkeypatch, 3)
+    recorded = f"{current_instantiation_epoch()}|{raw + offset}"
+    assert kbd._worker_alive(os.getpid(), recorded) is False
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+
+
+@pytest.mark.platforms("macos")
+def test_start_time_is_step_invariant_while_the_public_reading_moves(monkeypatch):
+    from gateway.status import get_process_start_time
+    from hermes_cli.kanban_worker_identity import public_start_time
 
     pid = os.getpid()
-    before = process_start_time(pid)
-    monkeypatch.setattr(_psosx, "INIT_BOOT_TIME", _psosx.boot_time() + 3)
-    assert get_process_start_time(pid) != before
-    assert process_start_time(pid) == before
+    before = get_process_start_time(pid)
+    assert public_start_time(pid) == before
+    _shift_boottime(monkeypatch, 3)
+    assert get_process_start_time(pid) == before
+    assert public_start_time(pid) == before + 300
 
 
-def test_start_time_falls_back_to_the_ordinary_reading(monkeypatch):
-    """Off macOS, or when psutil can't give the kernel's value, the reading is the ordinary one, and an
-    unreadable process stays unreadable."""
+class _NoKernelValue:
+    """A psutil.Process stand-in whose private ``_proc`` is missing or predates ``monotonic``."""
+
+    def __init__(self, real, proc_attr):
+        self._real = real
+        if proc_attr is not None:
+            self._proc = proc_attr
+
+    def create_time(self):
+        return self._real.create_time()
+
+
+class _OldProc:
+    def create_time(self):  # no ``monotonic`` keyword
+        return 0.0
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("proc_attr", [None, _OldProc()], ids=["no-_proc", "no-monotonic-keyword"])
+def test_start_time_falls_back_to_the_public_reading(monkeypatch, proc_attr):
+    """If a later psutil drops ``_proc`` or its keyword, the reading is the public one, as before."""
     import psutil
 
-    import hermes_cli.kanban_worker_identity as identity
+    from gateway import status
 
-    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 12345)
-    monkeypatch.setattr(identity.sys, "platform", "linux")
-    assert identity.process_start_time(os.getpid()) == 12345
+    real_process = psutil.Process
+    pid = os.getpid()
+    public = int(round(real_process(pid).create_time() * 100))
+    monkeypatch.setattr(psutil, "Process", lambda p: _NoKernelValue(real_process(p), proc_attr))
+    assert status.get_process_start_time(pid) == public
 
-    monkeypatch.setattr(identity.sys, "platform", "darwin")
 
-    def no_kernel_value(pid):
-        raise psutil.AccessDenied(pid)
+@pytest.mark.platforms("not macos")
+def test_off_macos_there_is_no_compatibility_reading():
+    """Off macOS the start time never changed, so only the ordinary reading is compared."""
+    from hermes_cli.kanban_worker_identity import public_start_time
 
-    monkeypatch.setattr(psutil, "Process", no_kernel_value)
-    assert identity.process_start_time(os.getpid()) == 12345
+    assert public_start_time(os.getpid()) is None
 
-    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: None)
-    assert identity.process_start_time(os.getpid()) is None
+
+@pytest.mark.parametrize(("current", "public", "same"), [
+    ("e|179246502392", None, True),                  # raw reading matches
+    ("e|179246502092", "e|179246502392", True),      # only the adjusted reading matches (old row)
+    ("e|179246502092", "e|179246502092", False),     # neither: off by 3 s
+    (None, "e|179246502392", False),                 # unreadable now: the public reading can't rescue it
+    ("e|179246502092", "other|179246502392", False), # the epoch still has to agree
+    ("e|179246502092", None, False),                 # off macOS / no public reading
+])
+def test_recorded_fingerprint_matches_either_reading(current, public, same):
+    assert recorded_fingerprint_matches("e|179246502392", current, public) is same
+
+
+def test_integer_row_keeps_exact_comparison_against_either_reading():
+    assert recorded_fingerprint_matches(179246502392, 179246502092, 179246502392) is True
+    assert recorded_fingerprint_matches(179246502392, 179246502092, 179246502492) is False
