@@ -1520,8 +1520,7 @@ def _run_no_agent_job(
     """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
     verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
     """
-    # Load .env first so auto-delivery can resolve *_HOME_CHANNEL: the agent path's per-run dotenv
-    # reload never runs for no_agent jobs. Does not override existing values.
+    # Load .env for delivery's home channels; the agent path's reload never runs here.
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -1536,7 +1535,9 @@ def _run_no_agent_job(
 
         return _block_and_pause_job(job_id, job_name, NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
-    # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
+    # Capture start-time lateness without changing the script's input or silence gates.
+    from cron.oneshot_lateness import late_note
+    late_prefix = late_note(job)
     _job_workdir = _resolve_job_workdir(job, job_id)
     try:
         ok, output = _run_job_script_with_claim_heartbeat(
@@ -1550,7 +1551,7 @@ def _run_no_agent_job(
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
-        alert = (
+        alert = late_prefix + (
             f"⚠ Cron watchdog '{job_name}' script failed\n\n"
             f"{output}\n\n"
             f"Time: {now_iso}"
@@ -1566,6 +1567,7 @@ def _run_no_agent_job(
         logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)
         return True, f"{header}**Status:** silent (empty output)\n", SILENT_MARKER, None
 
+    output = output if _is_cron_silence_response(output) else late_prefix + output
     return True, f"{header}\n---\n\n{output}\n", output, None
 
 
