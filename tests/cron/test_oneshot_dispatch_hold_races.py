@@ -217,6 +217,73 @@ def test_8_a_queued_run_past_its_deadline_is_not_started(store):
     assert claim_job_for_fire("gp", manual=True)
 
 
+def test_10_degraded_jobs_lock_never_mutates_the_hold_marker(store, monkeypatch):
+    """A real sibling flock forces timeout: neither stamping nor cleanup may race its owner."""
+    marker = cronjobs.CRON_DIR / "dispatch_held"
+    original = f"{_at(9, 0).timestamp()} {_at(9, 1).timestamp()}\n"
+    marker.write_text(original, encoding="utf-8")
+    code = (
+        "import fcntl, sys; from pathlib import Path\n"
+        "with Path(sys.argv[1]).open('a+') as lock:\n"
+        " fcntl.flock(lock, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()\n")
+    child = subprocess.Popen([sys.executable, "-c", code, str(cronjobs._jobs_lock_file())],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "locked"
+        monkeypatch.setattr(cronjobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.1)
+        store["clock"]["now"] = _at(10, 0)
+        oneshot_lateness.note_dispatch_held()
+        after_stamp = marker.read_text(encoding="utf-8")
+        with cronjobs._jobs_lock() as protected:
+            assert protected is False
+            oneshot_lateness.end_hold_window(_at(10, 0).timestamp())
+        assert (after_stamp, marker.read_text(encoding="utf-8") if marker.exists() else None) == (
+            original, original)
+    finally:
+        child.communicate(timeout=10)
+        assert child.returncode == 0
+
+
+def test_11_resumed_ticker_does_not_cover_a_later_unrelated_miss(store, monkeypatch):
+    """Actual dispatch resumption caps the gap; arbitrary CLI scans do not end a live hold."""
+    from cron import bot_chat_delivery, scheduler, scheduler_tick
+
+    monkeypatch.setattr(scheduler, "_should_yield_tick_to_fresh_gateway", lambda: None)
+    monkeypatch.setattr(scheduler_tick, "_acquire_tick_lock_or_degrade", lambda _: object())
+    monkeypatch.setattr(scheduler, "_release_tick_lock", lambda _: None)
+    monkeypatch.setattr(bot_chat_delivery, "drain", lambda: None)
+    for name in ("_maybe_reap_dead_owners", "_maybe_run_worktree_maintenance", "_sweep_mcp_orphans"):
+        monkeypatch.setattr(scheduler, name, lambda: None)
+    monkeypatch.setattr(scheduler, "_sweep_stale_inflight_for_tick", lambda _: None)
+    monkeypatch.setattr(scheduler, "get_due_jobs", get_due_jobs)
+    save_jobs([_oneshot("later", _at(10, 5))])
+    _hold(store, _at(9, 42), _at(10, 0))
+    for now in (_at(10, 1), _at(10, 3), _at(10, 4)):
+        store["clock"]["now"] = now
+        assert scheduler_tick._tick_admitted(verbose=False, can_dispatch=lambda: True) == 0
+    store["clock"]["now"] = _at(10, 10)
+    assert get_due_jobs() == []
+    assert _ids() == []
+
+
+def test_12_schedule_edit_discards_oneshot_deadline_and_recurring_fire_ignores_it(store):
+    save_jobs([_oneshot("gp", _at(10, 0))])
+    _hold(store, _at(9, 42), _at(10, 12))
+    store["clock"]["now"] = _at(10, 13)
+    assert [d["id"] for d in get_due_jobs()] == ["gp"]
+    assert clear_run_claim("gp")
+    assert load_jobs()[0]["run_claim"]["until"] == _at(12, 0).timestamp()
+    edited = cronjobs.update_job("gp", {"schedule": "every 3h"})
+    assert "until" not in (edited.get("run_claim") or {})
+    # Legacy/hand-edited recurring records with the obsolete field cannot be wedged either.
+    rows = load_jobs()
+    rows[0]["run_claim"] = {"outage": True, "until": _at(12, 0).timestamp()}
+    save_jobs(rows)
+    store["clock"]["now"] = _at(13, 13)
+    assert [d["id"] for d in get_due_jobs()] == ["gp"]
+    assert claim_job_for_fire("gp")
+
+
 def test_9_a_marker_stamped_in_the_future_admits_nothing(store):
     """A writer with a fast clock (or a clock corrected backwards) left last=11:00. At 10:30 that
     is no evidence of a live hold: the 10:00 reminder is a miss and the marker goes."""

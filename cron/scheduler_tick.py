@@ -113,6 +113,11 @@ def _tick_admitted(
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
         due_jobs = _sched.get_due_jobs()
+        if can_dispatch is not None:
+            # Only the gated ticker knows dispatch resumed. A CLI scan during another process's
+            # live hold must not cap the restart gap before that holding gateway exits.
+            from cron.oneshot_lateness import note_dispatch_resumed
+            note_dispatch_resumed()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
         if not due_jobs:

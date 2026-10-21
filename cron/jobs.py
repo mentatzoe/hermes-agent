@@ -2143,6 +2143,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
+            # A hold admission belongs to the old one-shot occurrence, never the edited schedule.
+            claim = updated.get("run_claim")
+            if isinstance(claim, dict) and "until" in claim:
+                updated["run_claim"] = {k: v for k, v in claim.items() if k not in {"until", "outage"}}
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
             # the record from the stale-error re-arm while no longer describing where it is
             # parked. The next fire re-parks (with a fresh notice) if the window is still closed.

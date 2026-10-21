@@ -6,14 +6,12 @@ minutes for running work, the ticker skips every tick meanwhile (``can_dispatch`
 replacement gateway's first scan found a reminder due in that wait already past its grace and
 removed it unrun, leaving only a file in its output folder (aleph-vault#221).
 
-* **Hold marker.** Every held tick stamps ``cron/dispatch_held`` (``<since> <last>``, epoch
-  seconds) in each store the ticker visits. The file is the only state, so it outlives the process
-  and every process's scan reads the same answer. A one-shot past its grace still fires once when
-  it fell due between ``since`` and shortly after ``last``, the marker was stamped recently (a
-  restart, not downtime), and it is at most ``HELD_ONESHOT_MAX_LATE_SECONDS`` late. A scan deletes
-  the marker only once it can no longer cover anything (unstamped for ``_TAIL_SECONDS``, or
-  stamped in the future), so no scan in any process can end a hold early. Stamping and deleting
-  both happen under the store's jobs lock.
+* **Hold marker.** Every held tick stamps ``cron/dispatch_held`` (``<since> <last>`` with an
+  optional ``<resumed>`` epoch timestamp) in each store the ticker visits. The file is the only
+  hold state, so it outlives the process. A one-shot past grace still fires once if due in a recent
+  hold or its restart tail, at most ``HELD_ONESHOT_MAX_LATE_SECONDS`` late. A gated ticker's first
+  resumed scan caps that tail; a CLI scan cannot end another process's live hold. An expired
+  marker is deleted. All mutations require the store's real cross-process jobs lock.
 * **Late run.** A one-shot fired past its grace is stamped in ``last_dispatch`` and its prompt opens
   with when it was due. A hold-admitted claim carries ``until`` (due + the 2 h ceiling), which
   ``clear_run_claim`` keeps; past it, neither a due scan nor a queued worker's fire claim starts
@@ -47,15 +45,15 @@ def _marker_path():
     return _current_cron_store().cron_dir / _MARKER
 
 
-def _read_marker() -> Optional[Tuple[float, float]]:
+def _read_marker() -> Optional[Tuple[float, float, Optional[float]]]:
     try:
         fields = _marker_path().read_text(encoding="utf-8-sig").split()
-        return float(fields[0]), float(fields[-1])
+        return float(fields[0]), float(fields[1]), float(fields[2]) if len(fields) == 3 else None
     except (OSError, ValueError, IndexError):
         return None
 
 
-def _live(marker: Optional[Tuple[float, float]], now: float) -> bool:
+def _live(marker: Optional[Tuple[float, float, Optional[float]]], now: float) -> bool:
     """Whether a marker's last stamp is recent enough to belong to a hold that still covers jobs."""
     return marker is not None and -_SKEW_SECONDS <= now - marker[1] <= _TAIL_SECONDS
 
@@ -67,10 +65,13 @@ def note_dispatch_held() -> None:
     write. A write failure costs this protection, never the tick."""
     from cron.jobs import _hermes_now, _jobs_lock, _write_marker
 
-    with _jobs_lock():
+    with _jobs_lock() as protected:
+        if not protected:
+            # Fail closed: miss this stamp rather than publish over a scanner's locked snapshot.
+            return
         now = _hermes_now().timestamp()
         previous = _read_marker()
-        since = previous[0] if _live(previous, now) else now
+        since = previous[0] if previous is not None and _live(previous, now) and previous[2] is None else now
         if previous is None or since != previous[0]:
             logger.info("Cron dispatch held: a one-shot that falls due now fires once when it resumes")
         _write_marker(_MARKER, f"{since} {now}\n", ".held_")
@@ -82,23 +83,44 @@ def hold_covers(due_at: float, now: float) -> bool:
     from cron.jobs import ONESHOT_GRACE_SECONDS
 
     marker = _read_marker()
-    if not _live(marker, now):
+    if marker is None or not _live(marker, now):
         return False
-    since, last = marker
-    return (since - ONESHOT_GRACE_SECONDS <= due_at <= last + _TAIL_SECONDS
+    since, last, resumed = marker
+    end = min(last + _TAIL_SECONDS, resumed) if resumed is not None else last + _TAIL_SECONDS
+    return (since - ONESHOT_GRACE_SECONDS <= due_at <= end
             and now - due_at <= HELD_ONESHOT_MAX_LATE_SECONDS)
 
 
+def note_dispatch_resumed() -> None:
+    """A gated ticker completed a due scan. Cap coverage at its first resumed scan, not each scan.
+    CLI scans don't call this: they cannot know whether another process still holds dispatch."""
+    from cron.jobs import _hermes_now, _jobs_lock, _write_marker
+
+    with _jobs_lock() as protected:
+        if not protected:
+            # Keep the old bounded cover rather than end a hold whose current stamp we can't lock.
+            return
+        now = _hermes_now().timestamp()
+        marker = _read_marker()
+        if marker is not None and _live(marker, now) and marker[2] is None:
+            _write_marker(_MARKER, f"{marker[0]} {marker[1]} {now}\n", ".held_")
+
+
 def end_hold_window(now: float) -> None:
-    """After a due scan's save (under the jobs lock): drop a marker that can no longer cover any job,
-    so normal grace applies again. A marker that still could stays, whichever process scans."""
-    if _live(_read_marker(), now):
-        return
-    path = _marker_path()
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("Could not clear %s: %s", path, exc)
+    """After a due scan's save: drop an expired marker, but only with real cross-process protection."""
+    from cron.jobs import _jobs_lock
+
+    with _jobs_lock() as protected:
+        if not protected:
+            # Never delete a stamp without its lock: it may have been renewed by another process.
+            return
+        if _live(_read_marker(), now):
+            return
+        path = _marker_path()
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not clear %s: %s", path, exc)
 
 
 def late_claim_fields(until: Optional[float]) -> Dict[str, Any]:
@@ -117,6 +139,9 @@ def retry_claim(claim: Any) -> Optional[Dict[str, Any]]:
 
 def claim_expired(job: Dict[str, Any], now: float) -> bool:
     """A hold-admitted ``run_claim`` past its ``until``: the job may no longer start on schedule."""
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("kind") != "once":
+        return False  # Legacy recurring records may still carry a former one-shot's deadline.
     claim = job.get("run_claim")
     until = claim.get("until") if isinstance(claim, dict) else None
     return isinstance(until, (int, float)) and now > until
