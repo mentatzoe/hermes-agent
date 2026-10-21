@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import cron.scheduler as scheduler
 from cron import scheduler_preflight as sched_preflight
 import gateway.run as gateway_run
+from gateway import run_cron_delivery
 
 
 class _OneTickStopEvent:
@@ -73,8 +74,8 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
     monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: root_home)
 
     monkeypatch.setattr(
-        gateway_run,
-        "_handoff_watch_scopes",
+        run_cron_delivery,
+        "cron_delivery_scopes",
         lambda _runner: [(None, None), ("secondary", secondary_home)],
     )
 
@@ -125,8 +126,8 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
     routed = object()
 
     monkeypatch.setattr(
-        gateway_run,
-        "_handoff_watch_scopes",
+        run_cron_delivery,
+        "cron_delivery_scopes",
         lambda _runner: [(None, None), ("secondary", secondary_home)],
     )
 
@@ -214,7 +215,7 @@ def test_primary_drain_delivers_credentialless_satellite_queue_row_through_prima
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
     runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True), _profile_adapters={"satellite": {}})
-    monkeypatch.setattr(gateway_run, "_handoff_watch_scopes", lambda _r: [("satellite", satellite_home)])
+    monkeypatch.setattr(run_cron_delivery, "cron_delivery_scopes", lambda _r: [("satellite", satellite_home)])
     try:
         with patch("tools.send_message_tool._send_to_platform", _standalone), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):

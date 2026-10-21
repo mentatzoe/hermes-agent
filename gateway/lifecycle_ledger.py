@@ -26,10 +26,11 @@ logger = logging.getLogger(__name__)
 
 def _process_hermes_home() -> Path:
     """HERMES_HOME for process-level identity files (ignore task overrides)."""
-    from hermes_constants import get_hermes_home, get_process_hermes_home
+    from hermes_constants import get_process_hermes_home
 
-    # get_process_hermes_home expands ``~``/``$VAR`` (python -m gateway.run skips the CLI normalizer).
-    return get_process_hermes_home() if os.environ.get("HERMES_HOME", "").strip() else get_hermes_home()
+    # The module entrypoint need not set HERMES_HOME; its platform default must
+    # still ignore the secondary profile scope of a /restart or cron tick.
+    return get_process_hermes_home()
 
 
 def _home_path(home: Optional[Path], *relative: str) -> Path:

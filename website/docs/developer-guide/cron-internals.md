@@ -54,6 +54,10 @@ idempotent one-line skipped-run notice in the profile's `cron/deliveries.db`, ad
 job's delivery target. A missing/local target uses the home-channel fallback (`origin` without
 an origin). Queue/transport failures are logged; delivery remains subject to the existing
 queue's at-most-once and unavailable-transport semantics. Nothing sends from the due scanner.
+The gateway drains and watches queues for the same profile set as cron, even with adapter
+multiplexing disabled; secondary queues use their own adapters or exact enabled primary
+routes, and stand down when another gateway owns that profile. Process lifecycle evidence
+always resolves against the launch home, including when `HERMES_HOME` is unset.
 
 ## Job Storage
 
