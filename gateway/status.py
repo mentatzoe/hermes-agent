@@ -481,18 +481,9 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     # of the same process compare equal without float-precision fragility.
     try:
         import psutil  # type: ignore
-        proc = psutil.Process(pid)
-        # macOS: public create_time() adds (boot time cached at psutil import - kern.boottime
-        # now) once they differ by >= 1 s, so after a clock step a long-lived gateway reads
-        # every start time shifted (21 Oct 2026: +3 s, false Kanban crashes). The kernel's
-        # p_starttime doesn't move; read it unadjusted so every process agrees.
-        raw = getattr(getattr(proc, "_proc", None), "create_time", None)
-        if sys.platform == "darwin" and raw is not None:
-            try:
-                return int(round(raw(monotonic=True) * 100))
-            except TypeError:
-                pass  # psutil without the keyword: fall back to the public value
-        return int(round(proc.create_time() * 100))
+        from hermes_cli.process_start_time import process_create_time
+
+        return int(round(process_create_time(psutil.Process(pid)) * 100))
     except Exception:
         return None
 

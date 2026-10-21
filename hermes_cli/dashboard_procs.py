@@ -928,7 +928,9 @@ def _process_age_seconds(pid: int) -> float:
     import time as _time
 
     import psutil as _psutil
-    return max(0.0, _time.time() - _psutil.Process(pid).create_time())
+    from hermes_cli.process_start_time import process_create_time
+
+    return max(0.0, _time.time() - process_create_time(_psutil.Process(pid)))
 
 
 def _reap_orphaned_desktop_local_serves(
