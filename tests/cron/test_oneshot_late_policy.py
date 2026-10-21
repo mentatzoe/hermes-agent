@@ -60,8 +60,8 @@ def test_restart_wait_runs_once_with_note(rig):
     _, due = late_job(rig)
     assert scheduler.tick(verbose=False) == 1
     assert len(rig[2]) == 1
-    assert rig[2][0].startswith("This one-off job is running late")
-    assert due in rig[2][0] and "1800" in rig[2][0]
+    assert rig[2][0].startswith("Running late:")
+    assert due in rig[2][0] and "30 min ago" in rig[2][0]
     assert "time-bound" in rig[2][0] and "silent" in rig[2][0]
     assert scheduler.tick(verbose=False) == 0
     assert len(rig[2]) == 1
@@ -73,7 +73,8 @@ def test_seven_hours_late_is_skipped_once(rig):
     assert not rig[2]
     assert len(rig[3]) == 1
     content = rig[3][0][0]
-    assert "Skipped" in content and "reminder" in content and due in content and "25200" in content
+    assert content == ("Skipped 'reminder': it was due at 05:00 and is now 7 h late, "
+                       "past the 6 h limit for late one-off jobs.")
     assert scheduler.tick(verbose=False) == 0
     assert len(rig[3]) == 1
     assert not jobs.load_jobs()
@@ -88,8 +89,8 @@ def test_script_output_late_prefix(rig, monkeypatch, stdout, visible):
     assert scheduler.tick(verbose=False) == 1
     if visible:
         content = rig[3][0][0]
-        assert content.startswith("This one-off job is running late")
-        assert due in content and content.endswith("result")
+        assert content.startswith("Running late:")
+        assert content == "Running late: this was due at 11:30, 30 min ago.\nresult"
     else:
         assert not rig[3]
 
@@ -108,7 +109,7 @@ def test_schedule_edited_before_worker_uses_current_time(rig, monkeypatch):
     assert scheduler.tick(verbose=False) == 1
     assert len(rig[2]) == 1
     assert edited_due in rig[2][0] and old_due not in rig[2][0]
-    assert "300" in rig[2][0]
+    assert "5 min ago" in rig[2][0]
     assert scheduler.tick(verbose=False) == 0
 
 
@@ -129,7 +130,7 @@ def test_recurring_unchanged(rig, catch_up):
     rows[0]["next_run_at"] = (rig[1][0] - timedelta(hours=7)).isoformat()
     jobs.save_jobs(rows)
     assert scheduler.tick(verbose=False) == int(catch_up)
-    assert all("one-off job is running late" not in prompt for prompt in rig[2])
+    assert all("Running late:" not in prompt for prompt in rig[2])
     assert all("Skipped" not in item[0] for item in rig[3])
     assert jobs.get_job(job["id"])
 
@@ -248,7 +249,7 @@ def test_forced_and_manual_fire_have_no_late_note(rig, manual):
     claimed = jobs.claim_job_for_fire(job["id"], force=not manual, manual=manual, return_job=True)
     assert scheduler.run_one_job(claimed)
     assert len(rig[2]) == 1
-    assert "one-off job is running late" not in rig[2][0]
+    assert "Running late:" not in rig[2][0]
     assert all("Skipped" not in row[0] for row in rig[3])
 
 
@@ -256,7 +257,7 @@ def test_store_outage_recovery_stays_exempt(rig, monkeypatch):
     late_job(rig, 7 * 3600)
     monkeypatch.setattr(jobs.store_health, "outage_covers", lambda *a: True)
     assert scheduler.tick(verbose=False) == 1
-    assert "one-off job is running late" not in rig[2][0]
+    assert "Running late:" not in rig[2][0]
     assert all("Skipped" not in row[0] for row in rig[3])
 
 
@@ -304,8 +305,9 @@ def test_failed_script_late_prefix_survives_normal_failure_composer(rig, monkeyp
                         lambda *a, **kw: (False, "Script exited with code 1"))
     assert scheduler.tick(verbose=False) == 1
     assert len(rig[3]) == 1
-    assert rig[3][0][0].startswith("This one-off job is running late")
-    assert due in rig[3][0][0] and "failed" in rig[3][0][0]
+    assert rig[3][0][0].startswith("Running late:")
+    assert rig[3][0][0].splitlines()[0] == "Running late: this was due at 11:30, 30 min ago."
+    assert "failed" in rig[3][0][0]
 
 
 def test_failed_script_note_does_not_unsuppress_acked_incident(rig, monkeypatch):
@@ -328,4 +330,67 @@ def test_script_note_uses_start_time_not_long_runtime(rig, monkeypatch, ok):
     monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat", long_script)
     assert scheduler.tick(verbose=False) == 1
     assert len(rig[3]) == 1
-    assert "one-off job is running late" not in rig[3][0][0]
+    assert "Running late:" not in rig[3][0][0]
+
+
+
+def test_fresh_foreign_run_claim_blocks_late_job_without_fire_claim(rig):
+    job, _ = late_job(rig)
+    rows = jobs.load_jobs()
+    claim = {"at": (rig[1][0] - timedelta(seconds=10)).isoformat(), "by": "other-host:123"}
+    rows[0]["run_claim"] = claim
+    assert not rows[0].get("fire_claim")
+    jobs.save_jobs(rows)
+    for _ in range(2):
+        assert scheduler.tick(verbose=False) == 0
+        stored = jobs.get_job(job["id"])
+        assert stored["run_claim"] == claim and not stored.get("fire_claim")
+    assert not rig[2] and not rig[3]
+
+
+@pytest.mark.parametrize("seconds,elapsed", [(149, "2 min"), (150, "3 min"),
+                                             (3599, "1 h"), (3900, "1 h 5 min")])
+def test_note_rounds_elapsed_minutes(rig, seconds, elapsed):
+    from cron.oneshot_lateness import late_note
+    late_job(rig, seconds)
+    claimed = jobs.get_due_jobs()[0]
+    assert late_note(claimed).endswith(f", {elapsed} ago.\n")
+
+
+def test_note_uses_scheduler_local_date_across_midnight(rig):
+    from zoneinfo import ZoneInfo
+    from cron.oneshot_lateness import late_note
+    rig[1][0] = datetime(2026, 10, 22, 0, 5, tzinfo=ZoneInfo("Europe/London"))
+    job, _ = late_job(rig, 35 * 60)
+    # Stored UTC is a different wall-clock date: display in the scheduler's timezone.
+    rows = jobs.load_jobs()
+    utc_due = "2026-10-21T22:30:00+00:00"
+    rows[0]["next_run_at"] = utc_due
+    rows[0]["schedule"]["run_at"] = utc_due
+    jobs.save_jobs(rows)
+    claimed = jobs.get_due_jobs()[0]
+    expected = "Running late: this was due at 23:30 on Wed 21 Oct, 35 min ago."
+    assert late_note(claimed) == expected + "\n"
+    assert expected in late_note(claimed, agent=True) and utc_due in late_note(claimed, agent=True)
+
+
+def test_skip_has_local_date_name_and_limit(rig):
+    from zoneinfo import ZoneInfo
+    rig[1][0] = datetime(2026, 10, 22, 0, 5, tzinfo=ZoneInfo("Europe/London"))
+    job, _ = late_job(rig, 7 * 3600 + 5 * 60)
+    jobs.update_job(job["id"], {"name": "henko-nudge"})
+    assert scheduler.tick(verbose=False) == 0
+    assert rig[3][0][0] == ("Skipped 'henko-nudge': it was due at 17:00 on Wed 21 Oct "
+                            "and is now 7 h 5 min late, past the 6 h limit for late one-off jobs.")
+
+
+def test_note_compares_local_dates_not_stored_offset(rig):
+    from zoneinfo import ZoneInfo
+    from cron.oneshot_lateness import late_note
+    rig[1][0] = datetime(2026, 10, 22, 0, 45, tzinfo=ZoneInfo("Europe/London"))
+    late_job(rig, 30 * 60)
+    rows = jobs.load_jobs()
+    rows[0]["next_run_at"] = "2026-10-21T23:15:00+00:00"
+    rows[0]["schedule"]["run_at"] = rows[0]["next_run_at"]
+    jobs.save_jobs(rows)
+    assert late_note(jobs.get_due_jobs()[0]) == "Running late: this was due at 00:15, 30 min ago.\n"

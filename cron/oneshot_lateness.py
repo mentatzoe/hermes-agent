@@ -10,13 +10,28 @@ import math
 
 logger = logging.getLogger("cron.scheduler")
 _skip_delivery: ContextVar[list | None] = ContextVar("oneshot_skip_delivery", default=None)
-_LATE_PREFIX = "This one-off job is running late:"
+_LATE_PREFIX = "Running late:"
 
 
 def max_lateness_seconds():
     from cron.jobs import _cron_config_number
     value = _cron_config_number("oneshot_max_lateness_seconds", 0, float)
     return value if math.isfinite(value) and value > 0 else 0
+
+
+def _duration(seconds):
+    """Nearest whole minute, with half minutes rounded up."""
+    hours, minutes = divmod(int(max(0, seconds) / 60 + 0.5), 60)
+    return f"{hours} h" + (f" {minutes} min" if minutes else "") if hours else f"{minutes} min"
+
+
+def _local_due(due, now):
+    """Use the scheduler's configured timezone, including its local calendar date."""
+    local = due.astimezone(now.tzinfo)
+    text = local.strftime("%H:%M")
+    if local.date() != now.date():
+        text += f" on {local:%a} {local.day} {local:%b}"
+    return text
 
 
 def outage_exempt(d):
@@ -41,8 +56,9 @@ def retire_expired_oneshot(d):
         d.scan.retire(d.job["id"])
         d.scan.on_saved.append(lambda: jobs.record_cron_missed(d.job))
         if automatic and jobs._cron_config_number("notify_missed_oneshots", False, lambda v: v is True):
-            text = (f"Skipped one-off job '{_one_line(d.label)}': due {d.next_run}; "
-                    f"{late:.0f} seconds late (outside the allowed lateness window).")
+            text = (f"Skipped '{_one_line(d.label)}': it was due at {_local_due(d.next_run_dt, d.scan.now)} "
+                    f"and is now {_duration(late)} late, past the {_duration(max_lateness_seconds())} "
+                    "limit for late one-off jobs.")
             d.scan.on_saved.append(lambda: _notice_after_save(d.job, text))
     return True
 
@@ -100,12 +116,14 @@ def late_note(job, *, agent=False):
     due = jobs._parse_aware(job.get("next_run_at"))
     if due is None:
         return ""
-    late = jobs._elapsed_seconds(jobs._hermes_now(), due)
+    now = jobs._hermes_now()
+    late = jobs._elapsed_seconds(now, due)
     if late <= jobs.ONESHOT_GRACE_SECONDS:
         return ""
-    text = f"{_LATE_PREFIX} due {job['next_run_at']}; {late:.0f} seconds late."
+    text = f"{_LATE_PREFIX} this was due at {_local_due(due, now)}, {_duration(late)} ago."
     if agent:
-        text += " Adjust time-bound wording to the actual time, or stay silent if it is no longer useful."
+        text += (f" Scheduled timestamp: {job['next_run_at']}."
+                 " Adjust time-bound wording to the actual time, or stay silent if it is no longer useful.")
     return text + ("\n\n" if agent else "\n")
 
 

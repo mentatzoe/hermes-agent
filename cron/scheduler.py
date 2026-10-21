@@ -2357,7 +2357,8 @@ class _CronRunScope:
         for name in _CRON_DELIVERY_VARS:
             _VAR_MAP[name].set("")
         # Workdir binds to the per-run task id (tool-layer cwd authority) instead of mutating
-        # global TERMINAL_CWD; _SESSION_CWD above remains the prompt/context-file authority.
+        # global TERMINAL_CWD; never os.chdir() (leaks into concurrent gateway sessions).
+        # _SESSION_CWD above remains the prompt/context-file authority.
         self.task_id = f"cron:{job_id}:{execution_id or job.get('execution_id') or uuid.uuid4().hex}"
         if self.workdir:
             record_session_cwd(self.task_id, self.workdir)
