@@ -2,7 +2,27 @@
 
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+from hermes_cli.active_sessions import _FileLock
+
+
+def persist_runtime_status(
+    path: Path, payload: dict[str, Any], write_fn: Callable[[Path, dict[str, Any]], None]
+) -> bool:
+    """Serialize ownership validation through atomic replacement across writers.
+
+    Lock a stable sibling, not the JSON inode that atomic replacement unlinks.
+    The lock lives only on the background writer thread and is released by the
+    OS if a writer dies; another process's queued write then checks the owner
+    it actually finds, rather than the one it observed before waiting.
+    """
+    with _FileLock(path.with_suffix(path.suffix + ".lock")):
+        merged = merge_runtime_status_on_disk(path, payload)
+        if merged is None:
+            return False
+        write_fn(path, merged)
+        return True
 
 
 def merge_runtime_status_on_disk(
