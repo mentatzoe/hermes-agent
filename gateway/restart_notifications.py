@@ -144,6 +144,8 @@ async def complete_notice(runner, event) -> None:
 
 async def dispatch_message(adapter, event: MessageEvent):
     """Recheck after profile-scope awaits too; a runner refusal is not consumption."""
+    if not event.internal:
+        return await adapter._message_handler(event)
     key = adapter._event_session_key(event)
     if await defer_during_restart(adapter, event, key):
         return None

@@ -837,10 +837,11 @@ class GatewayBusySessionMixin:
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # A profile-scoped busy callback may have yielded since adapter admission.
         from gateway.restart_notifications import defer_during_restart
-        adapter = self._delivery_adapter_for(event.source)
-        if event.internal and adapter and await defer_during_restart(adapter, event, session_key):
-            event._gateway_accepted = True
-            return True
+        if event.internal:
+            adapter = self._delivery_adapter_for(event.source)
+            if adapter and await defer_during_restart(adapter, event, session_key):
+                event._gateway_accepted = True
+                return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if event.internal and event.allow_gateway_control:
