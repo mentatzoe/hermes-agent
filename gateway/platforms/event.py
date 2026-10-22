@@ -111,6 +111,7 @@ class MessageEvent:
     _restart_notification_id: Optional[str] = field(default=None, init=False, repr=False, compare=False)
     _restart_notification_path: Optional[Path] = field(default=None, init=False, repr=False, compare=False)
     _restart_notification_deferred: bool = field(default=False, init=False, repr=False, compare=False)
+    _restart_notification_consumed: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Transport-attested bots are conversational peers, not operators.

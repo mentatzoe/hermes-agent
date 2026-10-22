@@ -199,6 +199,13 @@ started or are still loading a profile. Notices that already crossed the executi
 boundary are not added to this handoff. Explicit session ownership also bypasses
 ordinary Telegram topic healing, so a stale binding cannot replace the pinned
 session; verified compression continuation is resolved before that check.
+Main and queued-follow-up turns recheck restart handoff after their last
+pre-execution hook/preparation await. Execution admission then marks the event
+without another await. Completed consumption is also recorded locally when no
+journal receipt exists yet, so a concurrent lookup or save cannot insert a late
+pending row for work that already finished. A crash or storage failure during
+execution or receipt settlement can still require a retry; this is not an
+exactly-once ledger for tool side effects.
 A missing handler, mismatched explicit session key, or queue-cap drop is not
 acceptance. Custom adapters overriding ingress should delegate internal events to
 `BasePlatformAdapter.handle_message()` (or explicitly record actual admission),

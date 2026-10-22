@@ -16,11 +16,14 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+from typing import TYPE_CHECKING
 import uuid
 
-from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.session_identity import restore_identity, transport_profile_of
+
+if TYPE_CHECKING:
+    from gateway.platforms.event import MessageEvent
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +73,19 @@ def _draining(runner) -> bool:
 
 async def defer_during_restart(adapter, event: MessageEvent, session_key: str) -> bool:
     """Transfer a notice to disk before acknowledging it; humans keep normal dispatch."""
-    runner = getattr(adapter, "gateway_runner", None)
-    if not event.internal or runner is None or not _draining(runner):
+    return await _retain_during_restart(getattr(adapter, "gateway_runner", None), event, session_key)
+
+
+async def _retain_during_restart(runner, event, session_key) -> bool:
+    if not getattr(event, "internal", False) or runner is None or not _draining(runner):
         return False
+    if getattr(event, "_restart_notification_consumed", False):
+        return True
     from gateway.wake import WakeNotAccepted
     try:
         entry = await asyncio.to_thread(runner.session_store.lookup_by_session_key, session_key)
+        if getattr(event, "_restart_notification_consumed", False):
+            return True
         metadata = dict(event.metadata or {})
         session_id = metadata.get("gateway_session_id") or (entry.session_id if entry else None)
         if not isinstance(session_id, str) or not session_id:
@@ -98,6 +108,8 @@ async def defer_during_restart(adapter, event: MessageEvent, session_key: str) -
         event._restart_notification_path = path
         event._restart_notification_deferred = True
         _inflight(runner).discard((path, notice_id))
+        if getattr(event, "_restart_notification_consumed", False):
+            await complete_notice(runner, event)
         return True
     except Exception as exc:
         logger.warning("Could not retain internal notice during restart: %s", exc)
@@ -132,6 +144,11 @@ def _settled(runner) -> set:
 
 async def complete_notice(runner, event) -> None:
     """Record consumption at the real agent boundary, including in-band FIFO followups."""
+    if event is None:
+        return
+    # A concurrent handoff may still be looking up its owner or committing its row.
+    # Its post-commit check must see consumption even when no receipt exists yet.
+    event._restart_notification_consumed = True
     path = getattr(event, "_restart_notification_path", None)
     notice_id = getattr(event, "_restart_notification_id", None)
     if path and notice_id:
@@ -157,19 +174,30 @@ async def dispatch_message(adapter, event: MessageEvent):
     try:
         response = await adapter._message_handler(event)
         executed = getattr(event, "_heartbeat_execution_started", False) is True
+        if executed:
+            await complete_notice(runner, event)
         if event.internal and not executed and await defer_during_restart(adapter, event, key):
             return None
-        if receipt and not event._restart_notification_deferred:
-            if executed:
-                await complete_notice(runner, event)
-            elif not _queued(runner, adapter, event, key):
-                _inflight(runner).discard(receipt)
-                return None  # capacity/routing refusal: keep the row retryable, without a chat reply
+        if receipt and not executed and not event._restart_notification_deferred and not _queued(runner, adapter, event, key):
+            _inflight(runner).discard(receipt)
+            return None  # capacity/routing refusal: keep the row retryable, without a chat reply
         return response
     except BaseException:
         if receipt:
             _inflight(runner).discard(receipt)
         raise
+
+
+async def begin_execution(runner, event, session_key) -> bool:
+    """Choose execution or durable restart handoff at the last pre-agent await boundary."""
+    from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
+    if not heartbeat_owner_is_current(runner, event, session_key):
+        return False
+    if await _retain_during_restart(runner, event, session_key):
+        return False
+    if event is not None:
+        event._heartbeat_execution_started = True
+    return True
 
 
 def track_scheduled_notice(adapter, event, session_key, task) -> None:
@@ -237,6 +265,7 @@ async def _replay_one(runner, path: Path, notice_id: str, payload: dict) -> None
     if (adapter is None or not adapter._message_handler
             or key in adapter._active_sessions or runner._is_session_running(key)):
         return
+    from gateway.platforms.event import MessageEvent, MessageType
     event = MessageEvent(
         text=payload["text"], source=source, internal=True,
         message_type=MessageType(payload["message_type"]), metadata=payload["metadata"],
