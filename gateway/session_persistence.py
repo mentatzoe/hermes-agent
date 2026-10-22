@@ -439,10 +439,12 @@ class SessionPersistenceMixin:
         self._reconcile_recovered_routing_locked()
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(self, data: Dict[str, Any], generation: int, *, require_primary: bool = False) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
+                if require_primary:
+                    raise OSError("Authoritative routing save superseded before commit")
                 return
             # Fold in fast upserts numbered above this snapshot: they were serialized after us and
             # a delayed full rewrite must not regress them.
@@ -470,6 +472,8 @@ class SessionPersistenceMixin:
                     logger.warning(
                         "gateway.session: sessions.json mirror save failed after state.db commit: "
                         "%s", exc)
+            if require_primary and not db_saved:
+                raise OSError("Authoritative routing database commit failed; JSON mirror is insufficient")
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its generation; newer ones stay for
             # the next delayed full writer.
@@ -489,7 +493,7 @@ class SessionPersistenceMixin:
 
     def _save_entry(
         self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
-        lock_held: bool = False) -> None:
+        lock_held: bool = False, require_primary: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural
         transitions use the full rewrite (which also refreshes the sessions.json mirror; it may lag
@@ -497,7 +501,8 @@ class SessionPersistenceMixin:
         ``_save_lock`` the upsert is skipped if a full snapshot or a newer fast save of this key
         already persisted (the reverse case lives in ``_persist_routing_data``). No DB or a failed
         upsert falls back to the full rewrite. ``entry_data`` persists a candidate BEFORE it is
-        published to the live entry (failure-atomic transitions); the fallback carries it too."""
+        published to the live entry (failure-atomic transitions); the fallback carries it too.
+        ``require_primary`` refuses success from only a JSON mirror or a superseding write."""
         guard = contextlib.nullcontext() if lock_held else self._lock
         with guard:
             entry = self._entries.get(session_key)
@@ -511,10 +516,14 @@ class SessionPersistenceMixin:
             try:
                 with self._lazy("_save_lock", threading.Lock):
                     if getattr(self, "_persisted_routing_generation", 0) >= revision:
+                        if require_primary:
+                            raise OSError("Authoritative routing save superseded before commit")
                         return
                     fast_persisted = self._lazy("_fast_persisted_entries", dict)
                     persisted = fast_persisted.get(session_key)
                     if persisted is not None and persisted[0] >= revision:
+                        if require_primary:
+                            raise OSError("Authoritative routing save superseded before commit")
                         return
                     saver(session_key, entry_json, scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
@@ -523,11 +532,11 @@ class SessionPersistenceMixin:
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r (%s); falling back "
                     "to full index rewrite", session_key, exc)
-        if entry_data is not None:
+        if entry_data is not None or require_primary:
             # Full-snapshot fallback carrying the candidate transition.
             with guard:
                 fallback_data = self._entries_as_dicts()
-            fallback_data[session_key] = dict(entry_data)
-            self._persist_routing_data(fallback_data, revision)
+            fallback_data[session_key] = serialized
+            self._persist_routing_data(fallback_data, revision, require_primary=require_primary)
         else:
             self._save_entries()

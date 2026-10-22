@@ -870,13 +870,13 @@ class GatewayShutdownMixin:
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from tools.restart_wait import was_yielded_for_restart
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
-        # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
-        # manager during the drain, the durable marker is already written so the next gateway boot can
-        # recover in-flight sessions (#27856).
+        # Save ordinary live turns before draining. A native wait already saved its
+        # interruption; do not overwrite it or clear it as a successful completion.
         for _sk, _agent in list(self._running_agents.items()):
-            if _agent is _AGENT_PENDING_SENTINEL:
+            if _agent is _AGENT_PENDING_SENTINEL or was_yielded_for_restart(_agent):
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 await self.async_session_store.mark_resume_pending(_sk, reason)
@@ -1643,11 +1643,9 @@ class GatewayShutdownMixin:
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
-        """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
-
-        Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
-        cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
-        """
+        """Wait for active work; save and interrupt native waits for restart recovery."""
+        from gateway.run_restart_wait import yield_restart_waiters
+        await yield_restart_waiters(self)
         active = self._active_work_count()
         if active <= 0:
             return True
@@ -1677,6 +1675,7 @@ class GatewayShutdownMixin:
         deadline = loop.time() + timeout
         last_status_at = 0.0
         while self._awaitable_work_count() > 0:
+            await yield_restart_waiters(self)
             now = loop.time()
             if now >= deadline:
                 logger.warning(

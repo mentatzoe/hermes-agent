@@ -1037,7 +1037,7 @@ def build_resume_recovery_note(
     abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
     """
     reason_phrase = (
-        "a gateway restart" if reason == "restart_timeout"
+        "a gateway restart" if reason in {"restart_timeout", "restart_wait"}
         else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
     if message:
         resume_guidance = (
@@ -1045,7 +1045,7 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
         )
-    elif interactive:
+    elif interactive and reason != "restart_wait":
         resume_guidance = (
             "Report to the user that the session was restored "
             "successfully and ask what they would like to do next.")
@@ -1054,7 +1054,7 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
+            "This is automatic recovery of unfinished work, not a new user message, "
             "so do NOT emit a 'session restored' acknowledgement "
             "or ask questions. Review the conversation history and "
             "CONTINUE the interrupted task to completion.")
@@ -3074,8 +3074,8 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 
 
 # Weak ref to the active GatewayRunner; tools like send_message route through its live adapters.
-import weakref as _weakref
-_gateway_runner_ref: _weakref.ref = lambda: None
+from gateway.restart import register_gateway_runner
+_gateway_runner_ref = lambda: None
 
 
 def _normalize_empty_agent_response(
@@ -3476,7 +3476,7 @@ class GatewayRunner(
         # ``self.config`` is only the launch profile's: anything host-wide (restart notices) needs these.
         self._profile_configs: Dict[str, Any] = {}
         self._warn_if_docker_media_delivery_is_risky()
-        _gateway_runner_ref = _weakref.ref(self)
+        _gateway_runner_ref = register_gateway_runner(self)
 
         self._init_runtime_settings()
         self._init_session_store()
@@ -3986,10 +3986,10 @@ class GatewayRunner(
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
 
-    # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by recover_interrupted_turns()
-    # for a crash-left turn marker (no .clean_shutdown marker). All mean "killed mid-turn" -> startup
-    # auto-resume.
-    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
+    # Interrupted work, including native observation waits saved before restart, resumes at boot.
+    # Waiting-only turns are not crash-loop failures; real interrupted work keeps the loop breaker.
+    # Explicit suspension and owner authorization still take precedence.
+    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted", "restart_wait"})
 
     _MAX_SUPERVISED_RESTARTS = 5
     # Ran this long before crashing = HEALTHY (isolated crash, not a crash-loop); restart counter resets.

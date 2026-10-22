@@ -2644,14 +2644,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         self._completion_consumed &= tracked
         self._poll_observed &= tracked
 
-
-
-
 process_registry = ProcessRegistry()
-
 
 # --- the "process_manage" tool schema + handler -----------------------------------
 from tools.registry import registry, tool_error
+from tools.restart_wait import extend_process_schema, handle_wait_for
 
 PROCESS_SCHEMA = {
     "name": "process_manage",
@@ -2704,6 +2701,7 @@ PROCESS_SCHEMA = {
         "required": ["action"]
     }
 }
+extend_process_schema(PROCESS_SCHEMA)
 
 
 def transform_process_output(output: str, *, command: str, returncode: Optional[int], task_id: str = "") -> str:
@@ -2815,6 +2813,8 @@ def _handle_process(args, **kw):
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
+    if action == "wait_for":
+        return json.dumps(handle_wait_for(args, kw.get("task_id")), ensure_ascii=False)
     if action == "list":
         return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
     if action == "handoff":
@@ -2827,7 +2827,7 @@ def _handle_process(args, **kw):
         handler, redact = _SESSION_ACTIONS[action]
         result = handler(session_id, args)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, wait_for, kill, write, submit, close, handoff")
 
 
 registry.register(

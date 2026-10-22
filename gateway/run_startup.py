@@ -570,7 +570,7 @@ class GatewayStartupMixin:
             return None
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
         # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
-        if candidates:
+        if any(entry.resume_reason != "restart_wait" for entry in candidates):
             try:
                 from gateway import restart_loop_guard as _rlg
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()

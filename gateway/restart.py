@@ -5,9 +5,26 @@ import os
 import re
 import subprocess
 import sys
+import weakref
 from collections.abc import Callable, Mapping
 
 from hermes_cli.config import DEFAULT_CONFIG
+
+_active_gateway_runner_ref = None
+
+
+def register_gateway_runner(runner) -> weakref.ReferenceType:
+    """Share the host across entrypoints and return its weak reference."""
+    global _active_gateway_runner_ref
+    _active_gateway_runner_ref = weakref.ref(runner)
+    return _active_gateway_runner_ref
+
+
+def active_gateway_runner():
+    """Return the live host without importing a second gateway.run module."""
+    ref = _active_gateway_runner_ref
+    return ref() if ref is not None else None
+
 
 # EX_TEMPFAIL (sysexits.h): ask the service manager to restart after a graceful drain/reload.
 GATEWAY_SERVICE_RESTART_EXIT_CODE = 75

@@ -204,16 +204,30 @@ class SessionLifecycleMixin:
             return True
         return self._update_all_entries_locked(_discard)
 
-    def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
-        """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
-        unlike ``suspend_session``). True if marked."""
-        def _apply(entry: SessionEntry):
-            if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
+    def mark_resume_pending(
+        self, session_key: str, reason: str = "restart_timeout", *, expected_session_id: Optional[str] = None,
+    ) -> bool:
+        """Persist a resumable interruption before publishing its marker in memory.
+
+        An expected session id fences a reset/replacement during an off-thread save.
+        Explicit suspension always wins.
+        SQLite must commit unless this is an explicitly JSON-only store.
+        """
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.suspended or (
+                expected_session_id is not None and entry.session_id != expected_session_id
+            ):
                 return False
+            marked_at = _now()
+            candidate = entry.to_dict()
+            candidate.update(resume_pending=True, resume_reason=reason, last_resume_marked_at=marked_at.isoformat())
+            self._save_entry(session_key, entry_data=candidate, lock_held=True,
+                             require_primary=self._pinned_db() is not None)
             entry.resume_pending = True
             entry.resume_reason = reason
-            entry.last_resume_marked_at = _now()
-        return self._update_entry(session_key, _apply)
+            entry.last_resume_marked_at = marked_at
+            return True
 
     def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
