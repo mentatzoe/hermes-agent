@@ -1,7 +1,17 @@
-"""agent/periodic_scheduler: one timer thread dispatches isolated callbacks."""
+"""agent/periodic_scheduler: one timer thread dispatches isolated callbacks.
+
+A shorter interval is due more often when the timer wakes in time to tell the
+intervals apart. A wake later than the slower interval fires each already-due
+handle once — missed intervals are not caught up — so those counts match.
+That is the lease and liveness contract, not a missed ratio. Regression for
+mentatzoe/aleph-vault#266.
+"""
 
 import threading
 import time
+from types import SimpleNamespace
+
+import pytest
 
 from agent import periodic_scheduler
 from agent.periodic_scheduler import PeriodicScheduler, schedule
@@ -16,25 +26,124 @@ def _wait_until(pred, timeout=3.0):
     return pred()
 
 
-def test_two_intervals_fire_proportionally_and_cancel_stops_one():
+class _ControlledWake:
+    """Control only the clock and condition wake, not scheduling or dispatch.
+
+    The real timer and callback threads run until the timer parks with every
+    worker finished. Observations at that point cannot race a delayed worker.
+    """
+
+    def __init__(self, monkeypatch):
+        self.now = 0.0
+        self.scheduler = PeriodicScheduler()
+        self.handles = []
+        self.settled = threading.Event()
+        monkeypatch.setattr(
+            periodic_scheduler, "time", SimpleNamespace(monotonic=lambda: self.now)
+        )
+        self.real_wait = self.scheduler._cond.wait
+        self.scheduler._cond.wait = self._wait
+
+    def _wait(self, timeout=None):
+        if all(h._runner is None for h in self.handles):
+            self.settled.set()
+        # Only the driver advances virtual time. Callback completion still
+        # notifies this real condition, so dispatch and requeue run normally.
+        return self.real_wait()
+
+    def schedule_pair(self, fast, slow):
+        with self.scheduler._cond:
+            self.handles = [
+                self.scheduler.schedule(fast, 0.01),
+                self.scheduler.schedule(slow, 0.05),
+            ]
+        assert self.settled.wait(5.0), "timer did not park after scheduling"
+
+    def advance(self, now):
+        with self.scheduler._cond:
+            self.settled.clear()
+            self.now = now
+            self.scheduler._cond.notify()
+        assert self.settled.wait(5.0), "timer or callback did not finish the wake"
+
+    def close(self):
+        for handle in self.handles:
+            handle.cancel(wait=5.0)
+        with self.scheduler._cond:
+            self.scheduler._cond.wait = self.real_wait
+            self.scheduler._cond.notify()
+
+
+@pytest.fixture
+def controlled_wake(monkeypatch):
+    wake = _ControlledWake(monkeypatch)
+    try:
+        yield wake
+    finally:
+        wake.close()
+
+
+def test_shorter_interval_is_due_more_often_when_wakes_are_on_time(controlled_wake):
+    wake = controlled_wake
+    fast, slow = [], []
+    wake.schedule_pair(lambda: fast.append(wake.now), lambda: slow.append(wake.now))
+
+    # One microsecond per tick avoids floating-point boundary ambiguity while
+    # remaining far shorter than the slow interval. No wall-clock rate assumed.
+    ticks = [tick * 0.010001 for tick in range(1, 16)]
+    for now in ticks:
+        wake.advance(now - 0.005)
+        wake.advance(now)
+
+    assert fast == ticks
+    assert slow == ticks[4::5]
+    assert len(fast) > len(slow)
+
+
+def test_late_wake_fires_each_due_handle_once(controlled_wake):
+    wake = controlled_wake
+    fast, slow = [], []
+    release_fast = threading.Event()
+
+    def fast_callback():
+        # Force the last slow worker to finish first. The driver must wait for
+        # this worker too, not compare live counters when only slow has finished.
+        if len(fast) == 2:
+            assert release_fast.wait(5.0)
+        fast.append(wake.now)
+
+    def slow_callback():
+        slow.append(wake.now)
+        if len(slow) == 3:
+            release_fast.set()
+
+    wake.schedule_pair(fast_callback, slow_callback)
+    try:
+        for now in (0.07, 0.14, 0.21):
+            wake.advance(now)
+            assert fast == slow == [t for t in (0.07, 0.14, 0.21) if t <= now]
+    finally:
+        release_fast.set()
+
+
+def test_cancel_stops_one_callback_without_stopping_its_sibling():
     sched = PeriodicScheduler()
     fast, slow = [], []
-    h_fast = sched.schedule(lambda: fast.append(time.monotonic()), 0.01)
-    h_slow = sched.schedule(lambda: slow.append(time.monotonic()), 0.05)
-
-    assert _wait_until(lambda: len(slow) >= 3)
-    assert len(fast) > len(slow)  # 5x interval ratio -> clearly more fast ticks
+    h_fast = sched.schedule(lambda: fast.append(1), 0.01)
+    h_slow = sched.schedule(lambda: slow.append(1), 0.05)
+    assert _wait_until(lambda: fast and slow)
     assert sched._thread is not None and sched._thread.is_alive()
 
-    h_fast.cancel(wait=1.0)
-    n_fast = len(fast)
-    time.sleep(0.1)
+    h_fast.cancel(wait=2.0)
+    n_fast, n_slow = len(fast), len(slow)
+    assert _wait_until(lambda: len(slow) > n_slow), (
+        "sibling callback stopped when another was cancelled"
+    )
     assert len(fast) == n_fast, "cancelled callback kept firing"
-    assert len(slow) > 3, "sibling callback stopped when another was cancelled"
-    h_slow.cancel(wait=1.0)
+    h_slow.cancel(wait=2.0)
     # With every handle quiesced, scheduling + cancelling adds no persistent thread.
     before = threading.active_count()
-    sched.schedule(lambda: None, 0.01).cancel(wait=1.0)
+    sched.schedule(lambda: None, 0.01).cancel(wait=2.0)
     assert threading.active_count() == before
 
 
