@@ -169,6 +169,81 @@ def test_failed_save_does_not_publish_a_resume_marker(tmp_path, monkeypatch):
         runner.session_store.close_all_db_handles()
 
 
+@pytest.mark.asyncio
+async def test_json_mirror_cannot_authorize_yield_when_both_primary_writes_fail(tmp_path, monkeypatch):
+    runner, _, entry = make_wait_runner(tmp_path)
+    store = runner.session_store
+    db = store._routing_db
+
+    def fail(*args, **kwargs):
+        raise OSError("routing database is read-only")
+
+    monkeypatch.setattr(db, "save_gateway_routing_entry", fail)
+    monkeypatch.setattr(db, "replace_gateway_routing_entries", fail)
+    agent = WaitAgent(entry.session_id)
+    receipt = tmp_path / "exit"
+    done, _, thread = start_wait(runner, entry.session_key, agent, receipt)
+    restored = None
+    try:
+        await yield_restart_waiters(runner)
+        assert not agent._interrupt_requested
+        assert not done.is_set()
+        assert not entry.resume_pending
+        # A successful mirror write is insufficient: startup loads the old DB row.
+        mirror = json.loads((store.sessions_dir / "sessions.json").read_text())
+        assert mirror[entry.session_key]["resume_pending"] is True
+        store.close_all_db_handles()
+        restored = SessionStore(store.sessions_dir, runner.config)
+        saved = restored.lookup_by_session_key(entry.session_key)
+        assert saved.session_id == entry.session_id and not saved.resume_pending
+    finally:
+        receipt.touch()
+        thread.join(5)
+        if restored is not None:
+            restored.close_all_db_handles()
+        store.close_all_db_handles()
+
+
+def test_primary_rewrite_commits_recovery_even_if_legacy_mirror_fails(tmp_path, monkeypatch):
+    runner, _, entry = make_wait_runner(tmp_path)
+    store = runner.session_store
+
+    def fail(*args, **kwargs):
+        raise OSError("write failed")
+
+    monkeypatch.setattr(store._routing_db, "save_gateway_routing_entry", fail)
+    monkeypatch.setattr(store, "_save_sessions_json", fail)
+    restored = None
+    try:
+        assert store.mark_resume_pending(entry.session_key, "restart_wait", expected_session_id=entry.session_id)
+        store.close_all_db_handles()
+        restored = SessionStore(store.sessions_dir, runner.config)
+        saved = restored.lookup_by_session_key(entry.session_key)
+        assert saved.session_id == entry.session_id
+        assert saved.resume_pending and saved.resume_reason == "restart_wait"
+    finally:
+        if restored is not None:
+            restored.close_all_db_handles()
+        store.close_all_db_handles()
+
+
+def test_explicit_json_only_store_keeps_durable_wait_recovery(tmp_path):
+    runner, _ = make_restart_runner()
+    store = SessionStore(tmp_path / "json-sessions", runner.config)
+    store._db = None
+    entry = store.get_or_create_session(make_restart_source(chat_id="json-observer"))
+    assert store.mark_resume_pending(entry.session_key, "restart_wait", expected_session_id=entry.session_id)
+    restored = SessionStore(store.sessions_dir, runner.config)
+    restored._db = None
+    try:
+        saved = restored.lookup_by_session_key(entry.session_key)
+        assert saved.session_id == entry.session_id
+        assert saved.resume_pending and saved.resume_reason == "restart_wait"
+    finally:
+        restored.close_all_db_handles()
+        store.close_all_db_handles()
+
+
 def test_saved_wait_continues_without_asking_the_user_again():
     from gateway.run import build_resume_recovery_note
     note = build_resume_recovery_note("restart_wait", interactive=True)

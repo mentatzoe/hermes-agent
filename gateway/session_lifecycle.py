@@ -211,6 +211,7 @@ class SessionLifecycleMixin:
 
         An expected session id fences a reset/replacement during an off-thread save.
         Explicit suspension always wins.
+        SQLite must commit unless this is an explicitly JSON-only store.
         """
         with self._lock:
             entry = self._entry_locked(session_key)
@@ -221,7 +222,8 @@ class SessionLifecycleMixin:
             marked_at = _now()
             candidate = entry.to_dict()
             candidate.update(resume_pending=True, resume_reason=reason, last_resume_marked_at=marked_at.isoformat())
-            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            self._save_entry(session_key, entry_data=candidate, lock_held=True,
+                             require_primary=self._pinned_db() is not None)
             entry.resume_pending = True
             entry.resume_reason = reason
             entry.last_resume_marked_at = marked_at
