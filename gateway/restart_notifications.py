@@ -178,6 +178,8 @@ async def preserve_pending_notices(runner, adapter, session_key=None) -> None:
     for key in keys:
         head = adapter._pending_messages.get(key)
         overflow = runner._overflow_queue(key)
+        if head is None and overflow and runner._delivery_adapter_for(overflow[0].source) is not adapter:
+            continue  # another transport must save its head before its FIFO tail
         events = [head, *list(overflow or [])]
         for event in events:
             if event is None or not event.internal:

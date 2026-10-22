@@ -2163,7 +2163,7 @@ class GatewayNotificationsMixin:
                     # While the launching turn is still running the injection only queues a follow-up, and
                     # the chat would stay mute for as long as that turn lasts (#112033): send the concise
                     # receipt now.
-                    if turn_busy and (notify_mode in {"concise", "all", "result"} or (
+                    if turn_busy and not getattr(self, "_draining", False) and (notify_mode in {"concise", "all", "result"} or (
                         notify_mode == "error" and session.exit_code not in {0, None}
                     )):
                         message_text = self._format_process_final_message(session_id, session, "concise")

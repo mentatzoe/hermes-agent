@@ -177,3 +177,26 @@ async def test_real_session_resolver_never_retargets_to_idle_or_user_replacement
     else:
         assert resolved is None
     runner._resolve_async_delegation_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart_during_delivery", [False, True])
+async def test_process_watcher_sends_no_concise_receipt_during_restart(tmp_path, monkeypatch, restart_during_delivery):
+    import tools.process_registry as registry
+    from tests.gateway.test_background_process_notifications import _FakeRegistry, _build_runner, _watcher_dict
+
+    session = SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0,
+                              command="echo done", started_at=None)
+    monkeypatch.setattr(registry, "process_registry", _FakeRegistry([session], consumed=False))
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    runner._draining = not restart_during_delivery
+    runner._launching_turn_active = AsyncMock(return_value=True)
+    async def deliver(*args):
+        runner._draining = True
+        return True
+    runner._enqueue_process_completion_notification = AsyncMock(side_effect=deliver)
+    watcher = {**_watcher_dict(), "check_interval": 0, "notify_on_complete": True}
+    await runner._run_process_watcher(watcher)
+    runner._enqueue_process_completion_notification.assert_awaited_once()
+    from gateway.config import Platform
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
