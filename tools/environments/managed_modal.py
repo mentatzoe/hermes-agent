@@ -106,7 +106,13 @@ class ManagedModalEnvironment(BaseEnvironment):
         timeout = timeout or self.timeout
         exec_id = _exec_id or str(uuid.uuid4())
         startup = shlex.quote(self._startup_snapshot_path)
-        exec_command = f"if [ ! -f {startup} ]; then (umask 077; export -p > {startup}) || exit $?; fi\n{exec_command}"
+        temporary = shlex.quote(f"{self._startup_snapshot_path}.{exec_id}")
+        # Publish a complete startup snapshot once, even when the first parent and
+        # child execs arrive together. A hard link cannot replace a competing winner.
+        exec_command = (
+            f"if [ ! -f {startup} ]; then (umask 077; export -p > {temporary} && "
+            f"(ln {temporary} {startup} 2>/dev/null || [ -f {startup} ]); "
+            f"rc=$?; rm -f -- {temporary}; exit $rc) || exit $?; fi\n{exec_command}")
         payload: Dict[str, Any] = {"execId": exec_id, "command": exec_command, "cwd": cwd or self.cwd,
                                    "timeoutMs": int(timeout * 1000)}
         if stdin_data is not None:
