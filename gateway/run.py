@@ -3074,8 +3074,8 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 
 
 # Weak ref to the active GatewayRunner; tools like send_message route through its live adapters.
-import weakref as _weakref
-_gateway_runner_ref: _weakref.ref = lambda: None
+from gateway.restart import register_gateway_runner
+_gateway_runner_ref = lambda: None
 
 
 def _normalize_empty_agent_response(
@@ -3476,7 +3476,7 @@ class GatewayRunner(
         # ``self.config`` is only the launch profile's: anything host-wide (restart notices) needs these.
         self._profile_configs: Dict[str, Any] = {}
         self._warn_if_docker_media_delivery_is_risky()
-        _gateway_runner_ref = _weakref.ref(self)
+        _gateway_runner_ref = register_gateway_runner(self)
 
         self._init_runtime_settings()
         self._init_session_store()

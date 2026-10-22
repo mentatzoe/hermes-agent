@@ -11,7 +11,6 @@ import math
 import os
 from pathlib import Path
 import stat
-import sys
 import threading
 import time
 
@@ -204,12 +203,17 @@ def wait_for_condition(condition, path=None, timeout=180, *, task_id=""):
 def handle_wait_for(args, task_id):
     if args.get("session_id") or args.get("data"):
         return {"status": "error", "error": "wait_for observes a condition, not a process or command"}
+    if args.get("condition") in ("file_exists", "file_missing", "lock_free"):
+        from tools.terminal_tool import _get_env_config
+        if _get_env_config()["env_type"] != "local":
+            return {"status": "error", "error": "File and lock wait_for require the local terminal backend; remote filesystem observation is unsupported."}
     return wait_for_condition(args.get("condition"), args.get("path"), args.get("timeout", 180), task_id=task_id)
 
 
 def extend_process_schema(schema):
     schema["description"] += (
         " wait_for: read-only observation of a timer, receipt file or POSIX lock, without running shell code. "
+        "File/lock conditions require the local terminal backend; timers work with any backend. "
         "Use it instead of shell sleep/poll loops. A gateway restart saves and interrupts a waiting-only "
         "turn for recovery; work it owns is not made restart-safe by waiting on it. Recheck the observed "
         "state after ready: readiness is a snapshot, not ownership or event acknowledgement."
@@ -219,14 +223,13 @@ def extend_process_schema(schema):
     props["session_id"]["description"] = "From terminal background output; any unique prefix works. Required except for list and wait_for."
     props["timeout"]["description"] = "Max seconds for wait or wait_for (default 180); timer waits for this duration."
     props["condition"] = {"type": "string", "enum": list(_CONDITIONS), "description": "Required for wait_for only."}
-    props["path"] = {"type": "string", "description": "Absolute receipt or lock path for wait_for; omit for timer. Never creates or changes the file."}
+    props["path"] = {"type": "string", "description": "Absolute local-terminal receipt or lock path for wait_for; remote filesystem waits are unsupported. Omit for timer. Never creates or changes the file."}
 
 
 def launch_block_reason():
     """Use the running host's in-memory flag, not a stale profile status file."""
-    module = sys.modules.get("gateway.run")
-    ref = getattr(module, "_gateway_runner_ref", None)
-    runner = ref() if callable(ref) else None
+    from gateway.restart import active_gateway_runner
+    runner = active_gateway_runner()
     if runner is not None and getattr(runner, "_restart_requested", False) is True:
         return "Gateway restart requested; no new terminal or Python execution was started. Resume after restart."
     return None

@@ -177,12 +177,38 @@ def test_delayed_worker_cannot_register_a_wait_for_a_successor_turn(tmp_path):
         thread.join(5)
 
 
+@pytest.mark.parametrize("backend", ["ssh", "docker"])
+@pytest.mark.parametrize("condition", ["file_exists", "lock_free"])
+def test_file_observation_rejects_a_nonlocal_terminal_backend(tmp_path, monkeypatch, backend, condition):
+    import tools.terminal_tool as terminal
+    monkeypatch.setattr(terminal, "_get_env_config", lambda: {"env_type": backend})
+    path = tmp_path / "host-receipt"
+    if condition == "file_exists":
+        path.touch()
+    result = json.loads(_handle_process({
+        "action": "wait_for", "condition": condition, "path": str(path), "timeout": 1,
+    }, task_id="remote-owner"))
+    assert result["status"] == "error"
+    assert "local" in result["error"]
+
+
+def test_native_timer_never_resolves_a_terminal_filesystem(monkeypatch):
+    import tools.terminal_tool as terminal
+
+    def unexpected():
+        pytest.fail("timer consulted a terminal backend")
+
+    monkeypatch.setattr(terminal, "_get_env_config", unexpected)
+    result = json.loads(_handle_process({"action": "wait_for", "condition": "timer", "timeout": 1}))
+    assert result["status"] == "ready"
+
+
 def test_restart_admission_refuses_shell_and_python_before_any_environment_work(monkeypatch):
-    import gateway.run as gateway_run
+    import gateway.restart as restart
     import tools.terminal_tool as terminal
     import tools.code_execution_tool as code
     runner = SimpleNamespace(_restart_requested=True)
-    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+    monkeypatch.setattr(restart, "active_gateway_runner", lambda: runner)
 
     def unexpected(*args, **kwargs):
         pytest.fail("execution or environment acquisition started during restart")

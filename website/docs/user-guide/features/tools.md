@@ -263,6 +263,11 @@ process_manage(action="wait_for", condition="file_exists", path="/absolute/pass/
 process_manage(action="wait_for", condition="lock_free", path="/absolute/controller.json.lock", timeout=180)
 ```
 
+File and lock conditions require the local terminal backend and inspect that
+host's filesystem. SSH, Docker and other remote/sandbox filesystem observations
+are rejected rather than reporting readiness from the wrong host. Timer waits
+work with any backend.
+
 `file_missing` is also supported. These waits never run a command, create a lock
 file, consume a receipt or acquire lasting lock ownership. `lock_free` requires
 POSIX `flock`; use an exit receipt on other hosts. Readiness is a snapshot: check
