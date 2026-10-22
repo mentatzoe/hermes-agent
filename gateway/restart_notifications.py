@@ -200,20 +200,31 @@ async def begin_execution(runner, event, session_key) -> bool:
     return True
 
 
+def _release_task_notice(adapter, notices, task) -> None:
+    current = notices.get(task)
+    if current is not None:
+        _, event = current
+        if (_draining(getattr(adapter, "gateway_runner", None))
+                and not getattr(event, "_heartbeat_execution_started", False)
+                and not getattr(event, "_restart_notification_consumed", False)):
+            return  # Teardown must preserve an unexecuted follow-up even after task completion.
+    notices.pop(task, None)
+
+
 def track_scheduled_notice(adapter, event, session_key, task) -> None:
-    """Keep the accepted payload reachable even before its task starts or loads a profile."""
-    if not event.internal or not isinstance(task, asyncio.Task):
+    """Keep the current accepted payload reachable from scheduling through preparation."""
+    if adapter is None or not getattr(event, "internal", False) or not isinstance(task, asyncio.Task):
         return
     notices = getattr(adapter, "_restart_notification_tasks", None)
     if notices is None:
         notices = adapter._restart_notification_tasks = {}
     notices[task] = session_key, event
-    task.add_done_callback(lambda finished: notices.pop(finished, None))
+    task.add_done_callback(lambda finished: _release_task_notice(adapter, notices, finished))
 
 
 async def _preserve_scheduled_notices(runner, adapter, session_key) -> None:
     for task, (key, event) in list(getattr(adapter, "_restart_notification_tasks", {}).items()):
-        if (task.done() or (session_key is not None and key != session_key)
+        if ((session_key is not None and key != session_key)
                 or getattr(event, "_heartbeat_execution_started", False) is True):
             continue
         await defer_during_restart(adapter, event, key)

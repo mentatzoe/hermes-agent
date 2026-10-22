@@ -3580,7 +3580,7 @@ class GatewayTurnMixin:
         from gateway.run import (
             _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message
         )
-        from gateway.restart_notifications import preserve_pending_notices
+        from gateway.restart_notifications import preserve_pending_notices, track_scheduled_notice
         await preserve_pending_notices(self, adapter, session_key)
         pending_event = None
         pending = None
@@ -3589,6 +3589,8 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            # Transfer ownership before transcription or any later preparation can yield.
+            track_scheduled_notice(adapter, pending_event, session_key, asyncio.current_task())
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
