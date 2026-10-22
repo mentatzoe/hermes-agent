@@ -36,7 +36,9 @@ def test_non_host_stages_adopt_but_runtime_hosts_refuse(tmp_path, relay, handoff
     pytest.importorskip("psutil")  # the production runtime-host fence uses psutil
     marker = tmp_path / "marker"
     owner = os.getpid()
-    marker.write_text(f"{owner}\n{int(time.time())}\nct:{process_create_time():.3f}\n", encoding="utf-8")
+    marker.write_text(
+        f"{owner}\n{int(time.time())}\nct:{process_create_time():.3f}\n", encoding="utf-8", newline="",
+    )
     base = marker.read_bytes()
     runtime_host = stage != ("version",)
     run_handoff_child(marker, f"""
