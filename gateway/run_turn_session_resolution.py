@@ -58,7 +58,9 @@ async def resolve_turn_session(runner, event, source):
             return
         session_entry = resolved_entry
     runner._cache_session_source(session_key, source)
-    if await asyncio.to_thread(runner._is_telegram_topic_lane, source):
+    # Explicit ownership was already resolved above, including verified compression.
+    # Ordinary topic healing must not mutate that route or replace its pinned owner.
+    if not pinned_session_id and await asyncio.to_thread(runner._is_telegram_topic_lane, source):
         session_entry = await runner._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
     from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
     if not await resolve_heartbeat_owner(runner, event, session_entry):

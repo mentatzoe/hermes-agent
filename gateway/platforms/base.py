@@ -429,7 +429,9 @@ from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from gateway.restart_notifications import defer_or_reject, dispatch_message, preserve_pending_notices
+from gateway.platforms.base_shutdown import cancel_adapter_background_tasks
+from gateway.restart_notifications import (
+    defer_or_reject, dispatch_message, track_scheduled_notice)
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
@@ -3992,6 +3994,7 @@ class BasePlatformAdapter(ABC):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
+        track_scheduled_notice(self, event, session_key, task)
         return True
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
@@ -4765,9 +4768,9 @@ class BasePlatformAdapter(ABC):
         # Capture the guard this drain owns now: a /stop//new guard swapped in during the
         # back-off must survive the slot-empty exit (#48300).
         guard = self._active_sessions.get(session_key)
-        self._track_session_task(
-            session_key,
-            asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)))
+        task = asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard))
+        self._track_session_task(session_key, task)
+        track_scheduled_notice(self, pending_event, session_key, task)
 
     async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
                            guard: Optional[asyncio.Event]) -> None:
@@ -4808,34 +4811,7 @@ class BasePlatformAdapter(ABC):
     async def cancel_background_tasks(self) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
         stragglers are untracked and left to unwind."""
-        # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
-        # untrack.
-        for _ in range(5):
-            tasks = [task for task in self._background_tasks if not task.done()]
-            if not tasks:
-                break
-            for task in tasks:
-                self._expected_cancelled_tasks.add(task)
-                task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(asyncio.shield(t) for t in tasks), return_exceptions=True),
-                    timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("[%s] %d background task(s) did not exit within 5s; "
-                               "releasing tracking and letting them unwind in the background",
-                               self.name, sum(not t.done() for t in tasks))
-                break
-        await preserve_pending_notices(self.gateway_runner, self)
-        with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
-        for state in self._text_debounce_store().values():
-            state.cancel_timer()
-        for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
-                       self._pending_messages, self._active_sessions, self._requeue_counts,
-                       self._text_debounce_store()):
-            bucket.clear()
+        await cancel_adapter_background_tasks(self)
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""

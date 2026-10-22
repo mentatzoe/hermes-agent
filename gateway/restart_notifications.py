@@ -172,10 +172,30 @@ async def dispatch_message(adapter, event: MessageEvent):
         raise
 
 
+def track_scheduled_notice(adapter, event, session_key, task) -> None:
+    """Keep the accepted payload reachable even before its task starts or loads a profile."""
+    if not event.internal or not isinstance(task, asyncio.Task):
+        return
+    notices = getattr(adapter, "_restart_notification_tasks", None)
+    if notices is None:
+        notices = adapter._restart_notification_tasks = {}
+    notices[task] = session_key, event
+    task.add_done_callback(lambda finished: notices.pop(finished, None))
+
+
+async def _preserve_scheduled_notices(runner, adapter, session_key) -> None:
+    for task, (key, event) in list(getattr(adapter, "_restart_notification_tasks", {}).items()):
+        if (task.done() or (session_key is not None and key != session_key)
+                or getattr(event, "_heartbeat_execution_started", False) is True):
+            continue
+        await defer_during_restart(adapter, event, key)
+
+
 async def preserve_pending_notices(runner, adapter, session_key=None) -> None:
     """Transfer already-admitted queue heads and FIFO tails before a drain can discard them."""
     if adapter is None or not _draining(runner):
         return
+    await _preserve_scheduled_notices(runner, adapter, session_key)
     keys = {session_key} if session_key else set(adapter._pending_messages) | set(getattr(runner, "_queued_events", {}) or {})
     for key in keys:
         head = adapter._pending_messages.get(key)

@@ -192,7 +192,13 @@ silently in the owning profile's `restart_notifications/pending.sqlite3`; human
 messages retain the busy reply. The adapter checks both before scheduling and
 after the profile-scoped handler returns, so a restart beginning during profile
 loading does not turn an acknowledged notice into a chat reply. Queue heads and
-FIFO tails are transferred before drain/disconnect can discard them.
+FIFO tails are transferred before drain/disconnect can discard them. Scheduled
+internal notices remain attached to their owning tasks until completion; teardown
+retains unexecuted payloads before cancellation, including tasks that have not
+started or are still loading a profile. Notices that already crossed the execution
+boundary are not added to this handoff. Explicit session ownership also bypasses
+ordinary Telegram topic healing, so a stale binding cannot replace the pinned
+session; verified compression continuation is resolved before that check.
 A missing handler, mismatched explicit session key, or queue-cap drop is not
 acceptance. Custom adapters overriding ingress should delegate internal events to
 `BasePlatformAdapter.handle_message()` (or explicitly record actual admission),
