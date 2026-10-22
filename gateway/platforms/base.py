@@ -429,6 +429,7 @@ from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.restart_notifications import defer_or_reject, dispatch_message, preserve_pending_notices
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
@@ -3637,7 +3638,7 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
+        response = await dispatch_message(self, event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return
@@ -4097,9 +4098,7 @@ class BasePlatformAdapter(ABC):
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
-        if expected_session_key and session_key != expected_session_key:
-            logger.warning("Dropping internally routed event: expected session=%s derived=%s",
-                           expected_session_key, session_key)
+        if await defer_or_reject(self, event, session_key, expected_session_key):
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
@@ -4611,7 +4610,7 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
+            response = await dispatch_message(self, event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4827,6 +4826,7 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
+        await preserve_pending_notices(self.gateway_runner, self)
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")

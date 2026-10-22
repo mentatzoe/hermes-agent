@@ -186,7 +186,13 @@ Adapters implement a common interface:
 
 Internal push wakes use `gateway.wake.admit_internal_event`: the public
 `handle_message()` still returns `None`, but the event's process-local
-`_gateway_accepted` receipt is set only after scheduling or queue insertion.
+`_gateway_accepted` receipt is set only after scheduling, queue insertion, or a
+committed restart handoff. During restart drains, internal notices are retained
+silently in the owning profile's `restart_notifications/pending.sqlite3`; human
+messages retain the busy reply. The adapter checks both before scheduling and
+after the profile-scoped handler returns, so a restart beginning during profile
+loading does not turn an acknowledged notice into a chat reply. Queue heads and
+FIFO tails are transferred before drain/disconnect can discard them.
 A missing handler, mismatched explicit session key, or queue-cap drop is not
 acceptance. Custom adapters overriding ingress should delegate internal events to
 `BasePlatformAdapter.handle_message()` (or explicitly record actual admission),
@@ -296,6 +302,20 @@ async completions remain durable delivery rows, never autonomous new model turns
 acceptance. Refused admission refunds every claimed batch sibling without spending an attempt;
 actual delivery errors keep their bounded retry policy. Recognized raw API routes resolve after
 persisted messaging origins and defer quietly when unavailable; malformed routes still warn.
+
+`gateway.restart_notifications` replays retained messaging notices after startup
+restoration, through their original transport (including relay provenance),
+profile, session key and session ID. Only a verified compression continuation may
+replace that ID; an idle replacement or explicit user boundary does not inherit
+the notice. Offline destinations remain pending for the supervised five-second
+retry. Concurrent replay and stale database snapshots cannot repeat a completed
+receipt. A row settles at the agent execution boundary, not on adapter scheduling;
+a crash while a handler is executing remains at-least-once, not an exactly-once
+guarantee for its tool side effects.
+
+This handoff covers internal `MessageEvent` notices. Ordinary cron output uses
+the outbound delivery queue, while `bot-chat` cron delivery uses its existing
+durable owner mailbox; neither is converted into a messaging-gateway wake.
 
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
