@@ -93,6 +93,76 @@ def test_failed_launch_does_not_leave_private_shell_state(shells, monkeypatch, f
     assert command("parent", "printf alive") == "alive"
 
 
+@pytest.mark.parametrize("failure", ["result", "drain", "wrapping", "running-copy", "run"])
+def test_preparation_exception_removes_created_copy_before_payload(shells, monkeypatch, failure):
+    from tools.terminal_tool_background import _spawn
+    from tools.terminal_tool_lifecycle import get_active_env
+    from tools.environments import base
+    root, command, child = shells
+    command("parent", "printf parent")
+    child()
+    command("child", "export ISOLATION_TEST=child")
+    shell = get_active_env("child")
+    original_run, original_wait = shell._run_bash, shell._wait_for_process
+    copies, processes, spawned = [], [], []
+
+    def copy_then_raise(proc, *args, **kwargs):
+        if copies:
+            return original_wait(proc, *args, **kwargs)
+        if failure == "running-copy":
+            wait_file(root / "copy-entered")
+        else:
+            original_wait(proc, *args, **kwargs)
+        copies.extend(root.glob("hermes-bg-snap-*.sh"))
+        assert copies
+        raise OSError("synthetic preparation wait failure")
+
+    def run_copy(command, **kwargs):
+        if command.startswith("umask 077; cp"):
+            if failure == "running-copy":
+                command += f"; touch {shlex.quote(str(root / 'copy-entered'))}; while :; do sleep 0.02; done"
+            proc = original_run(command, **kwargs)
+            processes.append(proc)
+            if failure == "run":
+                proc.wait(timeout=10)
+                raise OSError("synthetic preparation run failure")
+            return proc
+        return original_run(command, **kwargs)
+
+    def unexpected_spawn(**kwargs):
+        spawned.append(True)
+        raise AssertionError("payload must not spawn")
+
+    monkeypatch.setattr(process_registry, "spawn_local", unexpected_spawn)
+    monkeypatch.setattr(shell, "_run_bash", run_copy)
+    if failure in {"result", "running-copy"}:
+        monkeypatch.setattr(shell, "_wait_for_process", copy_then_raise)
+    elif failure == "drain":
+        original_drain = base._start_drain_thread
+
+        def fail_drain(proc, *args, **kwargs):
+            if not copies:
+                proc.wait(timeout=10)
+                copies.extend(root.glob("hermes-bg-snap-*.sh"))
+                assert copies
+                raise RuntimeError("synthetic preparation drain failure")
+            return original_drain(proc, *args, **kwargs)
+
+        monkeypatch.setattr(base, "_start_drain_thread", fail_drain)
+    elif failure == "wrapping":
+        def fail_quote(cwd):
+            assert list(root.glob("hermes-bg-snap-*.sh"))
+            raise ValueError("synthetic preparation quote failure")
+        monkeypatch.setattr(shell.backend, "_quote_cwd_for_cd", fail_quote)
+    with pytest.raises((OSError, RuntimeError, ValueError), match="synthetic preparation"):
+        _spawn(process_registry, env=shell, env_type="local", command="printf payload",
+               cwd=str(root), effective_task_id=tt._resolve_container_task_id("child"),
+               task_id="child", session_key="child", effective_pty=False)
+    assert not spawned
+    assert not list(root.glob("hermes-bg-snap-*.sh"))
+    assert all(proc.poll() is not None for proc in processes)
+
+
 @pytest.mark.parametrize("mode", ["pipe", "pty", "pty-fallback", "remote"])
 @pytest.mark.parametrize("explicit_workdir", [False, True])
 def test_background_cwd_survives_login_startup_cd(shells, monkeypatch, mode, explicit_workdir):

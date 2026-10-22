@@ -37,17 +37,29 @@ class DelegatedShellSession(BaseEnvironment):
         if not self._snapshot_ready:
             raise RuntimeError("Cannot launch an isolated background shell without a ready snapshot")
         snapshot = f"{self.get_temp_dir().rstrip('/')}/hermes-bg-snap-{uuid.uuid4().hex}.sh"
-        proc = self._run_bash(
-            f"umask 077; cp -- {self._quote_shell_path(self._snapshot_path)} {self._quote_shell_path(snapshot)}",
-            timeout=10)
-        result = self._wait_for_process(proc, timeout=10)
-        if result.get("returncode") != 0:
-            _BackgroundShellLaunch(self, snapshot, "").cleanup()
-            raise RuntimeError("Could not copy isolated background shell state")
-        wrapped = (
-            f"source {self._quote_shell_path(snapshot)} || exit $?\n"
-            f"builtin cd -- {self.backend._quote_cwd_for_cd(cwd or self.cwd)} || exit 126\n{command}")
-        return _BackgroundShellLaunch(self, snapshot, wrapped)
+        launch = _BackgroundShellLaunch(self, snapshot, "")
+        proc = None
+        try:
+            proc = self._run_bash(
+                f"umask 077; cp -- {self._quote_shell_path(self._snapshot_path)} {self._quote_shell_path(snapshot)}",
+                timeout=10)
+            result = self._wait_for_process(proc, timeout=10)
+            if result.get("returncode") != 0:
+                raise RuntimeError("Could not copy isolated background shell state")
+            launch.command = (
+                f"source {self._quote_shell_path(snapshot)} || exit $?\n"
+                f"builtin cd -- {self.backend._quote_cwd_for_cd(cwd or self.cwd)} || exit 126\n{command}")
+        except BaseException:
+            if proc is not None:
+                # A failed wait can leave cp alive. Stop/reap it before removing the
+                # destination so it cannot recreate the file after cleanup.
+                with contextlib.suppress(Exception):
+                    if proc.poll() is None:
+                        self._kill_process(proc)
+                    proc.wait(timeout=10)
+            launch.cleanup()
+            raise
+        return launch
 
     def __getattr__(self, name):
         return getattr(self.backend, name)
