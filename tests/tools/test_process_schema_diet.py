@@ -19,9 +19,9 @@ class TestProcessSchemaDiet(unittest.TestCase):
     def test_enum_is_the_verb_source(self):
         from tools.process_registry import _SESSION_ACTIONS
         props = PROCESS_SCHEMA["parameters"]["properties"]
-        # The enum is the single list of verbs: every session-scoped handler is offered, plus the two
+        # The enum is the single list of verbs: every session-scoped handler is offered, plus the
         # non-session verbs dispatched by name in _handle_process.
-        self.assertEqual(set(props["action"]["enum"]), set(_SESSION_ACTIONS) | {"list", "handoff"})
+        self.assertEqual(set(props["action"]["enum"]), set(_SESSION_ACTIONS) | {"list", "handoff", "wait_for"})
 
 
 if __name__ == "__main__":
