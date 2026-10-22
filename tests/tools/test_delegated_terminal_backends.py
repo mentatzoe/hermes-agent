@@ -9,6 +9,8 @@ from tools.environments.base import BaseEnvironment
 from tools.environments.local import LocalEnvironment
 from tools.terminal_tool_sessions import DelegatedShellSession
 
+pytestmark = pytest.mark.platforms("posix")
+
 
 @pytest.fixture
 def transport(tmp_path, monkeypatch):

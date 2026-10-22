@@ -12,6 +12,8 @@ from tools import terminal_tool as tt
 from tools.delegate_tool_child_run import _ChildRun, _close_child
 from tools.file_tools import _get_file_ops, clear_file_ops_cache
 
+pytestmark = pytest.mark.platforms("posix")
+
 
 @pytest.fixture
 def shells(tmp_path, monkeypatch):
@@ -155,7 +157,6 @@ def test_backend_eviction_rebinds_file_tools_and_child_shell(shells):
     assert state(command, "child") == baseline
 
 
-@pytest.mark.platforms("posix")
 @pytest.mark.parametrize("mode", ["pipe", "pty", "pty-fallback"])
 def test_background_commands_use_child_snapshot_without_publishing_mutations(shells, monkeypatch, mode):
     from tools.process_registry import process_registry

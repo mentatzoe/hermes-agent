@@ -31,10 +31,23 @@ class DelegatedShellSession(BaseEnvironment):
             return execute_in_shell(self, command, cwd, **kwargs)
         return super().execute(command, cwd, **kwargs)
 
-    def background_command(self, command):
-        # Read the selected snapshot after login startup, without publishing background
-        # mutations back into the foreground shell. A missing snapshot must fail closed.
-        return f"source {self._quote_shell_path(self._snapshot_path)} || exit $?\n{command}"
+    def prepare_background_launch(self, command, cwd):
+        """Copy launch state before spawning; child teardown must not own its lifetime."""
+        import uuid
+        if not self._snapshot_ready:
+            raise RuntimeError("Cannot launch an isolated background shell without a ready snapshot")
+        snapshot = f"{self.get_temp_dir().rstrip('/')}/hermes-bg-snap-{uuid.uuid4().hex}.sh"
+        proc = self._run_bash(
+            f"umask 077; cp -- {self._quote_shell_path(self._snapshot_path)} {self._quote_shell_path(snapshot)}",
+            timeout=10)
+        result = self._wait_for_process(proc, timeout=10)
+        if result.get("returncode") != 0:
+            _BackgroundShellLaunch(self, snapshot, "").cleanup()
+            raise RuntimeError("Could not copy isolated background shell state")
+        wrapped = (
+            f"source {self._quote_shell_path(snapshot)} || exit $?\n"
+            f"builtin cd -- {self.backend._quote_cwd_for_cd(cwd or self.cwd)} || exit 126\n{command}")
+        return _BackgroundShellLaunch(self, snapshot, wrapped)
 
     def __getattr__(self, name):
         return getattr(self.backend, name)
@@ -85,6 +98,40 @@ class DelegatedShellSession(BaseEnvironment):
         proc = self._run_bash(f"rm -f -- {paths}", timeout=10)
         self._wait_for_process(proc, timeout=10)
         self._snapshot_ready = False
+
+
+class _BackgroundShellLaunch:
+    """Process-owned snapshot; its contents never enter argv or registry checkpoints."""
+
+    def __init__(self, shell, snapshot, command):
+        self.shell, self.snapshot, self.command = shell, snapshot, command
+
+    def cleanup(self):
+        import logging
+        try:
+            proc = self.shell._run_bash(
+                f"rm -f -- {self.shell._quote_shell_path(self.snapshot)}", timeout=10)
+            self.shell._wait_for_process(proc, timeout=10)
+        except Exception:
+            logging.getLogger(__name__).warning("Could not remove background shell snapshot", exc_info=True)
+
+    def track(self, process):
+        from agent.memory_provider import spawn_context_thread
+
+        def after_exit():
+            process._completion_event.wait()
+            self.cleanup()
+
+        if process.exited:
+            self.cleanup()
+        else:
+            try:
+                spawn_context_thread(after_exit, name=f"shell-state-{process.id}").start()
+            except RuntimeError:
+                # The command is already running. Never turn optional cleanup failure
+                # into an apparent spawn failure that could make the caller run it twice.
+                import logging
+                logging.getLogger(__name__).warning("Background shell snapshot cleanup could not be scheduled")
 
 
 def is_delegated_shell(task_id):
