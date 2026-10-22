@@ -89,6 +89,8 @@ def _cleanup_env(env: Any, *, force_remove: Optional[bool] = None) -> None:
     Shared by ``cleanup_vm``, the idle reaper and the prompt-time backend probe so
     the signature check lives in one place.
     """
+    from tools.terminal_tool_sessions import release_backend_sessions
+    release_backend_sessions(env)
     if hasattr(env, 'cleanup'):
         if force_remove is not None and "force_remove" in inspect.signature(env.cleanup).parameters:
             env.cleanup(force_remove=force_remove)
@@ -177,8 +179,10 @@ def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
     lookup = _resolve_container_task_id(task_id)
+    from tools.terminal_tool_sessions import bind_shell_session
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        env = _active_environments.get(lookup) or _active_environments.get(task_id)
+    return bind_shell_session(env, task_id) if env is not None else None
 
 
 def ensure_task_env(task_id: Optional[str] = None):

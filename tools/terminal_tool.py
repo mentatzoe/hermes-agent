@@ -347,6 +347,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 
 def clear_task_env_overrides(task_id: str):
     """Drop a task's overrides, cwd record and container alias (rollout cleanup)."""
+    from tools.terminal_tool_sessions import release_shell_session
+    release_shell_session(task_id)
     _task_env_overrides.pop(_qualify_task_key(task_id), None)
     clear_session_cwd(task_id)
     with _container_alias_lock:
@@ -1413,6 +1415,8 @@ def terminal_tool(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
         env = _acquire_env(plan, task_id)
+        from tools.terminal_tool_sessions import bind_shell_session, is_delegated_shell
+        env = bind_shell_session(env, task_id, plan.cwd)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker
@@ -1420,7 +1424,8 @@ def terminal_tool(
         # session_key) as a stable anchor.
         from tools.approval import get_current_session_key
 
-        session_key = get_current_session_key(default="") or (task_id or "")
+        session_key = ((task_id or "") if is_delegated_shell(task_id)
+                       else get_current_session_key(default="") or (task_id or ""))
 
         # The supervised-gateway identity probe ends in a kernel process query
         # (psutil create_time) that has wedged for the better part of an hour on

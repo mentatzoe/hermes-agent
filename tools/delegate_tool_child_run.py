@@ -51,6 +51,11 @@ def _close_child(child: Any, log_message: str) -> None:
         close = getattr(child, "close", None)
         if callable(close):
             close()
+    with _quiet("Failed to release child terminal session: %s"):
+        from tools.terminal_tool import clear_task_env_overrides
+        task_id = getattr(child, "_delegate_terminal_task_id", None)
+        if task_id:
+            clear_task_env_overrides(task_id)
 
 def _with_children_lock(parent_agent: Any, op: str, child: Any) -> None:
     """``parent_agent._active_children.<op>(child)`` under the parent's lock when it has one."""
@@ -750,6 +755,7 @@ class _ChildRun:
         import uuid as _uuid
         self.child_task_id = self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}"
         self.parent_task_id = getattr(self.parent_agent, "_current_task_id", None)
+        self.child._delegate_terminal_task_id = self.child_task_id
         # Seed the child's cwd record from the parent's: same starting directory,
         # but the child's later `cd`s stay in its own record. Per-session container
         # isolation keys containers by task_id; the child must share the PARENT's.
