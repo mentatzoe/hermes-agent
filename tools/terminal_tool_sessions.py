@@ -21,6 +21,21 @@ class DelegatedShellSession(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=backend.timeout, env=dict(backend.env))
         self.init_session()
 
+    def init_session(self):
+        self._backend_generation = getattr(self.backend, "_container_id", None)
+        super().init_session()
+
+    def execute(self, command, cwd="", **kwargs):
+        execute_in_shell = getattr(self.backend, "execute_in_shell", None)
+        if execute_in_shell is not None:
+            return execute_in_shell(self, command, cwd, **kwargs)
+        return super().execute(command, cwd, **kwargs)
+
+    def background_command(self, command):
+        # Read the selected snapshot after login startup, without publishing background
+        # mutations back into the foreground shell. A missing snapshot must fail closed.
+        return f"source {self._quote_shell_path(self._snapshot_path)} || exit $?\n{command}"
+
     def __getattr__(self, name):
         return getattr(self.backend, name)
 
@@ -40,6 +55,10 @@ class DelegatedShellSession(BaseEnvironment):
 
     def _before_execute(self):
         self.backend._before_execute()
+        generation = getattr(self.backend, "_container_id", None)
+        if generation != self._backend_generation:
+            self._backend_generation = generation
+            self.init_session()
 
     def _run_bash(self, cmd_string, **kwargs):
         return self.backend._run_bash(cmd_string, **kwargs)

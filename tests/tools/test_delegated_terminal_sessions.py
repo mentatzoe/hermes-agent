@@ -153,3 +153,33 @@ def test_backend_eviction_rebinds_file_tools_and_child_shell(shells):
     new = _get_file_ops("child")
     assert new is not old
     assert state(command, "child") == baseline
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mode", ["pipe", "pty", "pty-fallback"])
+def test_background_commands_use_child_snapshot_without_publishing_mutations(shells, monkeypatch, mode):
+    from tools.process_registry import process_registry
+    if mode == "pty-fallback":
+        def unavailable(*args, **kwargs):
+            raise ImportError("synthetic missing PTY")
+        monkeypatch.setattr(process_registry, "_spawn_local_pty", unavailable)
+    pty = mode != "pipe"
+    root, command, child = shells
+    baseline = state(command, "parent")
+    child()
+    target = root / "background-cwd"
+    target.mkdir()
+    command("child", f"export HOME={shlex.quote(str(root / 'bg-home'))} HERMES_HOME={shlex.quote(str(root / 'bg-hermes'))} HERMES_REAL_HOME={shlex.quote(str(root / 'bg-real'))} ISOLATION_TEST=foreground; cd {shlex.quote(str(target))}")
+    result = json.loads(tt.terminal_tool(
+        'printf "CHECK:%s:%s:%s:%s\\n" "$HOME" "$HERMES_HOME" "$HERMES_REAL_HOME" "$ISOLATION_TEST"; pwd -P; export ISOLATION_TEST=background',
+        task_id="child", background=True, pty=pty, timeout=30))
+    assert "session_id" in result, result
+    if mode == "pty":
+        assert process_registry.get(result["session_id"])._pty is not None
+    completed = process_registry.wait(result["session_id"], timeout=20)
+    assert completed["status"] == "exited", completed
+    assert completed["exit_code"] == 0, completed
+    assert f"CHECK:{root / 'bg-home'}:{root / 'bg-hermes'}:{root / 'bg-real'}:foreground" in completed["output"]
+    assert str(target) in completed["output"]
+    assert state(command, "child")[3] == "foreground"
+    assert state(command, "parent") == baseline

@@ -1152,15 +1152,19 @@ class DockerEnvironment(BaseEnvironment):
         return True
 
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
-        """Execute a command; if the container was removed out-of-band (idle reaper,
-        docker prune, OOM, daemon restart) recreate it and retry once."""
-        result = super().execute(command, cwd, **kwargs)
+        return self.execute_in_shell(self, command, cwd, **kwargs)
+
+    def execute_in_shell(self, shell, command: str, cwd: str = "", **kwargs) -> dict:
+        """Keep container recovery when the caller owns a separate shell snapshot."""
+        result = BaseEnvironment.execute(shell, command, cwd, **kwargs)
         if (
             result.get("returncode", 0) != 0
             and self._is_container_gone(result.get("output", ""))
             and self._persist_across_processes
             and self._recreate_container()):
-            result = super().execute(command, cwd, **kwargs)
+            if shell is not self:
+                shell.init_session()
+            result = BaseEnvironment.execute(shell, command, cwd, **kwargs)
         return result
 
     @staticmethod

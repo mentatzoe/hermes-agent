@@ -92,6 +92,9 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
     if env_type == "local":
+        from tools.terminal_tool_sessions import DelegatedShellSession
+        if isinstance(env, DelegatedShellSession):
+            common["command"] = env.background_command(command)
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
     return process_registry.spawn_via_env(env=env, **common)
