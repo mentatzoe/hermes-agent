@@ -183,3 +183,24 @@ def test_background_commands_use_child_snapshot_without_publishing_mutations(she
     assert str(target) in completed["output"]
     assert state(command, "child")[3] == "foreground"
     assert state(command, "parent") == baseline
+
+
+def test_remote_background_wrapper_uses_child_snapshot_and_explicit_cwd(shells):
+    from tools.process_registry import process_registry
+    from tools.terminal_tool_background import _spawn
+    from tools.terminal_tool_lifecycle import get_active_env
+    root, command, child = shells
+    baseline = state(command, "parent")
+    child()
+    command("child", f"export HOME={shlex.quote(str(root / 'remote-bg-home'))} ISOLATION_TEST=child")
+    target = root / "remote-workdir"
+    target.mkdir()
+    session = _spawn(process_registry, env=get_active_env("child"), env_type="ssh",
+                     command='printf "CHECK:%s:%s\\n" "$HOME" "$ISOLATION_TEST"; pwd -P',
+                     cwd=str(target), effective_task_id=tt._resolve_container_task_id("child"),
+                     task_id="child", session_key="child", effective_pty=False)
+    completed = process_registry.wait(session.id, timeout=20)
+    assert completed["status"] == "exited" and completed["exit_code"] == 0, completed
+    assert f"CHECK:{root / 'remote-bg-home'}:child" in completed["output"]
+    assert str(target) in completed["output"]
+    assert state(command, "parent") == baseline

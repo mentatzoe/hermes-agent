@@ -88,13 +88,13 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
            session_key, effective_pty, persist_on_release: bool = False):
-    common = dict(command=command, cwd=cwd, task_id=effective_task_id,
+    common: dict[str, Any] = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
+    from tools.terminal_tool_sessions import DelegatedShellSession
+    if isinstance(env, DelegatedShellSession):
+        common["command"] = env.background_command(command)
     if env_type == "local":
-        from tools.terminal_tool_sessions import DelegatedShellSession
-        if isinstance(env, DelegatedShellSession):
-            common["command"] = env.background_command(command)
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
     return process_registry.spawn_via_env(env=env, **common)

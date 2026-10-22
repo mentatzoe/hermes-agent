@@ -1310,7 +1310,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
         try:
-            result = env.execute(bg_command, timeout=timeout, rewrite_compound_background=False)
+            result = env.execute(bg_command, cwd=cwd, timeout=timeout, rewrite_compound_background=False)
             output = result.get("output", "").strip()
             session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
             # No PID from the wrapper (syntax error, broken redirect): a failed launch,
