@@ -252,6 +252,31 @@ result reads or writes. Recovery does not rerun commands or replay completion
 notifications. This preserves work that finished while the parent was alive;
 it does not keep unfinished children alive after a timeout or crash.
 
+## Restart-aware observation waits
+
+For a timer, another pass's exit receipt or a controller lock, use the native
+observation operation rather than running a shell or Python polling loop:
+
+```python
+process_manage(action="wait_for", condition="timer", timeout=60)
+process_manage(action="wait_for", condition="file_exists", path="/absolute/pass/exit.json", timeout=180)
+process_manage(action="wait_for", condition="lock_free", path="/absolute/controller.json.lock", timeout=180)
+```
+
+`file_missing` is also supported. These waits never run a command, create a lock
+file, consume a receipt or acquire lasting lock ownership. `lock_free` requires
+POSIX `flock`; use an exit receipt on other hosts. Readiness is a snapshot: check
+the actual result and current owner before acting.
+
+When a gateway restart is requested, a turn whose executing tools are all native
+observation waits can be interrupted after its recovery marker is saved. The
+next gateway resumes that waiting turn without a new user message. A parallel
+mutating tool, an owned background process or live delegation keeps the normal
+drain protection. Arbitrary shell commands and `process_manage(action="wait")`
+are not reclassified as safe. New terminal and Python executions are refused
+while restart is pending. This prevents a waiting observer from starting a new
+long pass during the drain.
+
 ## Sudo Support
 
 On an interactive parent session, supported sudo commands use the masked password prompt (cached for the session). This includes literal absolute or quoted executable paths and `env` prefixes with ordinary options and assignments, such as `env -u UNUSED /usr/bin/sudo id`. Passwordless sudo does not need a prompt. You can also configure `SUDO_PASSWORD` in your profile's `.env` file on the agent machine.

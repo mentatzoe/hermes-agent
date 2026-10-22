@@ -1643,11 +1643,9 @@ class GatewayShutdownMixin:
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
-        """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
-
-        Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
-        cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
-        """
+        """Wait for active work; save and interrupt native waits for restart recovery."""
+        from gateway.run_restart_wait import yield_restart_waiters
+        await yield_restart_waiters(self)
         active = self._active_work_count()
         if active <= 0:
             return True
@@ -1677,6 +1675,7 @@ class GatewayShutdownMixin:
         deadline = loop.time() + timeout
         last_status_at = 0.0
         while self._awaitable_work_count() > 0:
+            await yield_restart_waiters(self)
             now = loop.time()
             if now >= deadline:
                 logger.warning(

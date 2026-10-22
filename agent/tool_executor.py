@@ -564,7 +564,9 @@ def _registered_tool_worker(agent):
     with agent._tool_worker_threads_lock:
         agent._tool_worker_threads.add(tid)
     try:
-        yield tid
+        from tools.restart_wait import bind_wait_owner
+        with bind_wait_owner(agent):
+            yield tid
     finally:
         with agent._tool_worker_threads_lock:
             agent._tool_worker_threads.discard(tid)
@@ -706,6 +708,14 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
+    from tools.restart_wait import wait_for_dispatch
+    if not wait_for_dispatch(agent):
+        _advance_start_order()
+        state.blocked = True
+        return _blocked_tool_result(
+            agent, ref, block_body={"error": "Tool deferred for gateway restart; resume after restart"},
+            block_error_type="gateway_restart", guardrail_decision=None,
+        )
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
         block_error_type = "plugin_block"
