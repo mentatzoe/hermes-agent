@@ -32,7 +32,7 @@ class WaitAgent(InterruptControlMixin):
         self.quiet_mode = True
 
 
-def start_wait(runner, key, agent, path):
+def start_wait(runner, key, agent, path, unwind_gate=None):
     done, results = threading.Event(), []
     runner._running_agents[key] = agent
 
@@ -43,6 +43,8 @@ def start_wait(runner, key, agent, path):
                     {"action": "wait_for", "condition": "file_exists", "path": str(path), "timeout": 20},
                     task_id=agent.session_id,
                 )))
+                if unwind_gate is not None:
+                    unwind_gate.wait(10)
         finally:
             if runner._running_agents.get(key) is agent:
                 runner._running_agents.pop(key)
@@ -109,6 +111,44 @@ async def test_waiting_only_restart_drains_promptly_and_boot_resumes_the_saved_t
         assert resumed == ["observer"]
         restored.close_all_db_handles()
     finally:
+        receipt.touch()
+        thread.join(5)
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_zero_after_turn_budget_keeps_wait_recovery_through_the_real_stop_drain(tmp_path):
+    runner, _, entry = make_wait_runner(tmp_path)
+    agent = WaitAgent(entry.session_id)
+    receipt, unwind = tmp_path / "exit", threading.Event()
+    done, results, thread = start_wait(runner, entry.session_key, agent, receipt, unwind)
+    actual_drain = runner._drain_active_agents
+    runner._restart_after_turn_timeout = 0
+    runner._cron_drain_timeout = 0
+    ctx = SimpleNamespace(elapsed=lambda: 0, deferred_count=lambda: 0)
+
+    async def drain(timeout, cron_timeout):
+        saved = runner.session_store.lookup_by_session_key(entry.session_key)
+        assert saved.resume_reason == "restart_wait"
+        unwind.set()
+        return await actual_drain(timeout, cron_timeout)
+
+    async def stop(**kwargs):
+        await runner._stop_drain_active_work(5, ctx)
+
+    runner._drain_active_agents, runner.stop = drain, stop
+    try:
+        runner.request_restart(via_service=True)
+        await asyncio.wait_for(runner._restart_task, 5)
+        assert done.is_set() and results[0]["status"] == "interrupted"
+        assert not ctx.timed_out
+        runner.session_store.close_all_db_handles()
+        restored = SessionStore(tmp_path / "sessions", runner.config)
+        saved = restored.lookup_by_session_key(entry.session_key)
+        assert saved.resume_pending and saved.resume_reason == "restart_wait"
+        restored.close_all_db_handles()
+    finally:
+        unwind.set()
         receipt.touch()
         thread.join(5)
         runner.session_store.close_all_db_handles()

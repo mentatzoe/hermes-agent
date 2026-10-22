@@ -6,6 +6,7 @@ not evidence that the observing turn is safe to interrupt.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 import math
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ import time
 
 from tools.interrupt import is_interrupted
 
-_owner = ContextVar("restart_wait_owner", default=None)
+_owner: ContextVar[tuple | None] = ContextVar("restart_wait_owner", default=None)
 _creation_lock = threading.Lock()
 _CONDITIONS = ("timer", "file_exists", "file_missing", "lock_free")
 
@@ -39,21 +40,46 @@ def _state(agent):
 
 @contextmanager
 def bind_wait_owner(agent):
-    token = _owner.set(agent)
+    bound = _owner.get()
+    if bound is None or bound[0] is not agent:
+        bound = (agent, getattr(agent, "_current_turn_id", None))
+    token = _owner.set(bound)
     try:
         yield
     finally:
         _owner.reset(token)
 
 
+def capture_wait_turn(fn):
+    """Snapshot the turn BEFORE its workers and copied contexts are submitted."""
+    @wraps(fn)
+    def run(agent, *args, **kwargs):
+        token = _owner.set((agent, getattr(agent, "_current_turn_id", None)))
+        try:
+            return fn(agent, *args, **kwargs)
+        finally:
+            _owner.reset(token)
+    return run
+
+
+def _bound_turn(agent):
+    bound = _owner.get()
+    return bound[1] if bound is not None and bound[0] is agent else getattr(agent, "_current_turn_id", None)
+
+
+def was_yielded_for_restart(agent):
+    state = vars(agent).get("_restart_wait_state") if hasattr(agent, "__dict__") else None
+    return state is not None and state.yielded_turn is not None and state.yielded_turn == getattr(agent, "_current_turn_id", None)
+
+
 def wait_for_dispatch(agent):
     """Fence queued tool workers until a restart claim commits or is abandoned."""
     state = _state(agent)
-    turn = getattr(agent, "_current_turn_id", None)
+    turn = _bound_turn(agent)
     with state.changed:
         while state.claim is not None and state.claim.turn_id == turn:
             state.changed.wait(0.1)
-        return turn is None or state.yielded_turn != turn
+        return getattr(agent, "_current_turn_id", None) == turn and (turn is None or state.yielded_turn != turn)
 
 
 @dataclass
@@ -123,7 +149,7 @@ def _ready(condition, path):
     return False
 
 
-def _wait_loop(state, turn, condition, path, timeout):
+def _wait_loop(state, turn, condition, path, timeout, agent):
     deadline = time.monotonic() + timeout
     while True:
         ready = _ready(condition, path)
@@ -132,7 +158,8 @@ def _wait_loop(state, turn, condition, path, timeout):
             # the tool return into another model/tool call until the claim ends.
             while state.claim is not None and state.claim.turn_id == turn:
                 state.changed.wait(0.1)
-            if is_interrupted() or (turn is not None and state.yielded_turn == turn):
+            stale = agent is not None and getattr(agent, "_current_turn_id", None) != turn
+            if stale or is_interrupted() or (turn is not None and state.yielded_turn == turn):
                 return {"status": "interrupted", "condition": condition}
             if ready:
                 return {"status": "ready", "condition": condition}
@@ -155,14 +182,16 @@ def wait_for_condition(condition, path=None, timeout=180, *, task_id=""):
         elif not isinstance(path, str) or not Path(path).is_absolute():
             raise ValueError("path must be absolute for file and lock observations")
         path = Path(path) if path is not None else None
-        agent = _owner.get()
-        turn = getattr(agent, "_current_turn_id", None) if agent is not None else None
+        bound = _owner.get()
+        agent, turn = bound if bound is not None else (None, None)
+        if agent is not None and getattr(agent, "_current_turn_id", None) != turn:
+            return {"status": "interrupted", "condition": condition}
         state = _state(agent) if agent is not None else _WaitState()
         tid = threading.get_ident()
         with state.changed:
             state.tickets[tid] = (turn, str(task_id or ""))
         try:
-            return _wait_loop(state, turn, condition, path, timeout)
+            return _wait_loop(state, turn, condition, path, timeout, agent)
         finally:
             with state.changed:
                 while state.claim is not None and state.claim.turn_id == turn:

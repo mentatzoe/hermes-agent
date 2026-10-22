@@ -870,13 +870,13 @@ class GatewayShutdownMixin:
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from tools.restart_wait import was_yielded_for_restart
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
-        # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
-        # manager during the drain, the durable marker is already written so the next gateway boot can
-        # recover in-flight sessions (#27856).
+        # Save ordinary live turns before draining. A native wait already saved its
+        # interruption; do not overwrite it or clear it as a successful completion.
         for _sk, _agent in list(self._running_agents.items()):
-            if _agent is _AGENT_PENDING_SENTINEL:
+            if _agent is _AGENT_PENDING_SENTINEL or was_yielded_for_restart(_agent):
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 await self.async_session_store.mark_resume_pending(_sk, reason)

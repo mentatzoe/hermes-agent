@@ -152,6 +152,31 @@ def test_concurrent_mutator_and_other_turns_are_not_claimed(tmp_path):
         thread.join(5)
 
 
+def test_delayed_worker_cannot_register_a_wait_for_a_successor_turn(tmp_path):
+    from agent.tool_executor import _registered_tool_worker
+    from tools.thread_context import propagate_context_to_thread
+    agent = _agent()
+    path, done, results = tmp_path / "exit", threading.Event(), []
+
+    def old_worker():
+        with _registered_tool_worker(agent):
+            results.append(wait_for_condition("file_exists", str(path), 10, task_id="old"))
+        done.set()
+
+    with bind_wait_owner(agent):
+        submitted = propagate_context_to_thread(old_worker)
+    agent._current_turn_id = "new-model-turn"
+    thread = threading.Thread(target=submitted)
+    thread.start()
+    try:
+        assert done.wait(5), "an abandoned worker was attributed to the successor turn"
+        assert results[0]["status"] == "interrupted"
+        assert claim_waits(agent) is None
+    finally:
+        path.touch()
+        thread.join(5)
+
+
 def test_restart_admission_refuses_shell_and_python_before_any_environment_work(monkeypatch):
     import gateway.run as gateway_run
     import tools.terminal_tool as terminal
