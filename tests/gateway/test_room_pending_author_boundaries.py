@@ -48,10 +48,11 @@ async def test_recursion_cap_keeps_different_authors():
     from types import SimpleNamespace
     runner, adapter, _ = _busy_runner()
     first, second = _event('first', _zoe()), _event('second', _sol())
-    adapter._pending_messages['k'] = first
+    # The follow-up was already dequeued; the slot now holds the next actor's event.
+    adapter._pending_messages['k'] = second
     ctx = SimpleNamespace(source=first.source, session_id='s', session_key='k', run_generation=0,
                           _interrupt_depth=100, history=[], _status_thread_metadata={}, result_holder=[None])
-    await runner._run_agent_queued_followup(ctx, adapter, second.text, second, 'answer', {}, None)
+    await runner._run_agent_queued_followup(ctx, adapter, first.text, first, 'answer', {}, None)
     assert adapter._pending_messages['k'] is first
     assert runner._peek_session_state('k').conversation.queued_events == [second]
 
