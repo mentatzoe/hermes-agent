@@ -38,10 +38,11 @@ def _connect(path: Path):
     return conn
 
 
-def _save(path: Path, notice_id: str, payload: dict) -> None:
+def _save(path: Path, notice_id: str, payload: dict) -> bool:
     encoded = json.dumps(payload, ensure_ascii=False)
     with closing(_connect(path)) as conn, conn:
-        conn.execute("INSERT OR IGNORE INTO notices (id, payload) VALUES (?, ?)", (notice_id, encoded))
+        inserted = conn.execute("INSERT OR IGNORE INTO notices (id, payload) VALUES (?, ?)", (notice_id, encoded))
+        return inserted.rowcount == 1
 
 
 def _pending(path: Path) -> list:
@@ -98,7 +99,12 @@ async def admit_notice(runner, event, session_key) -> None:
             metadata.update(gateway_session_key=session_key, gateway_session_id=session_id)
             home = Path(runner._resolve_profile_home_for_source(event.source))
             path = home / "restart_notifications" / "pending.sqlite3"
-            notice_id = event._restart_notification_id or uuid.uuid4().hex
+            notice_id = event._restart_notification_id or (
+                uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
+                    ["hermes-notice", session_key, event._restart_notification_identity])).hex
+                if event._restart_notification_identity is not None else uuid.uuid4().hex)
+            # A cancelled save await may still commit. Retry must reuse this ID.
+            event._restart_notification_id = notice_id
             receipt = path, notice_id
             _inflight(runner).add(receipt)
             payload = {
@@ -109,10 +115,15 @@ async def admit_notice(runner, event, session_key) -> None:
                 "media_urls": event.media_urls, "media_types": event.media_types,
                 "auto_skill": event.auto_skill, "channel_prompt": event.channel_prompt,
             }
-            await asyncio.to_thread(_save, path, notice_id, payload)
+            inserted = await asyncio.to_thread(_save, path, notice_id, payload)
             event._restart_notification_id = notice_id
             event._restart_notification_path = path
             event.metadata = metadata
+            if inserted is False:
+                # An earlier attempt already owns this producer occurrence. Re-ack
+                # that row; never schedule a second event alongside its replay.
+                event._restart_notification_deferred = True
+                _inflight(runner).discard(receipt)
         except BaseException as exc:
             if receipt:
                 _inflight(runner).discard(receipt)
@@ -153,7 +164,7 @@ async def defer_or_reject(adapter, event, session_key, expected_session_key) -> 
                        expected_session_key, session_key)
         return True
     await admit_notice(getattr(adapter, "gateway_runner", None), event, session_key)
-    if await defer_during_restart(adapter, event, session_key):
+    if event._restart_notification_deferred or await defer_during_restart(adapter, event, session_key):
         event._gateway_accepted = True
         return True
     return False

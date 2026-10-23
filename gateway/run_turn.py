@@ -4311,7 +4311,10 @@ class GatewayTurnMixin:
             # Settle this notice before any await can prepare/drain a later turn.
             # Cancellation before the durable mark deliberately leaves it retryable.
             from gateway.restart_notifications import complete_notice
-            if not (isinstance(response, dict) and response.get("interrupted")):
+            if (notice_event is not None
+                    and worker.executor_task.done() and not worker.executor_task.cancelled()
+                    and response is worker.executor_task.result()
+                    and not (isinstance(response, dict) and response.get("interrupted"))):
                 await complete_notice(self, notice_event)
 
             # Interrupted OR queued message (/queue)?

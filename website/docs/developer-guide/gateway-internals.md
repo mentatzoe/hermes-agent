@@ -187,7 +187,11 @@ Adapters implement a common interface:
 Internal push wakes use `gateway.wake.admit_internal_event`. In a running gateway,
 `BasePlatformAdapter.handle_message()` commits an ID, payload and owning session
 to the profile's `restart_notifications/pending.sqlite3` before scheduling or
-queueing the notice. The process-local `_gateway_accepted` receipt acknowledges
+queueing the notice. A producer-stable occurrence identity (process incarnation,
+delegation completion or Kanban event batch), scoped to its destination, keeps
+coroutine cancellation after commit from allocating a second record on retry.
+Events without a producer identity retain their allocated ID across same-event
+retries. The process-local `_gateway_accepted` receipt acknowledges
 that durable admission, not execution. During a restart wait, notices stay silent;
 human messages retain the busy reply. Immediate capacity refusal releases the
 in-process claim so the journal consumer can retry the same record.

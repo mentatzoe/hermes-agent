@@ -61,13 +61,21 @@ def production_turns(runner, adapter, source, key, sid, pause, worker):
     runner._run_agent_stream_consumer_task = AsyncMock()
     runner._run_agent_track_agent = AsyncMock()
     runner._run_agent_monitor_for_interrupt = AsyncMock()
-    runner._run_agent_start_turn_worker = lambda *args: SimpleNamespace(executor_task=None)
+    worker_future = []
+
+    def start_worker(*args):
+        future = asyncio.get_running_loop().create_future()
+        worker_future.append(future)
+        return SimpleNamespace(executor_task=future)
+
+    runner._run_agent_start_turn_worker = start_worker
 
     async def await_worker(_worker, ctx, *args):
         result = await worker(ctx.message)
         if result is None:
             result = {"final_response": "done", "messages": [], "completed": True, "interrupted": False}
         ctx.result_holder[0] = result
+        _worker.executor_task.set_result(result)
         return result
 
     runner._run_agent_await_turn_worker = await_worker
