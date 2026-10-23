@@ -860,21 +860,23 @@ def _write_manifest(default_home: Path, data: dict) -> None:
 def _reconcile_standalone_runtime(default_home: Path, secondary_names: set[str]) -> None:
     """Remove only status owned by multiplexing, without re-stamping gateway identity."""
     from gateway.status import read_runtime_status
+    from gateway.status_persistence import runtime_status_lock
     from utils import atomic_json_write
 
     path = default_home / "gateway_state.json"
-    runtime = read_runtime_status(path)
-    if runtime is None:
-        return
-    runtime["served_profiles"] = []
-    platforms = runtime.get("platforms")
-    if isinstance(platforms, dict):
-        prefixes = tuple(f"{name}:" for name in secondary_names if name)
-        runtime["platforms"] = {
-            key: value for key, value in platforms.items()
-            if not (isinstance(key, str) and key.startswith(prefixes))
-        }
-    atomic_json_write(path, runtime, indent=None, separators=(",", ":"))
+    with runtime_status_lock(path):
+        runtime = read_runtime_status(path)
+        if runtime is None:
+            return
+        runtime["served_profiles"] = []
+        platforms = runtime.get("platforms")
+        if isinstance(platforms, dict):
+            prefixes = tuple(f"{name}:" for name in secondary_names if name)
+            runtime["platforms"] = {
+                key: value for key, value in platforms.items()
+                if not (isinstance(key, str) and key.startswith(prefixes))
+            }
+        atomic_json_write(path, runtime, indent=None, separators=(",", ":"))
 
 
 def _wait_for_served(default_home: Path, expected: set[str], timeout: float) -> Optional[list[str]]:

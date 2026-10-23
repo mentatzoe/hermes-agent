@@ -77,7 +77,7 @@ def _connect_patches(mock_proc, mock_fh):
         patch.object(Path, "mkdir", return_value=None),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
         patch("subprocess.Popen", return_value=mock_proc),
-        patch("builtins.open", return_value=mock_fh),
+        patch("plugins.platforms.whatsapp.adapter.open", return_value=mock_fh, create=True),
         patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock),
         patch("plugins.platforms.whatsapp.adapter.asyncio.create_task"),
     ]
