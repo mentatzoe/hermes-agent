@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from agent.i18n import t
+from agent.memory_manager import MemoryReviewDispatch, memory_review_binding_for_agent
+from agent.memory_provider import MemoryReviewBinding
 from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -1135,10 +1137,28 @@ def _release_fork_clients(review_agent: Any) -> None:
         review_agent.release_clients()
 
 
+def _bind_review_memory_tools(agent: Any, review_agent: Any, binding: Optional[MemoryReviewBinding], review_run=None) -> set:
+    """Borrow dispatch only, never a provider manager/lifecycle, on memory-review forks."""
+    if binding is None:
+        return set()
+    review_agent._memory_review_dispatch = MemoryReviewDispatch(
+        binding, is_active=lambda: review_run is None or not (
+            review_run.cancel_requested.is_set() or review_run.request_done.is_set()))
+    names = set(binding.tool_names)
+    # Routed forks build a fresh schema surface; copy only already-exposed review tools.
+    # Same-model forks already carry the exact parent snapshot and must not change its bytes.
+    for tool in getattr(agent, "tools", None) or []:
+        name = tool["function"]["name"]
+        if name in names and name not in review_agent.valid_tool_names:
+            review_agent.tools.append(copy.deepcopy(tool))
+            review_agent.valid_tool_names.add(name)
+    return names
+
+
 def _run_review_fork(
     agent: Any, messages_snapshot: List[Dict], prompt: str, task_cfg: Optional[Dict[str, Any]],
     review_run: Optional[_BackgroundReviewRun], st: _ReviewForkState, review_memory: bool = False,
-    explicit: bool = False,
+    explicit: bool = False, *, memory_review_binding: Optional[MemoryReviewBinding] = None,
 ) -> None:
     """Fork phase (inside thread-scoped silence): build the fork, run the prompt under the tool
     whitelist, snapshot its messages/usage, release its clients. Partial progress lands on ``st``
@@ -1148,9 +1168,17 @@ def _run_review_fork(
     st.review_agent, _rt, _routed = build_cache_parity_fork(
         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
     st.review_agent._review_attended = explicit
+    binding = memory_review_binding if review_memory else None
+    provider_tools = _bind_review_memory_tools(agent, st.review_agent, binding, review_run)
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
     review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
+    # Configured extras cannot widen a provider's review capability (or admit it to skills-only).
+    manager = getattr(agent, "_memory_manager", None)
+    external_tools = set(manager.get_all_tool_names()) if manager else set()
+    review_whitelist = (review_whitelist - external_tools) | provider_tools
+    configured_extra_tools -= external_tools
+    configured_extra_tools |= provider_tools
     extra_list = ", ".join(sorted(configured_extra_tools))
     deny_extra = f" Configured extra tools also allowed: {extra_list}." if configured_extra_tools else ""
     prompt_extra = f" Exception — these configured tools are also allowed: {extra_list}." if configured_extra_tools else ""
@@ -1158,15 +1186,17 @@ def _run_review_fork(
     # tell the model that memory is available, or it will burn iterations on denied calls.
     memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
     memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
-    set_thread_tool_whitelist(
-        review_whitelist,
-        deny_msg_fmt=(
-            "Background review denied non-whitelisted tool: "
-            "{tool_name}. Allowed here: skill_view/skills_list/read_file/search_files to read, "
-            "skill_manage(action='patch'|...) to change skills"
-            + memory_phrase_deny + "." + deny_extra + " Do not retry {tool_name}."
-        ),
+    deny_msg_fmt = (
+        "Background review denied non-whitelisted tool: "
+        "{tool_name}. Allowed here: skill_view/skills_list/read_file/search_files to read, "
+        "skill_manage(action='patch'|...) to change skills"
+        + memory_phrase_deny + "." + deny_extra + " Do not retry {tool_name}."
     )
+    # Timeout/concurrent tool workers do not inherit threading.local. Keep the same guard
+    # on the detached fork so it is checked before dispatch in those workers as well.
+    st.review_agent._background_review_tool_whitelist = frozenset(review_whitelist)
+    st.review_agent._background_review_tool_deny_msg = deny_msg_fmt
+    set_thread_tool_whitelist(review_whitelist, deny_msg_fmt=deny_msg_fmt)
     with suppress(Exception):
         from tools.skill_manager_guards import _reset_background_review_read_marks
 
@@ -1183,6 +1213,9 @@ def _run_review_fork(
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
     finally:
+        dispatch = getattr(st.review_agent, '_memory_review_dispatch', None)
+        if dispatch is not None:
+            dispatch.close()
         clear_thread_tool_whitelist()
         # Attribute usage to the PARENT session. Snapshot BEFORE unregister/close so counters
         # survive teardown, and in this finally so a fork that consumed tokens then raised is
@@ -1211,6 +1244,7 @@ def _run_review_in_thread(
     agent: Any, messages_snapshot: List[Dict], prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
     review_memory: bool = False, explicit: bool = False,
+    memory_review_binding: Optional[MemoryReviewBinding] = None,
 ) -> None:
     """Daemon-thread worker: build the fork, run the prompt, surface the action summary via
     ``agent._safe_print`` / ``background_review_callback``. ``review_run`` (from
@@ -1245,7 +1279,8 @@ def _run_review_in_thread(
         # their console output (#55769 / #55925). ``thread_scoped_silence`` routes only this thread's writes
         # to devnull and leaves all other threads on the real streams.
         with thread_scoped_silence():
-            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit)
+            _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit,
+                             memory_review_binding=memory_review_binding)
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
         try:
@@ -1302,7 +1337,7 @@ def spawn_background_review_thread(
     agent: Any, messages_snapshot: List[Dict], review_memory: bool = False,
     review_skills: bool = False, focus: Optional[str] = None,
     task_cfg: Optional[Dict[str, Any]] = None, review_run: Optional[_BackgroundReviewRun] = None,
-    explicit: bool = False,
+    explicit: bool = False, memory_review_binding=...,
 ):
     """Return ``(target, prompt)``; the caller builds the ``threading.Thread`` so test patches of
     ``run_agent.threading.Thread`` keep working. ``focus`` (``/refine [instructions]``) is appended
@@ -1315,6 +1350,15 @@ def spawn_background_review_thread(
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
+    binding = (memory_review_binding_for_agent(agent) if memory_review_binding is Ellipsis
+               else memory_review_binding) if review_memory else None
+    binding = binding if isinstance(binding, MemoryReviewBinding) else None
+    if binding is not None:
+        if not getattr(agent, "_memory_store", None):
+            # No native store: do not send the reviewer to nonexistent MEMORY.md/USER.md targets.
+            prompt = (getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT) + "\n\n"
+                      if review_skills else "Review the conversation above for durable memory.\n\n")
+        prompt += "\n\n**External memory review**:\n" + binding.prompt
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "
@@ -1322,9 +1366,10 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
+        binding_kwargs = {"memory_review_binding": binding} if binding is not None else {}
         _run_review_in_thread(
             agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
-            review_memory=review_memory, explicit=explicit)
+            review_memory=review_memory, explicit=explicit, **binding_kwargs)
 
     return _target, prompt
 

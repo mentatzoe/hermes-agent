@@ -672,6 +672,9 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
 def _pre_tool_block(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
     hook-modified args applied. Hook failures never block."""
+    allowed = getattr(agent, "_background_review_tool_whitelist", None)
+    if allowed is not None and ref.name not in allowed:
+        return agent._background_review_tool_deny_msg.format(tool_name=ref.name), ref.args
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
@@ -1691,10 +1694,11 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
             error_result=lambda e: json.dumps({"error": f"Context engine tool '{function_name}' failed: {e}"}),
             error_log="context_engine.handle_tool_call raised for %s: %s",
         )
-    if agent._memory_manager and agent._memory_manager.has_tool(function_name):
+    memory_dispatch = getattr(agent, "_memory_review_dispatch", None) or agent._memory_manager
+    if memory_dispatch and memory_dispatch.has_tool(function_name):
         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
         return _SequentialDispatch(
-            execute=lambda next_args: agent._memory_manager.handle_tool_call(function_name, next_args),
+            execute=lambda next_args: memory_dispatch.handle_tool_call(function_name, next_args),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args),
             error_result=lambda e: json.dumps({"error": f"Memory tool '{function_name}' failed: {e}"}),
             error_log="memory_manager.handle_tool_call raised for %s: %s",

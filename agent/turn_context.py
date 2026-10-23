@@ -750,9 +750,12 @@ def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]])
 
 def _tick_memory_nudge(agent: Any) -> bool:
     """Advance the turn-based memory nudge counter; ``True`` when the review should fire."""
-    if (agent._memory_nudge_interval > 0
-            and "memory" in agent.valid_tool_names
-            and agent._memory_store):
+    if agent._memory_nudge_interval <= 0:
+        return False
+    from agent.memory_manager import memory_review_binding_for_agent
+
+    native = "memory" in agent.valid_tool_names and agent._memory_store
+    if native or memory_review_binding_for_agent(agent) is not None:
         agent._turns_since_memory += 1
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             agent._turns_since_memory = 0
