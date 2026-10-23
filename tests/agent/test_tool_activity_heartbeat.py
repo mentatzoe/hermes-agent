@@ -6,8 +6,9 @@ The gateway's turn-inactivity watchdog
 Activity was only stamped when a tool *started* and when it *completed*, so
 a tool call that ran silently for 30+ minutes looked idle to the watchdog
 and the turn was hard-abandoned mid-execution (processes reaped). The
-the heartbeat in ``_run_agent_tool_execution_middleware`` stamps activity
-periodically while a tool call is in flight.
+heartbeat in ``_run_agent_tool_execution_middleware`` stamps activity
+periodically while a tool call is in flight. Integration tests coordinate
+on those stamps, not elapsed wall-clock time (fork #40).
 """
 
 import json
@@ -89,19 +90,64 @@ def _make_agent(monkeypatch):
     stub._subdirectory_hints = MagicMock()
     stub._subdirectory_hints.check_tool_call = lambda *a, **kw: None
     stub._flush_messages_to_session_db = lambda *a, **kw: None
-    stub._append_guardrail_observation = lambda name, result, *a, **kw: result
+    stub._append_guardrail_observation = lambda name, args, result, **kw: result
     stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
     stub.clear_interrupt = _ra.AIAgent.clear_interrupt.__get__(stub)
     stub._guardrail_block_result = lambda d: json.dumps({"error": "blocked"})
     return stub
 
 
-def _slow_execute(delay: float = 0.25):
-    def _execute(next_args):
-        time.sleep(delay)
-        return json.dumps({"ok": True})
+@pytest.fixture
+def heartbeat_threads(monkeypatch):
+    """Observe the real middleware-owned heartbeat, without replacing its loop."""
+    import agent.tool_executor as te
 
-    return _execute
+    heartbeat = te._run_tool_activity_heartbeat
+    threads = []
+
+    def observe(agent, stop, label, **kwargs):
+        threads.append((threading.current_thread(), stop))
+        return heartbeat(agent, stop, label, **kwargs)
+
+    monkeypatch.setattr(te, "_run_tool_activity_heartbeat", observe)
+    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
+    try:
+        yield threads
+    finally:
+        # Clean up even when a shutdown regression makes an assertion fail.
+        for thread, stop in threads:
+            stop.set()
+            thread.join(timeout=5)
+
+
+def _assert_heartbeat_stopped(threads):
+    assert len(threads) == 1, "middleware did not start exactly one heartbeat"
+    thread, stop = threads[0]
+    assert stop.is_set(), "middleware did not signal heartbeat shutdown"
+    assert not thread.is_alive(), "heartbeat thread outlived tool execution"
+
+
+class _InFlightTool:
+    """Keep execute open until the real heartbeat has refreshed activity twice."""
+
+    def __init__(self):
+        self.in_flight = threading.Event()
+        self.repeated = threading.Event()
+        self.touches = []
+
+    def touch(self, desc):
+        if desc.startswith("tool running:") and self.in_flight.is_set():
+            self.touches.append(desc)
+            if len(self.touches) >= 2:
+                self.repeated.set()
+
+    def execute(self, next_args):
+        self.in_flight.set()
+        try:
+            assert self.repeated.wait(5), "no repeated heartbeat while execute was in flight"
+            return json.dumps({"ok": True})
+        finally:
+            self.in_flight.clear()
 
 
 def test_heartbeat_touches_periodically_and_stops():
@@ -136,7 +182,7 @@ def test_heartbeat_touches_periodically_and_stops():
     assert all(touch == "tool running: terminal" for touch in touches)
 
 
-def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
+def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch, heartbeat_threads):
     """A tool call running longer than one interval gets activity stamps.
 
     Before the fix, only the start stamp ("executing tool: X") and the
@@ -145,14 +191,12 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
     """
     import agent.tool_executor as te
 
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
-
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
-    touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    tool = _InFlightTool()
+    agent._touch_activity = tool.touch
 
     result = te._run_agent_tool_execution_middleware(
         agent,
@@ -160,64 +204,51 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=tool.execute,
         display_index=1,
     )
 
     assert json.loads(result.result) == {"ok": True}
 
-    # Start stamp + at least one heartbeat mid-call (0.25s run, 0.05s cadence).
-    assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
-    spread = touches[-1] - touches[0]
-    assert spread >= 0.15, f"touches not spread across the call: {spread:.3f}s"
+    assert len(tool.touches) >= 2
+    assert all(desc == "tool running: terminal" for desc in tool.touches)
+    _assert_heartbeat_stopped(heartbeat_threads)
 
 
-def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
+def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch, heartbeat_threads):
     """A quick tool exits the heartbeat thread; no touches after return."""
     import agent.tool_executor as te
-
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
 
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
-    touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
-
     te._run_agent_tool_execution_middleware(
         agent,
         function_name="terminal",
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.02),
+        execute=lambda args: json.dumps({"ok": True}),
         display_index=1,
     )
 
-    n = len(touches)
-    time.sleep(0.12)  # several heartbeat intervals
-    assert len(touches) == n, "heartbeat thread kept running after tool returned"
+    _assert_heartbeat_stopped(heartbeat_threads)
 
 
-def test_heartbeat_stops_when_execute_raises(monkeypatch):
+def test_heartbeat_stops_when_execute_raises(monkeypatch, heartbeat_threads):
     """If the tool call raises, the heartbeat thread still stops (no leak)."""
 
     import agent.tool_executor as te
-
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
 
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
-    touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
-
     def _boom(next_args):
         raise RuntimeError("tool exploded")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="tool exploded"):
         te._run_agent_tool_execution_middleware(
             agent,
             function_name="terminal",
@@ -228,23 +259,19 @@ def test_heartbeat_stops_when_execute_raises(monkeypatch):
             display_index=1,
         )
 
-    n = len(touches)
-    time.sleep(0.12)  # several heartbeat intervals
-    assert len(touches) == n, "heartbeat thread kept running after execute() raised"
+    _assert_heartbeat_stopped(heartbeat_threads)
 
 
-def test_concurrent_tool_call_heartbeat(monkeypatch):
+def test_concurrent_tool_call_heartbeat(monkeypatch, heartbeat_threads):
     """Concurrent execution also stamps activity via the shared chokepoint."""
     import agent.tool_executor as te
-
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
 
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
-    touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    tool = _InFlightTool()
+    agent._touch_activity = tool.touch
 
     agent._execute_tool_calls_concurrent = (
         __import__("run_agent").AIAgent._execute_tool_calls_concurrent.__get__(agent)
@@ -261,8 +288,7 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
             self.tool_calls = tool_calls
 
     def _invoke(name, *a, **kw):
-        time.sleep(0.25)
-        return json.dumps({"ok": name})
+        return tool.execute({})
 
     agent._invoke_tool = MagicMock(side_effect=_invoke)
 
@@ -270,7 +296,10 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
     messages: list = []
     agent._execute_tool_calls_concurrent(msg, messages, "task")
 
-    assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
+    assert len(tool.touches) >= 2
+    assert all(desc == "tool running: tool_a" for desc in tool.touches)
+    assert json.loads(messages[-1]["content"]) == {"ok": True}
+    _assert_heartbeat_stopped(heartbeat_threads)
 
 
 def test_heartbeat_exits_once_worker_tid_is_interrupted():
