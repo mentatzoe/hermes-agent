@@ -218,8 +218,7 @@ class GatewayPluginInjectionMixin:
     async def _dispatch_plugin_origin_injection(
         self, *, source: SessionSource, content: str, plugin_id: str
     ) -> bool:
-        """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
-        message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
+        """Resolve the authorized origin's owner before durable admission; reply to that chat."""
         target = f"origin={source.platform.value}/{source.chat_id}"
         if not self._plugin_injection_accepting():
             return False
@@ -231,13 +230,16 @@ class GatewayPluginInjectionMixin:
             return False
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
+            # Apply normal creation/reset policy only after own-profile routing and authorization.
+            # Admission must pin this owner even if restart begins before its first turn.
+            entry = await self.async_session_store.get_or_create_session(source, touch_activity=False)
             await adapter.handle_message(MessageEvent(
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,
-                # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
                 metadata={
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
-                    "gateway_session_key": session_key,
+                    "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
+                    "gateway_session_strict": True,
                 },
             ))
         logger.info("Plugin message injection dispatched: plugin=%s %s session=%s", plugin_id, target, session_key)

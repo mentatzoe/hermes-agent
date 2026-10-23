@@ -329,11 +329,13 @@ async def _replay_group(runner, path: Path, rows) -> None:
     event._restart_notification_records = tuple(identity for identity, _payload in rows)
     _inflight(runner).update((path, identity) for identity in event._restart_notification_records)
     try:
-        prime = getattr(adapter, "prime_routing_cache", None)
-        if callable(prime):
-            prime(event)
-        from gateway.wake import admit_internal_event
-        await admit_internal_event(adapter, event)
+        # The spawned adapter task must keep this scope through its reply, not just the model turn.
+        async with runner._async_profile_scope_for_source(source):
+            prime = getattr(adapter, "prime_routing_cache", None)
+            if callable(prime):
+                prime(event)
+            from gateway.wake import admit_internal_event
+            await admit_internal_event(adapter, event)
     except BaseException:
         release_notice(runner, event)
         raise

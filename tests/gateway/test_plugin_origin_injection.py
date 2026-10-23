@@ -198,3 +198,74 @@ async def test_origin_without_connected_adapter_returns_false(gateway):
         assert ctx_alpha.inject_message("x", origin={**_origin("100"), "platform": "discord"}) is False
     assert runner._background_tasks == set()
     assert gateway.adapters["default"].sent == []
+
+
+@pytest.mark.asyncio
+async def test_new_origin_owner_survives_restart_before_its_first_turn(gateway, monkeypatch):
+    """An authorized new lane is pinned before admission and replayed by its own bot/profile."""
+    from gateway import restart_notifications as notices
+
+    runner, alpha = gateway.runner, gateway.adapters["alpha"]
+    ctx, manager = _context(gateway.homes["alpha"])
+    original_save = notices._save
+    admitted = []
+
+    def save_then_restart(path, notice_id, payload):
+        key = payload["metadata"]["gateway_session_key"]
+        entry = runner.session_store.lookup_by_session_key(key)
+        assert entry.session_id == payload["metadata"]["gateway_session_id"]
+        admitted.append(entry.session_id)
+        result = original_save(path, notice_id, payload)
+        runner._restart_requested = True
+        return result
+
+    monkeypatch.setattr(notices, "_save", save_then_restart)
+    with patch("hermes_cli.plugins._known_plugin_managers", return_value=[manager]):
+        await _publish(runner)
+        assert ctx.inject_message("First review", origin=_origin("100")) is True
+        await _settle(runner, alpha)
+    assert len(admitted) == 1
+    assert gateway.turns == [] and alpha.sent == []
+    path = gateway.homes["alpha"] / "restart_notifications" / "pending.sqlite3"
+    assert len(notices._pending(path)) == 1
+    assert not (gateway.homes["default"] / "restart_notifications" / "pending.sqlite3").exists()
+    monkeypatch.setattr(notices, "_save", original_save)
+
+    # Reconstruct the real runner, routing index and adapters; only the model remains replaced.
+    fresh = GatewayRunner(runner.config)
+    adapters = {name: _RecordingAdapter(name) for name in gateway.homes}
+    fresh.adapters = {Platform.TELEGRAM: adapters["default"]}
+    fresh._profile_adapters = {name: {Platform.TELEGRAM: adapters[name]} for name in ("alpha", "beta")}
+    fresh._run_agent_inner = runner._run_agent_inner
+    for name, adapter in adapters.items():
+        adapter.gateway_runner = fresh
+        if name == "default":
+            adapter.set_message_handler(fresh._handle_message)
+        else:
+            adapter.set_owner_profile(name)
+            adapter.set_message_handler(fresh._make_profile_message_handler(name))
+    for _ in range(2):
+        await notices.replay_pending(fresh)
+        await _settle(fresh, adapters["alpha"])
+    assert len(gateway.turns) == 1
+    turn = gateway.turns[0]
+    assert (turn.session_id, turn.home, turn.marker) == (admitted[0], gateway.homes["alpha"], "alpha")
+    assert adapters["alpha"].sent == [("100", "reply-1")]
+    assert adapters["alpha"].send_scopes == [(gateway.homes["alpha"], "alpha")]
+    assert adapters["default"].sent == adapters["beta"].sent == []
+    assert notices._pending(path) == []
+
+
+@pytest.mark.asyncio
+async def test_origin_denied_at_dispatch_creates_no_owner_or_notice(gateway, monkeypatch):
+    runner, alpha = gateway.runner, gateway.adapters["alpha"]
+    ctx, manager = _context(gateway.homes["alpha"])
+    with patch("hermes_cli.plugins._known_plugin_managers", return_value=[manager]):
+        await _publish(runner)
+        assert ctx.inject_message("Not authorized", origin=_origin("100")) is True
+        monkeypatch.setattr(runner, "_is_user_authorized_for_source", lambda *_a, **_kw: False)
+        await _settle(runner, alpha)
+    assert runner.session_store._entries == {}
+    assert gateway.turns == [] and alpha.sent == []
+    assert not any((home / "restart_notifications" / "pending.sqlite3").exists()
+                   for home in gateway.homes.values())
