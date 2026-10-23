@@ -39,9 +39,13 @@ def merge_runtime_status_on_disk(
     existing = status._read_json_file(path)
     if not isinstance(existing, dict):
         return payload
-    if (status._pid_from_record(existing) != os.getpid()
-            and status._live_pid_from_record(existing) is not None):
+    owner = status._live_pid_from_record(existing)
+    if (owner is not None and owner != os.getpid()
+            and status._record_matches_live_gateway_pid(existing, owner)):
         return None
-    # External writers seed fields such as desired_state. Preserve those,
-    # while the gateway's canonical snapshot wins for the fields it owns.
-    return {**existing, **payload}
+    # Runtime fields belong to the gateway, but operator intent can change
+    # after its canonical snapshot was cached. Never replay that stale intent.
+    merged = {**existing, **payload}
+    if "desired_state" in existing:
+        merged["desired_state"] = existing["desired_state"]
+    return merged

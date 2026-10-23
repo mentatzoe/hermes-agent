@@ -11,6 +11,9 @@ import pytest
 from gateway import status
 
 
+pytestmark = pytest.mark.spawns_gateway_lookalike
+
+
 _OWNER = """
 import json
 import sys
@@ -35,11 +38,19 @@ def owner(tmp_path, monkeypatch):
     monkeypatch.setattr(status, "_runtime_status_state", None)
     process = None
 
-    def start(script=_OWNER, before_ready=None):
+    def start(script=_OWNER, before_ready=None, *, as_gateway=True):
         nonlocal process
+        repo = Path(__file__).resolve().parents[2]
+        if as_gateway:
+            # A reaped stub exercises the real command-line identity reader, not a mock.
+            entry = tmp_path / "hermes"
+            entry.write_text(f"import sys\nsys.path.insert(0, {str(repo)!r})\n" + script)
+            command = [sys.executable, str(entry), "gateway", "run"]
+        else:
+            command = [sys.executable, "-c", script]
         process = subprocess.Popen(
-            [sys.executable, "-c", script],
-            cwd=Path(__file__).resolve().parents[2],
+            command,
+            cwd=repo,
             env={**os.environ, "HERMES_HOME": str(tmp_path)},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -100,6 +111,16 @@ def test_foreign_status_write_preserves_live_owner_and_all_file_bytes(
     assert current["start_time"] == record["start_time"]
     assert current["active_agents"] == 2
     assert current["gateway_state"] == "running"
+
+
+@pytest.mark.parametrize("mode", ["write", "publish"])
+def test_unrelated_live_writer_cannot_block_gateway_startup(tmp_path, owner, mode):
+    process, record = owner(as_gateway=False)
+    assert process.poll() is None
+    assert not status._record_matches_live_gateway_pid(record, process.pid)
+
+    assert _submit(mode, gateway_state="starting")
+    assert status.read_runtime_status()["pid"] == os.getpid()
 
 
 @pytest.mark.parametrize("mode", ["write", "publish"])
