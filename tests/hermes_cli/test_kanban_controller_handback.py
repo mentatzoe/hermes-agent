@@ -126,3 +126,16 @@ def test_stale_controller_worker_cannot_block_a_new_run(conn):
     assert not kb.block_task(conn, tid, kind="needs_input", reason="Stale", expected_run_id=stale)
     assert kb.get_task(conn, tid).current_run_id == current
     assert kb.get_task(conn, tid).status == "running"
+
+
+def test_controller_triage_cannot_hide_ordinary_candidates_behind_limit(conn):
+    with kb.write_txn(conn):
+        conn.executemany(
+            "INSERT INTO tasks (id, title, status, priority, created_at, created_by) "
+            "VALUES (?, 'Old hand-back', 'triage', 10, 0, 'aleph-vault-controller')",
+            [(f"controller-{index}",) for index in range(1000)],
+        )
+    other_tenant = kb.create_task(conn, title="Other tenant", triage=True, tenant="other")
+    ordinary = kb.create_task(conn, title="Ordinary work", triage=True, tenant="selected")
+    assert set(decomp.list_triage_ids()) == {other_tenant, ordinary}
+    assert decomp.list_triage_ids(tenant="selected") == [ordinary]
