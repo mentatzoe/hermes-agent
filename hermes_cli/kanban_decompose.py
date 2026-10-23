@@ -337,7 +337,9 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return automatic decomposition candidates, leaving controllers their work."""
+    from hermes_cli.kanban_block_policy import is_controller_owned
+
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+    return [row.id for row in rows if not is_controller_owned(row.created_by)]
