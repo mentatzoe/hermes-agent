@@ -102,32 +102,43 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
-        """Append a /queue event to the FIFO chain for a session."""
+    @staticmethod
+    def _pop_queued_event(events: List["MessageEvent"]) -> "MessageEvent":
+        """Take the oldest human event, or the oldest notice when no human is waiting."""
+        index = next((i for i, event in enumerate(events) if not event.internal), 0)
+        return events.pop(index)
+
+    def _enqueue_fifo(
+        self, session_key: str, queued_event: "MessageEvent", adapter: Any, *, front: bool = False,
+    ) -> None:
+        """Queue humans before notices, FIFO within each class; restore dequeued work at the front."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
+        overflow = self._session_state(session_key).conversation.queued_events
         if session_key in pending_slot:
-            self._session_state(session_key).conversation.queued_events.append(queued_event)
+            overflow.insert(0, pending_slot.pop(session_key))
+        if front:
+            overflow.insert(0, queued_event)
         else:
-            pending_slot[session_key] = queued_event
+            overflow.append(queued_event)
+        pending_slot[session_key] = self._pop_queued_event(overflow)
         queued_event._gateway_accepted = True
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
     ) -> Optional["MessageEvent"]:
-        """Promote the next overflow item after the slot drained.
-
-        ``pending_event`` None → the overflow head becomes the pending event; otherwise the head is
-        staged into the slot for the NEXT recursion. Returns the (possibly updated) pending_event.
-        """
+        """Select the next human/notice and stage the following event in the adapter slot."""
         overflow = self._overflow_queue(session_key)
         if not overflow:
             return pending_event
+        if pending_event is not None and pending_event.internal and any(not e.internal for e in overflow):
+            overflow.insert(0, pending_event)
+            pending_event = None
         if pending_event is None:
-            return overflow.pop(0)
-        if adapter is not None and hasattr(adapter, "_pending_messages"):
-            adapter._pending_messages[session_key] = overflow.pop(0)
+            pending_event = self._pop_queued_event(overflow)
+        if overflow and adapter is not None and hasattr(adapter, "_pending_messages"):
+            adapter._pending_messages[session_key] = self._pop_queued_event(overflow)
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
 
@@ -138,16 +149,13 @@ class GatewayBusySessionMixin:
             depth += 1
         return depth
 
-    def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> Optional["MessageEvent"]:
-        """Pop the oldest orphaned FIFO overflow event for an idle session (None if nothing to rescue).
+    def _rescue_orphaned_overflow(
+        self, session_key: str, adapter: Any, *, incoming_event: Optional["MessageEvent"] = None,
+    ) -> Optional["MessageEvent"]:
+        """Rescue an idle overflow, considering the new arrival at its class's tail.
 
-        ``queued_events`` drains only at the post-turn promotion site; a busy window ending without
-        it (early exit, exception/interrupt/generation-bump) orphans the overflow. On a NEW event for
-        a NON-busy session the oldest orphan runs as THIS turn, the next is staged into the slot so
-        arrival order holds, and the caller enqueues the incoming event behind it. The returned
-        event is REMOVED from both stores, else the post-turn dequeue would run it twice.
-
-        See #28503.
+        Exits that skip post-turn promotion can orphan the overflow. Select humans before notices
+        and stage the next event so the normal drain continues. The returned event leaves both stores.
         """
         try:
             overflow = self._overflow_queue(session_key)
@@ -156,11 +164,13 @@ class GatewayBusySessionMixin:
             pending_slot = getattr(adapter, "_pending_messages", None)
             if not isinstance(pending_slot, dict) or pending_slot.get(session_key):
                 return None  # slot occupied (busy) or no slot storage — promotion owns this
-            head = overflow.pop(0)
-            # Keep the slot occupied so the drain promotes in order and a mid-chain arrival routes
-            # to overflow instead of jumping the queue (same invariant as _promote_queued_event).
+            if incoming_event is not None:
+                overflow.append(incoming_event)
+                incoming_event._gateway_accepted = True
+            head = self._pop_queued_event(overflow)
+            # Keep a slot occupied so adapter arrivals cannot bypass the remaining queue.
             if overflow:
-                pending_slot[session_key] = overflow.pop(0)
+                pending_slot[session_key] = self._pop_queued_event(overflow)
             logger.warning(
                 "Rescued orphaned FIFO overflow event for idle session "
                 "%s — it was queued during a busy window but the post-turn "

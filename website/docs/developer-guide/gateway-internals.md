@@ -91,6 +91,18 @@ When an agent is actively running, incoming messages pass through two sequential
 
 Commands that must reach the runner while the agent is blocked (like `/approve`) are dispatched **inline** via `await self._message_handler(event)` — they bypass the background task system to avoid race conditions.
 
+### Queued follow-up order
+
+The runner queues human messages before internal notices (`MessageEvent.internal`), retaining
+FIFO order within each class. This applies to the adapter's pending slot and the session's overflow,
+including recovery when a previous turn exited without draining it. Photo-burst merging still
+requires the same author and security context; a notice cannot absorb a human attachment.
+
+At the interrupt-depth limit, an already-dequeued event returns to the front of its own class,
+without merging into another message or applying the new-arrival queue cap again. A human arriving
+while that event is deferred still precedes any deferred notices. The active turn is not preempted
+by this ordering rule; existing steering and control-command behavior is unchanged.
+
 ## Authorization
 
 The gateway uses a multi-layer authorization check, evaluated in order:
