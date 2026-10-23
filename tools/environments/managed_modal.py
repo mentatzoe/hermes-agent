@@ -74,9 +74,26 @@ class ManagedModalEnvironment(BaseEnvironment):
         self._sandbox_kwargs = dict(modal_sandbox_kwargs or {})
         self._create_idempotency_key = str(uuid.uuid4())
         self._sandbox_id = self._create_sandbox()
+        self._startup_snapshot_path = f"/tmp/hermes-managed-startup-{uuid.uuid4().hex}.sh"  # no-tmp: ok — remote sandbox
+
+    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+        """Raw shell transport for delegated snapshots, independent of gateway shell state."""
+        from tools.environments.base_output import _ThreadedProcessHandle
+        # The gateway may source its own mutable snapshot before executing this command.
+        # Start clean, then restore the backend's original environment, not the parent's exports.
+        script = f"source {shlex.quote(self._startup_snapshot_path)} || exit $?\n{cmd_string}"
+        command = f"/usr/bin/env -i /bin/bash --noprofile --norc -c {shlex.quote(script)}"
+        exec_id = str(uuid.uuid4())
+
+        def run():
+            result = self.execute(command, timeout=timeout, stdin_data=stdin_data, _exec_id=exec_id)
+            return result["output"], result["returncode"]
+
+        return _ThreadedProcessHandle(run, cancel_fn=lambda: self._cancel_exec(exec_id))
 
     def execute(self, command: str, cwd: str = "", *, timeout: int | None = None, stdin_data: str | None = None,
-                rewrite_compound_background: bool = True, bounded_capture: bool = False) -> dict:
+                rewrite_compound_background: bool = True, bounded_capture: bool = False,
+                _exec_id: str | None = None) -> dict:
         # Signature parity with BaseEnvironment.execute only: the gateway runs commands
         # explicitly (no shell background rewriting) and returns the remote result in one
         # payload, so streaming-time bounding does not apply (the terminal tool's final
@@ -87,7 +104,15 @@ class ManagedModalEnvironment(BaseEnvironment):
             # Feed sudo via a shell pipe: the transport has no direct stdin piping.
             exec_command = f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
         timeout = timeout or self.timeout
-        exec_id = str(uuid.uuid4())
+        exec_id = _exec_id or str(uuid.uuid4())
+        startup = shlex.quote(self._startup_snapshot_path)
+        temporary = shlex.quote(f"{self._startup_snapshot_path}.{exec_id}")
+        # Publish a complete startup snapshot once, even when the first parent and
+        # child execs arrive together. A hard link cannot replace a competing winner.
+        exec_command = (
+            f"if [ ! -f {startup} ]; then (umask 077; export -p > {temporary} && "
+            f"(ln {temporary} {startup} 2>/dev/null || [ -f {startup} ]); "
+            f"rc=$?; rm -f -- {temporary}; exit $rc) || exit $?; fi\n{exec_command}")
         payload: Dict[str, Any] = {"execId": exec_id, "command": exec_command, "cwd": cwd or self.cwd,
                                    "timeoutMs": int(timeout * 1000)}
         if stdin_data is not None:
