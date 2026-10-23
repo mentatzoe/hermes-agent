@@ -196,6 +196,33 @@ actually needed. Results at or below the threshold are returned unchanged.
 This uses the shared `hooks.output_spill` settings (`10,000` characters by
 default); see [Plugins — oversized-context spill](./plugins/index.md#oversized-context-spill).
 
+## Optional Detached Memory Review
+
+A provider can opt into Hermes's existing periodic memory-review cadence, including
+when both native stores are disabled. Implement `memory_review_binding()` and
+return `MemoryReviewBinding(prompt, tool_names, handle_tool_call)`, or `None` when
+review is unavailable. Older hosts do not call this optional method.
+
+The getter runs on the foreground path, so keep it cheap and side-effect free.
+Capture the already-authorized peer/session target in the callback; do not resolve
+a mutable current session when the callback eventually runs. Hermes captures the
+binding with the transcript at enqueue time and retains that pairing on requeue.
+The provider remains responsible for enforcing its own approval and target-access
+policy when a borrowed callback executes.
+
+Only tools both exposed by the live agent and owned by that provider are admitted.
+The review fork borrows this bounded callback; it does not initialize or own a
+provider or run its prefetch, sync, session-end, or shutdown hooks. Review prompts,
+tool payloads, and reports must not become new conversation evidence. Keep mutable
+cards, destructive operations, and writes requiring interactive approval out of a
+detached capability unless the provider can enforce those boundaries itself.
+
+Both tool executor paths use the ordinary guards, redaction, and tool accounting.
+Cancellation or review completion revokes new dispatches from that fork. A request
+already in flight may still finish; this is not transactional cancellation. The
+captured binding can remain queued for a later retry, but each fork receives its
+own revocable dispatch wrapper. Native-only review behavior is unchanged.
+
 ## Pre-Compress Checkpoints (fail-closed)
 
 `on_pre_compress()` is best-effort by default: if your provider raises, the

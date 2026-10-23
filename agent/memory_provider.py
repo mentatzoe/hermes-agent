@@ -50,6 +50,20 @@ def is_core_memory_provider(name: Optional[str]) -> bool:
 
 
 @dataclass(frozen=True)
+class MemoryReviewBinding:
+    """Captured, authorized peer/session capability for a detached memory review.
+
+    The callback must retain its original target even if the provider later switches sessions.
+    It owns no initialize, prefetch, sync, session-end or shutdown lifecycle. ``prompt`` supplies
+    provider-specific review/routing instructions; ``tool_names`` bounds the callable surface.
+    """
+
+    prompt: str
+    tool_names: tuple[str, ...]
+    handle_tool_call: Callable[[str, dict], str]
+
+
+@dataclass(frozen=True)
 class RecallStatus:
     """What the last prefetch injected, for the deterministic recall indicator
     (``MemoryManager.describe_recall``). ``count == 0`` means content without a
@@ -148,6 +162,14 @@ class MemoryProvider(ABC):
 
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
+
+    def memory_review_binding(self, *, session_id: str = "") -> MemoryReviewBinding | None:
+        """Opt into existing periodic reviews without initializing a provider on the fork.
+
+        Capture the currently authorized target here, not at later tool dispatch. The host
+        admits only registered tools exposed on the parent and keeps its ordinary tool guards.
+        """
+        return None
 
     # -- Optional hooks (override to opt in) ---------------------------------
 
