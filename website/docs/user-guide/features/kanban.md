@@ -419,8 +419,8 @@ its source-phase provenance and returns to `review` or `ready` automatically
 when the dependency gate clears. `unblock` never routes directly to `triage`.
 
 If you unblock a task and it later shows up in **`triage`**, the unblock is not
-what put it there. A subsequent *re-block for the same reason* did: after a task
-is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
+what put it there. A subsequent *re-block with the same kind* did: after a task
+is blocked → unblocked → re-blocked with that kind `BLOCK_RECURRENCE_LIMIT`
 times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
 — where a cron would just keep unblocking it — and routes it to `triage` for
 orchestration attention. This is a deterministic DB guard, not an LLM judgment call, and
@@ -429,6 +429,25 @@ survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+
+In this fork, `created_by="<name>-controller"` (with a nonempty name) reserves
+hand-back routing for the external controller. These cards keep ordinary
+`blocked` events and recurrence history but never enter `triage` through the
+unblock-loop breaker, regardless of block kind or number of unblocks. Their
+owner must interpret repeated hand-backs and explicitly resume the same card;
+this keeps the issue-answer path working without rebuilding delivered work.
+Genuine incomplete-parent waits still use `todo` and resume after the parent.
+Ordinary cards retain the loop breaker, and body text cannot opt into this policy.
+
+The automatic decomposer and `decompose --all` also skip controller-owned cards
+already in `triage`; they do not change those cards' status. An explicit
+`decompose TASK_ID` remains an operator-directed action. Existing cards made by
+the Aleph Vault and Research Vault controllers already use this creator
+convention, so adoption needs no configuration change or database migration.
+Install the reviewed source, including `hermes_cli/kanban_block_policy.py`, and
+restart the gateway to load its dispatcher/decomposer changes. Start fresh
+worker/CLI processes too: already-running workers retain the old block router.
+The source merge alone does not change the running gateway.
 :::
 
 ## Enabling tools for a chat profile
