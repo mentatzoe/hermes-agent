@@ -1,10 +1,44 @@
 """Persistence-time ownership checks for gateway runtime status."""
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_cli.active_sessions import _FileLock
+
+
+@contextmanager
+def runtime_status_lock(path: Path):
+    """Stable mutex shared by runtime publishers and external status editors.
+
+    POSIX flock needs no writable descriptor. A root-run migration can create
+    this empty lock before the service user starts, so make new locks readable
+    even with a restrictive umask; never chmod or replace an existing inode.
+    Windows byte-range locking retains the existing writable-descriptor path.
+    """
+    lock = path.with_suffix(path.suffix + ".lock")
+    if os.name == "nt":
+        with _FileLock(lock):
+            yield
+        return
+
+    import fcntl
+
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        created = True
+    except FileExistsError:
+        fd = os.open(lock, os.O_RDONLY)
+    try:
+        if created:
+            os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def persist_runtime_status(
@@ -17,7 +51,7 @@ def persist_runtime_status(
     OS if a writer dies; another process's queued write then checks the owner
     it actually finds, rather than the one it observed before waiting.
     """
-    with _FileLock(path.with_suffix(path.suffix + ".lock")):
+    with runtime_status_lock(path):
         merged = merge_runtime_status_on_disk(path, payload)
         if merged is None:
             return False

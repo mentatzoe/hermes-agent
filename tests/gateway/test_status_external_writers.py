@@ -62,6 +62,37 @@ def test_external_status_edit_serializes_with_new_gateway(tmp_path, monkeypatch,
         assert current["desired_state"] == "stopped"
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("editor", ["service", "migration"])
+def test_new_coordination_lock_remains_readable_with_restrictive_umask(tmp_path, monkeypatch, editor):
+    import stat
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mask = os.umask(0o077)
+    try:
+        if editor == "service":
+            service_manager._write_gateway_desired_state("gateway-default", "running")
+        else:
+            gateway_migrate._reconcile_standalone_runtime(tmp_path, set())
+    finally:
+        os.umask(mask)
+    lock = tmp_path / "gateway_state.json.lock"
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o644
+
+
+@pytest.mark.platforms("posix")
+def test_read_only_coordination_file_allows_runtime_persistence(tmp_path, monkeypatch):
+    # Models the service user's access to a privileged caller's 0644 lock.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    lock = tmp_path / "gateway_state.json.lock"
+    lock.touch(mode=0o444)
+    try:
+        assert status.write_runtime_status(gateway_state="starting")
+        assert status.read_runtime_status()["pid"] == os.getpid()
+    finally:
+        lock.chmod(0o600)
+
+
 def test_cached_gateway_snapshot_preserves_new_operator_intent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     service_manager._write_gateway_desired_state("gateway-default", "running")

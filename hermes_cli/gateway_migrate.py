@@ -860,11 +860,11 @@ def _write_manifest(default_home: Path, data: dict) -> None:
 def _reconcile_standalone_runtime(default_home: Path, secondary_names: set[str]) -> None:
     """Remove only status owned by multiplexing, without re-stamping gateway identity."""
     from gateway.status import read_runtime_status
-    from hermes_cli.active_sessions import _FileLock
+    from gateway.status_persistence import runtime_status_lock
     from utils import atomic_json_write
 
     path = default_home / "gateway_state.json"
-    with _FileLock(path.with_suffix(path.suffix + ".lock")):
+    with runtime_status_lock(path):
         runtime = read_runtime_status(path)
         if runtime is None:
             return

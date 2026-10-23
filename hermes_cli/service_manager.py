@@ -252,7 +252,7 @@ def _write_gateway_desired_state(name: str, desired_state: str) -> None:
     ``gateway_state`` so boot reconciliation can restore s6 want-up/down after pod recreation.
     Best-effort: a failed write must not block immediate s6 lifecycle control.
     """
-    from hermes_cli.active_sessions import _FileLock
+    from gateway.status_persistence import runtime_status_lock
 
     profile_dir = _profile_dir_for_gateway_service(name)
     state_file = profile_dir / "gateway_state.json"
@@ -261,7 +261,7 @@ def _write_gateway_desired_state(name: str, desired_state: str) -> None:
             return
         # Share the runtime writer's stable lock before reading, so an intent
         # update cannot replay the previous gateway's identity after a restart.
-        with _FileLock(state_file.with_suffix(state_file.suffix + ".lock")):
+        with runtime_status_lock(state_file):
             try:
                 data = json.loads(state_file.read_text(encoding="utf-8-sig")) if state_file.exists() else {}
                 if not isinstance(data, dict):

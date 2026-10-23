@@ -124,6 +124,19 @@ def test_unrelated_live_writer_cannot_block_gateway_startup(tmp_path, owner, mod
 
 
 @pytest.mark.parametrize("mode", ["write", "publish"])
+def test_terminal_state_does_not_release_living_gateway_ownership(tmp_path, owner, mode):
+    process, _ = owner(_OWNER.replace("        break", "        continue"))
+    process.stdin.write("stop\n")
+    process.stdin.flush()
+    assert process.stdout.readline().strip() == "stopped"
+    assert process.poll() is None
+    path = tmp_path / "gateway_state.json"
+    before = path.read_bytes()
+    assert not _submit(mode, gateway_state="starting")
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mode", ["write", "publish"])
 @pytest.mark.parametrize("graceful", [False, True])
 def test_new_writer_takes_over_only_after_previous_owner_exits(
     tmp_path, owner, mode, graceful
