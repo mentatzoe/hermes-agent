@@ -3815,7 +3815,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import route_pending_follow_up
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3839,10 +3838,9 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                route_pending_follow_up(
-                    adapter._pending_messages, session_key, pending_event,
-                    enqueue_separate=lambda queued: self._enqueue_attributed_follow_up(session_key, queued, adapter),
-                )
+                # Already accepted and dequeued: restore before its own class without merging it
+                # into another event or applying the new-arrival queue cap again.
+                self._enqueue_fifo(session_key, pending_event, adapter, front=True)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
