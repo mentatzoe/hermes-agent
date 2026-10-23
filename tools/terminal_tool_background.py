@@ -137,6 +137,12 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     the chat mute for as long as that turn lasts (#112033). Before the gateway
     serves, or while it stops, the descriptor waits in ``pending_watchers`` for the
     startup / post-turn drain instead."""
+    from agent.delegation_context import is_delegated_child_context
+    # Child completions stay in the registry for accounting or explicit handoff,
+    # but their inherited chat route cannot arm a gateway watcher.
+    delegated = getattr(proc_session, "delegated_child", None)
+    if delegated is True or (delegated is None and is_delegated_child_context()):
+        return
     proc_session.watcher_interval = 5
     watcher = {
         "session_id": proc_session.id, "check_interval": 5, "session_key": session_key,
@@ -150,6 +156,16 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     if runner is not None and runner.arm_process_watcher(watcher):
         return
     process_registry.pending_watchers.append(watcher)
+
+
+def register_handoff_completion_watcher(process_registry, session, parent) -> None:
+    """A validated transfer to a supported parent needs its own gateway consumer."""
+    from gateway.session_context import async_delivery_supported, get_session_env
+    if not session.notify_on_complete or not session.watcher_platform or not async_delivery_supported():
+        return
+    session_key = (getattr(parent, "_gateway_session_key", None)
+                   or get_session_env("HERMES_SESSION_KEY", "") or session.session_key)
+    _register_completion_watcher(process_registry, session, session_key)
 
 
 def spawn_background_process(

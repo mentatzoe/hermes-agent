@@ -2769,10 +2769,7 @@ _SESSION_ACTIONS = {
 
 
 def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict:
-    """Subagent-only: transfer a running background process to the parent agent so its completion is delivered THERE
-    (child-owned process notices are suppressed and child teardown kills what it owns). Validated against the live spawn
-    tree: the caller must be a registered child and must own the process; anything else is an error, never a silent
-    no-op, so a PID mentioned in prose can't masquerade as a transfer."""
+    """Transfer a child's running process to its live parent; reject foreign or exited processes."""
     from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
     from tools.terminal_tool import _resolve_container_task_id
     with _active_subagents_lock:
@@ -2800,6 +2797,8 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     if session is None:
         return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
                          "with poll/log and report it instead)."}
+    from tools.terminal_tool_background import register_handoff_completion_watcher
+    register_handoff_completion_watcher(process_registry, session, parent)
     handed.append({"session_id": session.id, "command": session.command, "note": note})
     return {"status": "handed_off", "session_id": session.id, "command": session.command,
             "note": "Your parent now owns this process and will receive its completion; you will not. Mention the handoff "
