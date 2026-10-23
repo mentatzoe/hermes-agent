@@ -10,39 +10,65 @@ import pytest
 from pm import paths
 from pm.lock import Facts
 from tests.pm._fixtures import client as client, isolated_python as isolated_python
-from tests.pm._range_server import dl_server as dl_server
+from tests.pm._range_server import RangeHandler, dl_server as dl_server
 from tests.pm.test_worker import _node_archive
 
 
 @pytest.mark.platforms("posix")
-def test_slow_worker_observer_does_not_hold_range_writers(client, dl_server):
+def test_slow_worker_observer_does_not_hold_range_writers(client, dl_server, monkeypatch):
     # Every range contains several chunks: one write per range could otherwise
     # appear to make progress even while all writers wait on the bitmap lock.
     _node_archive(dl_server, b"#!/bin/sh\nexit 0\n#" + b"x" * (64 << 20))
     snapshots = []
     advanced = []
+    release = threading.Event()
+    # Each response sends exactly one downloader chunk before rendezvousing
+    # with the callback. No range can finish before the observer starts.
+    arrivals = threading.Barrier(9)
+
+    def before_chunk(handler, start, served):
+        if served == 1 << 20:
+            arrivals.wait(timeout=15)
+            assert release.wait(timeout=15), "observer never released response bytes"
+
+    monkeypatch.setattr(RangeHandler, "before_range_chunk", before_chunk)
 
     def observe(done, total, ranges):
         snapshots.append((done, total, ranges))
         if not done or advanced:
             return
         part, = paths.partials_root().glob("*.part")
-        # The eighth range's second chunk is untouched at the first callback
-        # on the old implementation. All writes are actual local HTTP bytes.
-        position = 7 * total // 8 + (1 << 20)
-        started = time.monotonic()
-        deadline = started + 3
+        arrivals.wait(timeout=15)
+        # Use the actual requests, not their arrival order. A writer writes
+        # before acquiring the bitmap lock, so its SECOND chunk could land on
+        # the old implementation too. Only a third chunk proves it got past
+        # that lock while this callback remained blocked across worker IPC.
+        positions = [start + (2 << 20) for _, start, _ in RangeHandler.ranges_seen]
+        assert len(positions) == 8
+        with part.open("rb") as stream:
+            for position in positions:
+                stream.seek(position)
+                assert stream.read(1) == b"\0", "response escaped the gate"
+        release.set()
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             with part.open("rb") as stream:
-                stream.seek(position)
-                if stream.read(1) == b"x":
-                    advanced.append(True)
-                    break
+                written = 0
+                for position in positions:
+                    stream.seek(position)
+                    written += stream.read(1) == b"x"
+            if written >= 2:
+                advanced.append(True)
+                break
             time.sleep(0.01)
         else:
             advanced.append(False)
 
-    client.ensure("node", explicit=True, download_progress=observe)
+    try:
+        client.ensure("node", explicit=True, download_progress=observe)
+    finally:
+        release.set()
+        arrivals.abort()
     assert advanced == [True], "range writers stalled until the progress callback returned"
     assert snapshots[-1][0] == snapshots[-1][1]
     assert [done for done, _, _ in snapshots] == sorted(done for done, _, _ in snapshots)

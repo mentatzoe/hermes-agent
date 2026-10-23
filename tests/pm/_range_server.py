@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -27,6 +27,9 @@ class RangeHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):  # noqa: A002 - silence request logging
         pass
+
+    def before_range_chunk(self, start, served):
+        """Tests can gate real response bytes without replacing the downloader."""
 
     def end_headers(self):
         payload = self.payloads.get(self.path)
@@ -81,6 +84,7 @@ class RangeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             served = 0
             while served < len(body):
+                self.before_range_chunk(start, served)
                 if self.abort_after is not None and start + served >= self.abort_after:
                     self.connection.close()
                     return
@@ -110,7 +114,10 @@ def dl_server():
     RangeHandler.no_range = False
     RangeHandler.etags = True
     RangeHandler.chunk = 1 << 20
-    server = HTTPServer(("127.0.0.1", 0), RangeHandler)
+    # A serial server can block on one response while the downloader waits for
+    # another range, and its listen backlog need not fit all eight connections.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
+    server.daemon_threads = False
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -118,6 +125,8 @@ def dl_server():
     finally:
         server.shutdown()
         server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def url(server, path: str) -> str:
