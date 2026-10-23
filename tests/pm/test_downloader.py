@@ -19,7 +19,7 @@ import pytest
 from pm.downloader import (Download, DownloadError, DownloadPaused,
                            HashError, Source, replace_when_released)
 
-from tests.pm._range_server import RangeHandler as _Handler, url as _url
+from tests.pm._range_server import RangeHandler as _Handler, RangeServer, url as _url
 from tests.pm._range_server import dl_server as dl_server
 
 
@@ -36,8 +36,6 @@ def _sha(data: bytes) -> str:
 
 @pytest.mark.parametrize("connections", [2, 8])
 def test_parallel_requests_overlap_without_exceeding_limit(tmp_path, connections):
-    from http.server import ThreadingHTTPServer
-
     total = 8 * (4 << 20)  # 32 MiB -> 8 x 4 MiB ranges
     payload = _payload(total)
     barrier = threading.Barrier(connections)
@@ -67,7 +65,7 @@ def test_parallel_requests_overlap_without_exceeding_limit(tmp_path, connections
                     active -= 1
 
     dest = tmp_path / "big.bin"
-    with ThreadingHTTPServer(("127.0.0.1", 0), ConcurrentHandler) as server:
+    with RangeServer(("127.0.0.1", 0), ConcurrentHandler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
