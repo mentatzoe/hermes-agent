@@ -314,12 +314,14 @@ def test_heartbeat_exits_once_worker_tid_is_interrupted():
     from tools.interrupt import set_interrupt
 
     touches: list = []
+    touched = threading.Event()
     stop = threading.Event()
     fake_worker_tid = 10**9 + 111922  # not a live thread; only the bit matters
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            touched.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -329,25 +331,22 @@ def test_heartbeat_exits_once_worker_tid_is_interrupted():
     )
     thread.start()
     try:
-        time.sleep(0.12)
-        assert touches, "heartbeat never stamped while the worker was live"
+        assert touched.wait(5), "heartbeat never stamped while the worker was live"
         set_interrupt(True, fake_worker_tid)
-        thread.join(timeout=1.0)
+        thread.join(timeout=5)
         assert not thread.is_alive(), "heartbeat kept running after its worker was abandoned"
-        n = len(touches)
-        time.sleep(0.12)
-        assert len(touches) == n
+        assert not stop.is_set(), "heartbeat must exit on the worker interrupt alone"
     finally:
-        set_interrupt(False, fake_worker_tid)
         stop.set()
+        thread.join(timeout=5)
+        set_interrupt(False, fake_worker_tid)
 
 
-def test_sequential_timeout_stops_abandoned_workers_heartbeat(monkeypatch):
+def test_sequential_timeout_stops_abandoned_workers_heartbeat(monkeypatch, heartbeat_threads):
     """After the sequential deadline abandons a non-cooperative tool, no more
     ``tool running:`` stamps arrive — the timed-out tool no longer fakes liveness (#111922)."""
     import agent.tool_executor as te
 
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
     monkeypatch.setattr(te, "_SEQUENTIAL_INTERRUPT_POLL_SECONDS", 0.05)
     monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: 0.3)
     monkeypatch.setattr(te, "_emit_terminal_post_tool_call", lambda agent, **kw: None)
@@ -382,10 +381,11 @@ def test_sequential_timeout_stops_abandoned_workers_heartbeat(monkeypatch):
             agent, function_name="terminal", function_args={}, effective_task_id="t",
             tool_call_id="tc1", execute=lambda args: release.wait() or "late",
         )
-        abandoned_at = time.monotonic()
         assert isinstance(managed.result, te._ToolTimeoutResult)
-        time.sleep(0.3)  # several heartbeat intervals past abandonment
-        late = [d for ts, d in agent.stamps if ts > abandoned_at + 0.06 and d.startswith("tool running:")]
-        assert not late, f"abandoned tool kept stamping activity: {late[:3]}"
+        assert len(heartbeat_threads) == 1
+        thread, stop = heartbeat_threads[0]
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "abandoned worker's heartbeat did not exit"
+        assert not stop.is_set(), "worker must still be blocked, without normal shutdown"
     finally:
         release.set()
