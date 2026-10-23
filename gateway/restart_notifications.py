@@ -1,9 +1,9 @@
 """A durable admission/completion journal for internal messaging notices.
 
-Commit each notice before acknowledging admission. Its own completed turn marks
-that same row before draining a later turn; teardown never reconstructs ownership
-from task or queue locations. A turn interrupted before that mark remains
-retryable, including the finished-but-unmarked window (at-least-once tool effects).
+Each producer occurrence has its own row, even in a coalesced turn. A turn marks
+only its owned rows before draining later work. Teardown never reconstructs
+ownership from task/queue positions. Finished-but-unmarked turns remain retryable;
+this is not an exactly-once ledger for tool effects.
 """
 
 from __future__ import annotations
@@ -38,11 +38,25 @@ def _connect(path: Path):
     return conn
 
 
-def _save(path: Path, notice_id: str, payload: dict) -> bool:
-    encoded = json.dumps(payload, ensure_ascii=False)
+def _save(path: Path, notice_id: str, payload: dict) -> tuple:
+    """Atomically admit individual occurrences; preserve coalescing of the new ones."""
+    base = {key: value for key, value in payload.items() if key != "_notice_rows"}
+    rows = payload.get("_notice_rows") or [(notice_id, payload["text"])]
+    inserted = []
     with closing(_connect(path)) as conn, conn:
-        inserted = conn.execute("INSERT OR IGNORE INTO notices (id, payload) VALUES (?, ?)", (notice_id, encoded))
-        return inserted.rowcount == 1
+        for identity, text in rows:
+            encoded = json.dumps({**base, "text": text}, ensure_ascii=False)
+            result = conn.execute("INSERT OR IGNORE INTO notices (id, payload) VALUES (?, ?)", (identity, encoded))
+            if result.rowcount == 1:
+                inserted.append(identity)
+        batch_text = (payload["text"] if len(inserted) == len(rows) else
+                      "\n\n".join(text for identity, text in rows if identity in inserted))
+        batch = {"batch_id": uuid.uuid4().hex, "batch_members": inserted, "batch_text": batch_text}
+        for identity, text in rows:
+            if identity in inserted:
+                encoded = json.dumps({**base, **batch, "text": text}, ensure_ascii=False)
+                conn.execute("UPDATE notices SET payload = ? WHERE id = ?", (encoded, identity))
+    return tuple(inserted)
 
 
 def _pending(path: Path) -> list:
@@ -59,10 +73,12 @@ def _is_pending(path: Path, notice_id: str) -> bool:
     return row is not None and row[0] == 0
 
 
-def _complete(path: Path, notice_id: str) -> None:
+def _complete(path: Path, notice_ids) -> None:
+    identities = (notice_ids,) if isinstance(notice_ids, str) else notice_ids
     with closing(_connect(path)) as conn, conn:
-        # Keep only the receipt, not the delivered private notice text.
-        conn.execute("UPDATE notices SET done = 1, payload = '{}' WHERE id = ?", (notice_id,))
+        # Keep only receipts, not delivered private text; the owned set settles atomically.
+        conn.executemany("UPDATE notices SET done = 1, payload = '{}' WHERE id = ?",
+                         ((identity,) for identity in identities))
 
 
 def _inflight(runner) -> set:
@@ -77,19 +93,62 @@ def _draining(runner) -> bool:
             or getattr(runner, "_restart_requested", False) is True)
 
 
+def _producer_id(session_key, identity) -> str:
+    if identity is None:
+        return uuid.uuid4().hex
+    return uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(["hermes-notice", session_key, identity])).hex
+
+
+def _notice_rows(event, session_key) -> list:
+    members = event._restart_notification_members or [(event._restart_notification_identity, event.text)]
+    records = event._restart_notification_records
+    if not records:
+        records = tuple(_producer_id(session_key, identity) for identity, _text in members)
+        if len(records) == 1 and event._restart_notification_id:
+            records = (event._restart_notification_id,)
+    # Preserve allocated identities even when cancellation precedes the save receipt.
+    event._restart_notification_records = records
+    event._restart_notification_id = records[0]
+    return list(dict((identity, member[1]) for identity, member in zip(records, members)).items())
+
+
+def _notice_payload(event, metadata, rows) -> dict:
+    return {
+        "source": event.source.to_dict(), "transport_profile": transport_profile_of(event.source),
+        "relay_transport": event.source.delivered_via_upstream_relay is True,
+        "text": event.text, "metadata": metadata, "message_type": event.message_type.value,
+        "allow_gateway_control": event.allow_gateway_control, "reply_expected": event.reply_expected,
+        "media_urls": event.media_urls, "media_types": event.media_types,
+        "auto_skill": event.auto_skill, "channel_prompt": event.channel_prompt, "_notice_rows": rows,
+    }
+
+
+def _bind_admission(runner, event, path, metadata, rows, inserted) -> None:
+    inserted = tuple(inserted or ())
+    for identity, _text in rows:
+        if identity not in inserted:
+            _inflight(runner).discard((path, identity))
+    event._restart_notification_path = path
+    event._restart_notification_records = inserted or tuple(identity for identity, _text in rows)
+    event._restart_notification_id = event._restart_notification_records[0]
+    event.metadata = metadata
+    event._restart_notification_deferred = not inserted
+    if inserted and len(inserted) < len(rows):
+        event.text = "\n\n".join(text for identity, text in rows if identity in inserted)
+
+
 async def admit_notice(runner, event, session_key) -> None:
-    """Commit before scheduling or queueing, and claim the row before it is visible."""
+    """Commit before scheduling/queueing, with an intake claim over every member row."""
     if not event.internal or runner is None or event._restart_notification_path:
         return
     from gateway.wake import WakeNotAccepted
-    # Serialize intake across owner lookup and commit, preserving admission order.
     lock = getattr(runner, "_restart_notification_admission_lock", None)
     if lock is None:
         lock = runner._restart_notification_admission_lock = asyncio.Lock()
     async with lock:
         if event._restart_notification_path:
             return
-        receipt = None
+        receipts = []
         try:
             entry = await asyncio.to_thread(runner.session_store.lookup_by_session_key, session_key)
             metadata = dict(event.metadata or {})
@@ -97,54 +156,35 @@ async def admit_notice(runner, event, session_key) -> None:
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError("internal notice has no owning session")
             metadata.update(gateway_session_key=session_key, gateway_session_id=session_id)
-            home = Path(runner._resolve_profile_home_for_source(event.source))
-            path = home / "restart_notifications" / "pending.sqlite3"
-            notice_id = event._restart_notification_id or (
-                uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
-                    ["hermes-notice", session_key, event._restart_notification_identity])).hex
-                if event._restart_notification_identity is not None else uuid.uuid4().hex)
-            # A cancelled save await may still commit. Retry must reuse this ID.
-            event._restart_notification_id = notice_id
-            receipt = path, notice_id
-            _inflight(runner).add(receipt)
-            payload = {
-                "source": event.source.to_dict(), "transport_profile": transport_profile_of(event.source),
-                "relay_transport": event.source.delivered_via_upstream_relay is True,
-                "text": event.text, "metadata": metadata, "message_type": event.message_type.value,
-                "allow_gateway_control": event.allow_gateway_control, "reply_expected": event.reply_expected,
-                "media_urls": event.media_urls, "media_types": event.media_types,
-                "auto_skill": event.auto_skill, "channel_prompt": event.channel_prompt,
-            }
-            inserted = await asyncio.to_thread(_save, path, notice_id, payload)
-            event._restart_notification_id = notice_id
-            event._restart_notification_path = path
-            event.metadata = metadata
-            if inserted is False:
-                # An earlier attempt already owns this producer occurrence. Re-ack
-                # that row; never schedule a second event alongside its replay.
-                event._restart_notification_deferred = True
-                _inflight(runner).discard(receipt)
+            path = Path(runner._resolve_profile_home_for_source(event.source)) / "restart_notifications" / "pending.sqlite3"
+            rows = _notice_rows(event, session_key)
+            receipts = [(path, identity) for identity, _text in rows]
+            _inflight(runner).update(receipts)
+            inserted = await asyncio.to_thread(_save, path, rows[0][0], _notice_payload(event, metadata, rows))
+            _bind_admission(runner, event, path, metadata, rows, inserted)
         except BaseException as exc:
-            if receipt:
-                _inflight(runner).discard(receipt)
+            _inflight(runner).difference_update(receipts)
             if not isinstance(exc, Exception):
                 raise
             raise WakeNotAccepted("internal notice restart handoff failed") from exc
 
 
 def finish_admission(adapter, event) -> None:
-    """A committed row owns retries when immediate adapter admission was refused."""
     if not event._restart_notification_path:
         return
     # The adapter's synchronous session guard now prevents concurrent execution.
-    # Keep no task/queue-owned receipt that cancellation could strand in this process.
     release_notice(adapter.gateway_runner, event)
     event._gateway_accepted = True
 
 
+def _event_records(event) -> tuple:
+    return event._restart_notification_records or (event._restart_notification_id,)
+
+
 def release_notice(runner, event) -> None:
     if event is not None and event._restart_notification_path:
-        _inflight(runner).discard((event._restart_notification_path, event._restart_notification_id))
+        _inflight(runner).difference_update((event._restart_notification_path, identity)
+                                            for identity in _event_records(event))
 
 
 async def defer_during_restart(adapter, event: MessageEvent, session_key: str) -> bool:
@@ -158,7 +198,6 @@ async def defer_during_restart(adapter, event: MessageEvent, session_key: str) -
 
 
 async def defer_or_reject(adapter, event, session_key, expected_session_key) -> bool:
-    """Validate the route, then durably admit before any scheduling/queue awaits."""
     if expected_session_key and session_key != expected_session_key:
         logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                        expected_session_key, session_key)
@@ -185,19 +224,19 @@ def _settled(runner) -> set:
 
 
 async def complete_notice(runner, event) -> None:
-    """Mark this turn only, before another queued turn or its preparation begins."""
+    """Mark this completed turn's owned rows before preparing another turn."""
     if event is None or not event.internal or event._restart_notification_consumed:
         return
-    path, notice_id = event._restart_notification_path, event._restart_notification_id
-    if path and notice_id:
-        await asyncio.to_thread(_complete, path, notice_id)
-        _settled(runner).add((path, notice_id))
+    path = event._restart_notification_path
+    if path and event._restart_notification_id:
+        identities = _event_records(event)
+        await asyncio.to_thread(_complete, path, identities)
+        _settled(runner).update((path, identity) for identity in identities)
         release_notice(runner, event)
     event._restart_notification_consumed = True
 
 
 async def dispatch_message(adapter, event: MessageEvent):
-    """A handler refusal/cancellation leaves the durable row retryable, never a busy reply."""
     if not event.internal:
         return await adapter._message_handler(event)
     runner = getattr(adapter, "gateway_runner", None)
@@ -211,8 +250,6 @@ async def dispatch_message(adapter, event: MessageEvent):
         response = await adapter._message_handler(event)
         executed = getattr(event, "_heartbeat_execution_started", False) is True
         if executed and getattr(event, "_restart_notification_turn_owned", False) is not True:
-            # Standalone handlers have no recursive worker boundary. Production owns
-            # its own completion mark, including interrupted/aborted turn results.
             await complete_notice(runner, event)
         if not executed and not _queued(runner, adapter, event, key):
             release_notice(runner, event)
@@ -224,7 +261,6 @@ async def dispatch_message(adapter, event: MessageEvent):
 
 
 async def begin_execution(runner, event, session_key) -> bool:
-    """Recheck restart and pinned ownership at the last pre-agent await boundary."""
     from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
     if not heartbeat_owner_is_current(runner, event, session_key):
         return False
@@ -239,7 +275,6 @@ async def begin_execution(runner, event, session_key) -> bool:
 
 
 def _journal_paths(runner) -> list[Path]:
-    # SessionStore captures the gateway's routing home before per-turn scopes exist.
     homes = {Path(runner.session_store.sessions_dir).parent}
     if getattr(runner.config, "multiplex_profiles", False):
         from gateway.run import _multiplex_profile_homes
@@ -247,14 +282,29 @@ def _journal_paths(runner) -> list[Path]:
     return [home / "restart_notifications" / "pending.sqlite3" for home in sorted(homes)]
 
 
-async def _replay_one(runner, path: Path, notice_id: str, payload: dict) -> None:
-    receipt = path, notice_id
-    if receipt in _inflight(runner) or receipt in _settled(runner):
+def _pending_groups(rows) -> list:
+    groups = {}
+    for identity, payload in rows:
+        groups.setdefault(payload.get("batch_id", identity), []).append((identity, payload))
+    return list(groups.values())
+
+
+def _replay_text(rows) -> str:
+    identities = [identity for identity, _payload in rows]
+    payload = rows[0][1]
+    if identities == payload.get("batch_members"):
+        return payload["batch_text"]
+    return "\n\n".join(payload["text"] for _identity, payload in rows)
+
+
+async def _replay_group(runner, path: Path, rows) -> None:
+    # A cancelled completion await can have committed without updating the local cache.
+    rows = [(identity, payload) for identity, payload in rows
+            if (path, identity) not in _inflight(runner) and (path, identity) not in _settled(runner)
+            and _is_pending(path, identity)]
+    if not rows:
         return
-    # A cancelled completion await can still have committed in its SQLite thread.
-    # Check the row itself, not only a snapshot or process-local settlement cache.
-    if not _is_pending(path, notice_id):
-        return
+    notice_id, payload = rows[0]
     source = SessionSource.from_dict(payload["source"])
     source.delivered_via_upstream_relay = payload.get("relay_transport") is True
     restore_identity(source, runner=runner, transport_profile=payload["transport_profile"])
@@ -268,7 +318,7 @@ async def _replay_one(runner, path: Path, notice_id: str, payload: dict) -> None
         return
     from gateway.platforms.event import MessageEvent, MessageType
     event = MessageEvent(
-        text=payload["text"], source=source, internal=True,
+        text=_replay_text(rows), source=source, internal=True,
         message_type=MessageType(payload["message_type"]), metadata=payload["metadata"],
         allow_gateway_control=payload["allow_gateway_control"], reply_expected=payload["reply_expected"],
         media_urls=payload["media_urls"], media_types=payload["media_types"],
@@ -276,7 +326,8 @@ async def _replay_one(runner, path: Path, notice_id: str, payload: dict) -> None
     )
     event._restart_notification_path = path
     event._restart_notification_id = notice_id
-    _inflight(runner).add(receipt)
+    event._restart_notification_records = tuple(identity for identity, _payload in rows)
+    _inflight(runner).update((path, identity) for identity in event._restart_notification_records)
     try:
         prime = getattr(adapter, "prime_routing_cache", None)
         if callable(prime):
@@ -284,12 +335,11 @@ async def _replay_one(runner, path: Path, notice_id: str, payload: dict) -> None
         from gateway.wake import admit_internal_event
         await admit_internal_event(adapter, event)
     except BaseException:
-        _inflight(runner).discard(receipt)
+        release_notice(runner, event)
         raise
 
 
 async def replay_pending(runner) -> None:
-    """Retry journal rows only; queue/task locations never define pending ownership."""
     if _draining(runner) or getattr(runner, "_startup_restore_in_progress", False):
         return
     lock = getattr(runner, "_restart_notification_replay_lock", None)
@@ -297,17 +347,17 @@ async def replay_pending(runner) -> None:
         lock = runner._restart_notification_replay_lock = asyncio.Lock()
     async with lock:
         for path in _journal_paths(runner):
-            for notice_id, payload in await asyncio.to_thread(_pending, path):
+            rows = await asyncio.to_thread(_pending, path)
+            for group in _pending_groups(rows):
                 if _draining(runner):
                     return
                 try:
-                    await _replay_one(runner, path, notice_id, payload)
+                    await _replay_group(runner, path, group)
                 except Exception:
-                    logger.warning("Restart notice %s remains pending", notice_id, exc_info=True)
+                    logger.warning("Restart notice group remains pending", exc_info=True)
 
 
 async def resolve_restart_session(runner, event):
-    """Use the exact saved session or its verified compression tip, never an idle replacement."""
     metadata = event.metadata
     entry = await runner.async_session_store.lookup_by_session_key(metadata["gateway_session_key"])
     pinned = metadata["gateway_session_id"]
@@ -324,7 +374,6 @@ async def resolve_restart_session(runner, event):
 
 
 async def watch_restart_notifications(runner) -> None:
-    """One supervised consumer: reconnects can make a retained destination available later."""
     while runner._running and not runner._shutdown_event.is_set():
         await replay_pending(runner)
         await asyncio.sleep(5)

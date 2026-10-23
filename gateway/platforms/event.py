@@ -110,6 +110,8 @@ class MessageEvent:
     # Trusted local restart handoff; never deserialized from ingress metadata.
     _restart_notification_id: Optional[str] = field(default=None, init=False, repr=False, compare=False)
     _restart_notification_identity: Any = field(default=None, init=False, repr=False, compare=False)
+    _restart_notification_members: Any = field(default=None, init=False, repr=False, compare=False)
+    _restart_notification_records: tuple = field(default=(), init=False, repr=False, compare=False)
     _restart_notification_path: Optional[Path] = field(default=None, init=False, repr=False, compare=False)
     _restart_notification_deferred: bool = field(default=False, init=False, repr=False, compare=False)
     _restart_notification_consumed: bool = field(default=False, init=False, repr=False, compare=False)

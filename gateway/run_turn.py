@@ -2771,28 +2771,17 @@ class GatewayTurnMixin:
         _start = time.time()
         saw_done = False
 
-        def _consume_sse_line(line: str) -> bool:
-            """Parse one SSE line into full_response; True when the terminal ``[DONE]`` was seen.
+        from gateway.run_proxy_completion import ProxyCompletion
+        proxy_completion = ProxyCompletion()
 
-            Malformed frames (bad JSON, ``choices: [null]``, non-dict deltas) are skipped —
-            one bad chunk must not abort the whole stream."""
+        def _consume_sse_line(line: str) -> bool:
             nonlocal full_response
-            line = line.strip()
-            if not line.startswith("data: "):
-                return False
-            data = line[6:]
-            if data.strip() == "[DONE]":
-                return True
-            try:
-                choices = json.loads(data).get("choices") or []
-                content = choices[0].get("delta", {}).get("content", "") if choices else ""
-            except (json.JSONDecodeError, TypeError, AttributeError, IndexError):
-                return False
+            done, content = proxy_completion.consume(line)
             if content:
                 full_response += content
                 if _stream_consumer:
                     _stream_consumer.on_delta(content)
-            return False
+            return done
 
         try:
             # sock_connect bounds the TCP connect phase so an unreachable proxy host
@@ -2869,6 +2858,7 @@ class GatewayTurnMixin:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "completed": proxy_completion.completed,
         }
 
     async def _run_agent(
@@ -4242,7 +4232,7 @@ class GatewayTurnMixin:
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
-            if not (isinstance(response, dict) and response.get("interrupted")):
+            if isinstance(response, dict) and response.get("completed") is True:
                 await complete_notice(self, notice_event)
             return response
 

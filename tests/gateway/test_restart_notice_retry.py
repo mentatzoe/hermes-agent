@@ -161,4 +161,3 @@ async def test_producer_retry_after_completion_and_new_occurrence_are_distinct(t
                        notice_identity=("completion", "stable-process", 2))
     await drain(fresh)
     assert [row[0] for row in replayed] == ["new incarnation"]
-

@@ -1385,6 +1385,7 @@ class GatewayNotificationsMixin:
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
             )
+            synth_event._restart_notification_members = evt.get("_restart_notice_members")
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
@@ -1684,37 +1685,6 @@ class GatewayNotificationsMixin:
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(str(evt.get(field) or "") for field in fields)
 
-    @staticmethod
-    def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
-        """Build one bounded synthetic event from several redacted completions."""
-        from gateway.run import _redact_gateway_user_facing_secrets
-        lines = [
-            f"[IMPORTANT: {len(entries)} background processes completed for this session.",
-            "Treat these results as one completion batch and send at most one "
-            "consolidated user-facing response.",
-        ]
-        shown = entries[:10]
-        for _text, evt, _future in shown:
-            session_id = str(evt.get("session_id") or "unknown")
-            exit_code = evt.get("exit_code")
-            reason = str(evt.get("completion_reason") or "exited")
-            # Unconditional gateway redaction floor (the producer-seam redactor is configurable). Redact
-            # BEFORE slicing: truncating first can leave a credential fragment the patterns miss.
-            output = _redact_gateway_user_facing_secrets(str(evt.get("output") or "")).strip()
-            if len(output) > 800:
-                output = f"[… truncated …]\n{output[-800:]}"
-            lines.append(f"\n- {session_id}: exit_code={exit_code}, reason={reason}")
-            if output:
-                lines.append(output)
-        omitted = len(entries) - len(shown)
-        if omitted:
-            lines.append(
-                f"\n- … and {omitted} more completion(s); inspect them with "
-                "the process tool if they affect the conclusion."
-            )
-        lines.append("If a result does not change the current conclusion, absorb it silently.]")
-        return "\n".join(lines)
-
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
         """Extend a successful primary delivery claim to its batched siblings."""
         identities = [i for i in map(self._completion_delivery_identity, events) if i is not None]
@@ -1723,6 +1693,7 @@ class GatewayNotificationsMixin:
 
     async def _flush_process_completion_batch(self, key: tuple[str, ...]) -> None:
         """Deliver one short-window completion batch and resolve its waiters."""
+        from gateway.run_notice_batches import format_coalesced_process_completions, with_notice_members
         current_task = asyncio.current_task()
         entries: list[tuple[str, dict, asyncio.Future]] = []
         delivered: Optional[bool] = False
@@ -1734,12 +1705,14 @@ class GatewayNotificationsMixin:
                 self._completion_notification_batch_tasks.pop(key, None)
             if not entries:
                 return
-            synth_text = entries[0][0] if len(entries) == 1 else self._format_coalesced_process_completions(entries)
+            synth_text = entries[0][0] if len(entries) == 1 else format_coalesced_process_completions(entries)
+            members = [(text, event) for text, event, _future in entries]
             # A duplicate primary returns None from the dedupe seam; try the next identity so a fresh
             # sibling is never discarded with it.
             delivered = None
             for _text, candidate_evt, _future in entries:
-                delivered = await self._deliver_completion_notification(synth_text, candidate_evt)
+                delivered = await self._deliver_completion_notification(
+                    synth_text, with_notice_members(self, candidate_evt, members))
                 if delivered is not None:
                     break
             if delivered is True and len(entries) > 1:
@@ -1891,6 +1864,9 @@ class GatewayNotificationsMixin:
             "response. If a result does not change the current conclusion, absorb it silently.]"
         )
         consolidated = "\n\n".join([header, *blocks])
+        from gateway.run_notice_batches import with_notice_members
+        events = [primary_evt, *(event for event, _claim_id in siblings)]
+        primary_evt = with_notice_members(self, primary_evt, zip(blocks, events))
         delivered = await self._deliver_completion_notification(
             consolidated, primary_evt, sibling_claims=siblings,
         )

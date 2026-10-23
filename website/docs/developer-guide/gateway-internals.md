@@ -188,7 +188,7 @@ Internal push wakes use `gateway.wake.admit_internal_event`. In a running gatewa
 `BasePlatformAdapter.handle_message()` commits an ID, payload and owning session
 to the profile's `restart_notifications/pending.sqlite3` before scheduling or
 queueing the notice. A producer-stable occurrence identity (process incarnation,
-delegation completion or Kanban event batch), scoped to its destination, keeps
+delegation completion or Kanban event), scoped to its destination, keeps
 coroutine cancellation after commit from allocating a second record on retry.
 Events without a producer identity retain their allocated ID across same-event
 retries. The process-local `_gateway_accepted` receipt acknowledges
@@ -197,8 +197,14 @@ human messages retain the busy reply. Immediate capacity refusal releases the
 in-process claim so the journal consumer can retry the same record.
 
 Each notice's own worker-return boundary marks its row completed before any await
-can drain or prepare a later queued turn. Completed rows retain an ID but erase
-the private payload. Teardown does not reconstruct pending work from queues,
+can drain or prepare a later queued turn. Coalesced process, delegation and Kanban
+wakes still have one row per producer occurrence; the turn completes its owned
+set atomically. Partial-overlap retries include only newly admitted members.
+Replay preserves the original grouping of remaining records, never recreates a
+covered member as another notice, and keeps warning-split Kanban groups distinct.
+Proxy turns require both a successful terminal result and stream completion;
+HTTP refusal, error/partial terminal frames and truncated streams remain pending.
+Completed rows retain an ID but erase the private payload. Teardown does not reconstruct pending work from queues,
 scheduled tasks, or execution-start flags: every unmarked record remains pending
 wherever its event was when cancellation happened. Restart replay consults only
 those records. Interruption or cancellation before the mark leaves the notice

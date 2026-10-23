@@ -525,6 +525,7 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        self._wake_members = None
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -671,8 +672,7 @@ class _KanbanNotification:
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
                                notification_category="diagnostic" if self.wake_diagnostic else "result",
-                               notice_identity=("kanban", self.board_slug, self.task_id,
-                                                sorted(ev.id for ev in self.d["events"])))
+                               notice_members=self._wake_members)
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
@@ -791,7 +791,9 @@ class _KanbanNotification:
                     self.format_event(ev)
                 self.build_wake_text()
                 if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
+                    from gateway.run_notice_batches import kanban_notice_members
+                    members = kanban_notice_members(self, events)
+                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds, members))
             self.d = {**self.d, "events": original_events}
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
         from gateway.wake import WakeNotAccepted
@@ -799,7 +801,7 @@ class _KanbanNotification:
         # A requested wake is required even when its passive ping already landed.
         if wake_payloads:
             try:
-                for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
+                for self.synth, self.wake_diagnostic, self.wake_kinds, self._wake_members in wake_payloads:
                     await self.wake()
                 self.clear_failures()
             except WakeNotAccepted:

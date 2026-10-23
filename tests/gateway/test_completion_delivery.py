@@ -17,6 +17,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
+from gateway.run_notice_batches import format_coalesced_process_completions
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -491,7 +492,7 @@ def test_coalesced_format_bounds_details_and_reports_omitted_count():
             )
             for index in range(12)
         ]
-        return GatewayRunner._format_coalesced_process_completions(entries)
+        return format_coalesced_process_completions(entries)
 
     text = asyncio.run(_format())
 
@@ -517,7 +518,7 @@ def test_coalesced_format_force_redacts_output_when_redaction_disabled(monkeypat
             "HOME=/home/user\n"
         )
         second = _completion_event(started_at=2.0, session_id="proc_control")
-        return GatewayRunner._format_coalesced_process_completions([
+        return format_coalesced_process_completions([
             ("first", first, loop.create_future()),
             ("second", second, loop.create_future()),
         ])
@@ -540,7 +541,7 @@ def test_coalesced_format_redacts_before_truncating_output(monkeypatch):
         first = _completion_event(started_at=1.0, session_id="proc_long_secret")
         first["output"] = f"MY_SERVICE_TOKEN={'x' * 900}{marker}\n"
         second = _completion_event(started_at=2.0, session_id="proc_control")
-        return GatewayRunner._format_coalesced_process_completions([
+        return format_coalesced_process_completions([
             ("first", first, loop.create_future()),
             ("second", second, loop.create_future()),
         ])
@@ -573,9 +574,10 @@ def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
 def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
+    import gateway.run_notice_batches as batches
     monkeypatch.setattr(
-        runner,
-        "_format_coalesced_process_completions",
+        batches,
+        "format_coalesced_process_completions",
         MagicMock(side_effect=ValueError("bad batch")),
     )
     events = [
