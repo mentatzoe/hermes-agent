@@ -403,62 +403,8 @@ class GatewayTurnMixin:
             return False
 
     async def _hmwa_resolve_session(self, event, source):
-        """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
-        topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
-        the event."""
-        # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
-        # cross-topic Reply doesn't fragment the conversation.
-        event_metadata = getattr(event, "metadata", None) or {}
-        expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
-        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
-                     if not expected_session_key else None)
-        if recovered is not None:
-            logger.info(
-                "telegram topic recovery: chat=%s user=%s %r -> %s",
-                source.chat_id, source.user_id, source.thread_id, recovered,
-            )
-            source = dataclasses.replace(source, thread_id=recovered)
-            with suppress(Exception):
-                event.source = source
-
-        if expected_session_key:
-            derived_session_key = self._session_key_for_source(source)
-            if derived_session_key != expected_session_key:
-                logger.warning(
-                    "Dropping internally routed event after route recovery: expected session=%s derived=%s",
-                    expected_session_key, derived_session_key,
-                )
-                return
-
-        strict_session = bool(event_metadata.get("gateway_session_strict"))
-        pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
-        if strict_session:
-            session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
-                logger.warning(
-                    "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
-                    pinned_session_id or "missing", expected_session_key or "missing",
-                )
-                return
-        else:
-            # Internal wakes observe reset policy without counting as user activity, or periodic
-            # notifications keep the routing key alive across every daily/idle boundary.
-            session_entry = await self.async_session_store.get_or_create_session(
-                source, touch_activity=not bool(getattr(event, "internal", False)),
-            )
-        session_key = session_entry.session_key
-        if not strict_session and pinned_session_id:
-            resolved_entry = await self._resolve_async_delegation_session(session_entry, pinned_session_id)
-            if resolved_entry is None:
-                return
-            session_entry = resolved_entry
-        self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
-            session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
-        from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
-        if not await resolve_heartbeat_owner(self, event, session_entry):
-            return
-        return source, session_entry, session_key
+        from gateway.run_turn_session_resolution import resolve_turn_session
+        return await resolve_turn_session(self, event, source)
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record
@@ -2179,14 +2125,12 @@ class GatewayTurnMixin:
 
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).
-            from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
-            if not heartbeat_owner_is_current(self, event, session_key):
+            from gateway.restart_notifications import begin_execution
+            if not await begin_execution(self, event, session_key):
                 return
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            # Admission/typing is not execution. All routing, authorization and
-            # turn preparation gates have passed when the agent runner is entered.
-            event._heartbeat_execution_started = True
+
             # Internal events reuse the last human turn's channel inputs (see _pinned_channel_inputs).
             _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
                 session_key, event.channel_prompt, source, internal=event.internal,
@@ -2201,7 +2145,7 @@ class GatewayTurnMixin:
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
-                title_user_message=prepared.title_user_message,
+                title_user_message=prepared.title_user_message, notice_event=event,
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
@@ -3940,6 +3884,11 @@ class GatewayTurnMixin:
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
+            from gateway.restart_notifications import begin_execution
+            if not await begin_execution(self, pending_event, next_session_key):
+                await _run_followup_processing_hook(
+                    _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.CANCELLED)
+                return result
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
@@ -3948,7 +3897,7 @@ class GatewayTurnMixin:
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
-                reply_expected=next_reply_expected,
+                reply_expected=next_reply_expected, notice_event=pending_event,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
@@ -4279,16 +4228,23 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        notice_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        from gateway.restart_notifications import complete_notice
+        if notice_event is not None:
+            notice_event._restart_notification_turn_owned = True
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            response = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
+            if not (isinstance(response, dict) and response.get("interrupted")):
+                await complete_notice(self, notice_event)
+            return response
 
         from run_agent import AIAgent
 
@@ -4352,6 +4308,11 @@ class GatewayTurnMixin:
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)
+            # Settle this notice before any await can prepare/drain a later turn.
+            # Cancellation before the durable mark deliberately leaves it retryable.
+            from gateway.restart_notifications import complete_notice
+            if not (isinstance(response, dict) and response.get("interrupted")):
+                await complete_notice(self, notice_event)
 
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]

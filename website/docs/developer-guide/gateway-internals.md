@@ -184,15 +184,32 @@ Adapters implement a common interface:
 - `send()` — outbound message delivery
 - inbound events are normalized into a `MessageEvent` and forwarded via `handle_message()`
 
-Internal push wakes use `gateway.wake.admit_internal_event`: the public
-`handle_message()` still returns `None`, but the event's process-local
-`_gateway_accepted` receipt is set only after scheduling or queue insertion.
-A missing handler, mismatched explicit session key, or queue-cap drop is not
-acceptance. Custom adapters overriding ingress should delegate internal events to
-`BasePlatformAdapter.handle_message()` (or explicitly record actual admission),
-not equate a consumed/dropped callback with acceptance. This receipt is separate
-from heartbeat execution accounting and does not bypass authorization, emergency
-stop, or later turn-preparation gates.
+Internal push wakes use `gateway.wake.admit_internal_event`. In a running gateway,
+`BasePlatformAdapter.handle_message()` commits an ID, payload and owning session
+to the profile's `restart_notifications/pending.sqlite3` before scheduling or
+queueing the notice. The process-local `_gateway_accepted` receipt acknowledges
+that durable admission, not execution. During a restart wait, notices stay silent;
+human messages retain the busy reply. Immediate capacity refusal releases the
+in-process claim so the journal consumer can retry the same record.
+
+Each notice's own worker-return boundary marks its row completed before any await
+can drain or prepare a later queued turn. Completed rows retain an ID but erase
+the private payload. Teardown does not reconstruct pending work from queues,
+scheduled tasks, or execution-start flags: every unmarked record remains pending
+wherever its event was when cancellation happened. Restart replay consults only
+those records. Interruption or cancellation before the mark leaves the notice
+retryable, including a turn that finished but was torn down before its completion
+mark committed. That window permits repeated tool effects; this is not an
+exactly-once tool ledger.
+
+Explicit session ownership bypasses ordinary Telegram topic healing, so a stale
+binding cannot replace the pinned session; only a verified compression
+continuation may inherit it. Main and queued turns recheck restart and pinned
+ownership after their last pre-execution hook/preparation await. A missing handler
+or mismatched explicit key is not admission. Custom adapters overriding ingress
+must delegate internal notices to the base adapter or provide their own actual
+admission receipt. Durable admission does not bypass later authorization,
+emergency-stop or turn-preparation gates.
 
 ### Token Locks
 
@@ -285,6 +302,7 @@ is only the fallback for processes registered before the gateway serves (checkpo
 while it stops, drained at startup and post-turn. Agent-notify watchers send no user-facing
 receipt (the agent's next turn is the report) unless the launching turn is still running at exit
 — then the injection only queues a follow-up, so the concise receipt goes out immediately.
+During a restart drain, agent-notify watchers suppress that extra receipt too.
 
 The idle completion watcher also drains `watch_match` / `watch_disabled`; no user follow-up is
 required. Notify-off drains these without waking. Transport failures are retried; unavailable
@@ -296,6 +314,20 @@ async completions remain durable delivery rows, never autonomous new model turns
 acceptance. Refused admission refunds every claimed batch sibling without spending an attempt;
 actual delivery errors keep their bounded retry policy. Recognized raw API routes resolve after
 persisted messaging origins and defer quietly when unavailable; malformed routes still warn.
+
+`gateway.restart_notifications` replays retained messaging notices after startup
+restoration, through their original transport (including relay provenance),
+profile, session key and session ID. Only a verified compression continuation may
+replace that ID; an idle replacement or explicit user boundary does not inherit
+the notice. Offline destinations remain pending for the supervised five-second
+retry. Concurrent replay and stale database snapshots cannot repeat a completed
+receipt. A row settles at the agent execution boundary, not on adapter scheduling;
+a crash while a handler is executing remains at-least-once, not an exactly-once
+guarantee for its tool side effects.
+
+This handoff covers internal `MessageEvent` notices. Ordinary cron output uses
+the outbound delivery queue, while `bot-chat` cron delivery uses its existing
+durable owner mailbox; neither is converted into a messaging-gateway wake.
 
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,

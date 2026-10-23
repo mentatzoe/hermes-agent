@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from gateway.session import SessionSource
@@ -106,6 +107,12 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Trusted local restart handoff; never deserialized from ingress metadata.
+    _restart_notification_id: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+    _restart_notification_path: Optional[Path] = field(default=None, init=False, repr=False, compare=False)
+    _restart_notification_deferred: bool = field(default=False, init=False, repr=False, compare=False)
+    _restart_notification_consumed: bool = field(default=False, init=False, repr=False, compare=False)
+    _restart_notification_turn_owned: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Transport-attested bots are conversational peers, not operators.

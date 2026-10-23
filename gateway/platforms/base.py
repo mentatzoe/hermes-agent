@@ -429,6 +429,9 @@ from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.base_shutdown import cancel_adapter_background_tasks
+from gateway.restart_notifications import (
+    defer_or_reject, dispatch_message, finish_admission)
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
@@ -3637,7 +3640,7 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
+        response = await dispatch_message(self, event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return
@@ -4097,18 +4100,18 @@ class BasePlatformAdapter(ABC):
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
-        if expected_session_key and session_key != expected_session_key:
-            logger.warning("Dropping internally routed event: expected session=%s derived=%s",
-                           expected_session_key, session_key)
+        if await defer_or_reject(self, event, session_key, expected_session_key):
             return
-        # On-entry self-heal: clear a guard whose owner task already exited.
-        if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
-        if session_key in self._active_sessions:
-            await self._handle_message_while_active(event, session_key)
-            return
-        # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
-        event._gateway_accepted = self._start_session_processing(event, session_key)
+        try:
+            # Guard installation stays synchronous after durable admission.
+            if session_key in self._active_sessions:
+                self._heal_stale_session_lock(session_key)
+            if session_key in self._active_sessions:
+                await self._handle_message_while_active(event, session_key)
+                return
+            event._gateway_accepted = self._start_session_processing(event, session_key)
+        finally:
+            finish_admission(self, event)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
@@ -4611,7 +4614,7 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
+            response = await dispatch_message(self, event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4766,9 +4769,8 @@ class BasePlatformAdapter(ABC):
         # Capture the guard this drain owns now: a /stop//new guard swapped in during the
         # back-off must survive the slot-empty exit (#48300).
         guard = self._active_sessions.get(session_key)
-        self._track_session_task(
-            session_key,
-            asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)))
+        task = asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard))
+        self._track_session_task(session_key, task)
 
     async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
                            guard: Optional[asyncio.Event]) -> None:
@@ -4809,33 +4811,7 @@ class BasePlatformAdapter(ABC):
     async def cancel_background_tasks(self) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
         stragglers are untracked and left to unwind."""
-        # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
-        # untrack.
-        for _ in range(5):
-            tasks = [task for task in self._background_tasks if not task.done()]
-            if not tasks:
-                break
-            for task in tasks:
-                self._expected_cancelled_tasks.add(task)
-                task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(asyncio.shield(t) for t in tasks), return_exceptions=True),
-                    timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("[%s] %d background task(s) did not exit within 5s; "
-                               "releasing tracking and letting them unwind in the background",
-                               self.name, sum(not t.done() for t in tasks))
-                break
-        with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
-        for state in self._text_debounce_store().values():
-            state.cancel_timer()
-        for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
-                       self._pending_messages, self._active_sessions, self._requeue_counts,
-                       self._text_debounce_store()):
-            bucket.clear()
+        await cancel_adapter_background_tasks(self)
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
