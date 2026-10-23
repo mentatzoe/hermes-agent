@@ -105,6 +105,13 @@ class RangeHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class RangeServer(ThreadingHTTPServer):
+    # Accept an entire eight-connection download burst even if the serving
+    # thread is descheduled. The stdlib's five-slot backlog is too small.
+    request_queue_size = 32
+    daemon_threads = False
+
+
 @pytest.fixture
 def dl_server():
     RangeHandler.payloads = {}
@@ -115,9 +122,8 @@ def dl_server():
     RangeHandler.etags = True
     RangeHandler.chunk = 1 << 20
     # A serial server can block on one response while the downloader waits for
-    # another range, and its listen backlog need not fit all eight connections.
-    server = ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
-    server.daemon_threads = False
+    # another range; independent writers need independent response handlers.
+    server = RangeServer(("127.0.0.1", 0), RangeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
