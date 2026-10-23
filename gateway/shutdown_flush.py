@@ -210,6 +210,10 @@ def _json_safe(value: Any) -> bool:
 
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
+    if isinstance(getattr(value, "_restart_notification_path", None), Path):
+        # The notice journal owns replay and its completion mark. A second spool
+        # would restore the same payload as an untracked human transcript row.
+        return None
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
         for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",

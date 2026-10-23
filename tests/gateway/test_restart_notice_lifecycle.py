@@ -251,3 +251,36 @@ async def test_marked_row_wins_over_stale_snapshot_without_local_cache(tmp_path,
     await notices.replay_pending(new)
     await drain(fresh)
     assert received == []
+
+
+@pytest.mark.asyncio
+async def test_notice_journal_does_not_also_restore_human_transcript_spool(tmp_path, monkeypatch):
+    from gateway.platforms.event import MessageEvent
+    from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file, recover_pending_spool
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old, adapter, source, key, sid, _ = route(tmp_path, restarting=False)
+    adapter._active_sessions[key] = asyncio.Event()
+    adapter.set_busy_session_handler(old._handle_active_session_busy_message)
+    await deliver_wake(adapter, text="journal head", source=source)
+    await deliver_wake(adapter, text="journal tail", source=source)
+    assert flush_pending_to_file(adapter._pending_messages) == 0
+    assert flush_overflow_to_file({key: old._overflow_queue(key)}) == 0
+    human = MessageEvent(text="human pending", source=source)
+    assert flush_pending_to_file({key: human}) == 1
+    old._draining = old._restart_requested = True
+    await adapter.cancel_background_tasks()
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session(session_id=sid, source="telegram", user_id="42")
+        recovered, held = recover_pending_spool(db, session_resolver=lambda key, **kwargs: (sid, db))
+        assert recovered == 1 and not held
+        assert [row["content"] for row in db.get_messages(sid)] == ["human pending"]
+    finally:
+        db.close()
+    new, fresh, _, _, _, received = route(tmp_path, restarting=False)
+    for _ in range(3):
+        await notices.replay_pending(new)
+        await drain(fresh)
+    assert [row[0] for row in received] == ["journal head", "journal tail"]
