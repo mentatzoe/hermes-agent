@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -27,6 +27,9 @@ class RangeHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):  # noqa: A002 - silence request logging
         pass
+
+    def before_range_chunk(self, start, served):
+        """Tests can gate real response bytes without replacing the downloader."""
 
     def end_headers(self):
         payload = self.payloads.get(self.path)
@@ -81,6 +84,7 @@ class RangeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             served = 0
             while served < len(body):
+                self.before_range_chunk(start, served)
                 if self.abort_after is not None and start + served >= self.abort_after:
                     self.connection.close()
                     return
@@ -101,6 +105,13 @@ class RangeHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class RangeServer(ThreadingHTTPServer):
+    # Accept an entire eight-connection download burst even if the serving
+    # thread is descheduled. The stdlib's five-slot backlog is too small.
+    request_queue_size = 32
+    daemon_threads = False
+
+
 @pytest.fixture
 def dl_server():
     RangeHandler.payloads = {}
@@ -110,7 +121,9 @@ def dl_server():
     RangeHandler.no_range = False
     RangeHandler.etags = True
     RangeHandler.chunk = 1 << 20
-    server = HTTPServer(("127.0.0.1", 0), RangeHandler)
+    # A serial server can block on one response while the downloader waits for
+    # another range; independent writers need independent response handlers.
+    server = RangeServer(("127.0.0.1", 0), RangeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -118,6 +131,8 @@ def dl_server():
     finally:
         server.shutdown()
         server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def url(server, path: str) -> str:
