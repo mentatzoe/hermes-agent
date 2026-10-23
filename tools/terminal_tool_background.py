@@ -137,6 +137,11 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     the chat mute for as long as that turn lasts (#112033). Before the gateway
     serves, or while it stops, the descriptor waits in ``pending_watchers`` for the
     startup / post-turn drain instead."""
+    from agent.delegation_context import is_delegated_child_context
+    # Child completions stay in the registry for accounting or explicit handoff,
+    # but their inherited chat route cannot arm a gateway watcher.
+    if is_delegated_child_context():
+        return
     proc_session.watcher_interval = 5
     watcher = {
         "session_id": proc_session.id, "check_interval": 5, "session_key": session_key,

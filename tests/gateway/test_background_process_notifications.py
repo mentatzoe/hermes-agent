@@ -806,10 +806,14 @@ async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
                               command="make -j8 all", started_at=None)
     done = SimpleNamespace(output_buffer="\x1b[32mstep 1 ok\x1b[0m\n\x1b[31mlinker error\x1b[0m\n", exited=True,
                            exit_code=2, command="make -j8 all", started_at=None)
-    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry([running, done]))
+    registry = SimpleNamespace(current=None, is_completion_consumed=lambda _sid: False)
+    states = iter([running, done])
+    registry.get = lambda _session_id: registry.current
+    monkeypatch.setattr(pr_module, "process_registry", registry)
 
     async def _instant_sleep(*_a, **_kw):
-        pass
+        # Ownership and presentation may both read the same state within a tick.
+        registry.current = next(states, None)
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = _build_runner(monkeypatch, tmp_path, "all")

@@ -2007,8 +2007,7 @@ class GatewayNotificationsMixin:
         return new_output
 
     async def _launching_turn_active(self, platform_name: str, watcher: dict) -> bool:
-        """Whether the session that launched *watcher*'s process is still inside a turn on its
-        adapter (``_active_sessions`` is the base adapter's busy guard)."""
+        """Whether the process's launching session is inside an adapter turn."""
         session_key = str(watcher.get("session_key") or "").strip()
         if not session_key:
             return False
@@ -2018,6 +2017,9 @@ class GatewayNotificationsMixin:
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
         from gateway.run import _non_conversational_metadata
+        async with self._completion_event_scope(watcher):
+            if await self._process_notice_ownership({**watcher, "type": "completion"}) != "deliver":
+                return
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:
@@ -2156,13 +2158,11 @@ class GatewayNotificationsMixin:
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
                     delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
                     if delivered is False:
-                        # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result.
+                        # Retry transient failures; rejected or deduplicated events stay silent.
                         continue
-                    # The agent normally reports the result itself, so the chat gets no separate receipt.
-                    # While the launching turn is still running the injection only queues a follow-up, and
-                    # the chat would stay mute for as long as that turn lasts (#112033): send the concise
-                    # receipt now.
+                    if delivered is None:
+                        break
+                    # A busy launching turn queues the follow-up; only accepted events get a receipt.
                     if turn_busy and (notify_mode in {"concise", "all", "result"} or (
                         notify_mode == "error" and session.exit_code not in {0, None}
                     )):
