@@ -4097,9 +4097,8 @@ class BasePlatformAdapter(ABC):
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
-        if expected_session_key and session_key != expected_session_key:
-            logger.warning("Dropping internally routed event: expected session=%s derived=%s",
-                           expected_session_key, session_key)
+        from gateway.restart_notice_summary import intercept_notice
+        if intercept_notice(self, event, session_key, expected_session_key):
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:

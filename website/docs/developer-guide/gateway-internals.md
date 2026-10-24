@@ -315,6 +315,17 @@ or opted-in explicit targets. `all` expansions do not gain home mirror eligibili
 briefs are labelled user turns appended at a turn boundary, preserving role alternation
 (`cron/AGENTS.md`).
 
+During a restart wait, internal wakes are swallowed before either busy replies or
+queueing. Human messages retain the restart busy reply. The gateway saves only a
+best-effort list of kind, identifier and arrival time in `restart-notice-summary.jsonl`
+beside the host's session index; result text and tool output are not retained.
+After startup restore, each affected session receives one internal wake listing
+those arrivals and directing the agent to the board and process/delegation records.
+Missing sessions, unavailable transports or list I/O failures may lose the wake;
+duplicates are acceptable. This is not per-notice replay or an execution ledger.
+Cron result delivery keeps its separate delivery path; any internal cron wake
+entering the message pipeline uses the same suppression rule.
+
 ## `/login` (off-turn, paired DM only)
 
 `/login` is registered in `hermes_cli/commands.py` with `busy_policy="dispatch"` and
