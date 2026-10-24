@@ -18,7 +18,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.redact import redact_for_egress
 
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_provider import (
+    MemoryProvider, MemoryReviewBinding, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
@@ -388,6 +390,44 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+class MemoryReviewDispatch:
+    """Tool-only borrowing of a captured capability; never owns provider teardown or sync."""
+
+    def __init__(self, binding: MemoryReviewBinding, *, is_active: Optional[Callable[[], bool]] = None) -> None:
+        self._binding = binding
+        self._closed = threading.Event()
+        self._is_active = is_active or (lambda: True)
+
+    def close(self) -> None:
+        """Revoke new dispatch; a provider request already started cannot be recalled."""
+        self._closed.set()
+
+    def has_tool(self, tool_name: str) -> bool:
+        return tool_name in self._binding.tool_names
+
+    def handle_tool_call(self, tool_name: str, args: dict) -> str:
+        if self._closed.is_set() or not self._is_active() or not self.has_tool(tool_name):
+            return tool_error(f"Memory review does not admit tool '{tool_name}'")
+        return self._binding.handle_tool_call(tool_name, args)
+
+
+def memory_review_binding_for_agent(agent: Any) -> Optional[MemoryReviewBinding]:
+    """Capture only the active provider's review tools exposed on this parent session."""
+    manager = getattr(agent, "_memory_manager", None)
+    getter = getattr(manager, "memory_review_binding", None)
+    if not callable(getter):
+        return None
+    binding = getter(session_id=getattr(agent, "session_id", "") or "")
+    if not isinstance(binding, MemoryReviewBinding):
+        return None
+    exposed = getattr(agent, "valid_tool_names", None) or set()
+    names = tuple(name for name in binding.tool_names if name in exposed)
+    if not names:
+        return None
+    restricted = MemoryReviewBinding(binding.prompt, names, binding.handle_tool_call)
+    return MemoryReviewBinding(binding.prompt, names, MemoryReviewDispatch(restricted).handle_tool_call)
+
+
 class MemoryManager:
     """Builtin provider (always first) plus at most one external provider.
 
@@ -703,17 +743,51 @@ class MemoryManager:
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
 
+    def memory_review_binding(self, *, session_id: str = "") -> Optional[MemoryReviewBinding]:
+        """Borrow an opt-in external capability, retaining egress/accounting and tool ownership."""
+        if self._shutting_down:
+            return None
+        for provider in self._providers:
+            getter = getattr(provider, "memory_review_binding", None)
+            if provider.name == "builtin" or not callable(getter):
+                continue
+            try:
+                binding = getter(session_id=session_id)
+            except Exception:
+                logger.warning("Memory provider '%s' review binding failed", provider.name, exc_info=True)
+                continue
+            if not isinstance(binding, MemoryReviewBinding):
+                continue
+            names = tuple(dict.fromkeys(
+                name for name in binding.tool_names if self._tool_to_provider.get(name) is provider))
+            if not names:
+                continue
+
+            def dispatch(name: str, args: dict) -> str:
+                if self._shutting_down or name not in names:
+                    return tool_error(f"Memory review does not admit tool '{name}'")
+                return self._dispatch_provider_tool(provider, name, args, binding.handle_tool_call)
+
+            return MemoryReviewBinding(binding.prompt, names, dispatch)
+        return None
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        return self._dispatch_provider_tool(provider, tool_name, args, provider.handle_tool_call, **kwargs)
+
+    @staticmethod
+    def _dispatch_provider_tool(provider: MemoryProvider, tool_name: str, args: dict,
+                                handler: Callable[..., str], **kwargs) -> str:
+        """Shared manager egress and usage path, including captured review callbacks."""
         args = _redact_for_provider(args)
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
-            result = provider.handle_tool_call(tool_name, args, **kwargs)
+            result = handler(tool_name, args, **kwargs)
         except Exception as e:
-            logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
+            logger.exception("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
             record_provider_memory_call(provider.name, tool_name, args, raised=True)
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
         record_provider_memory_call(provider.name, tool_name, args, result)
