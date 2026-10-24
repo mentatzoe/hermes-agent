@@ -267,6 +267,8 @@ class GatewayStartupMixin:
             self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+        from gateway.restart_notice_summary import wake_after_restart
+        await wake_after_restart(self)
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
