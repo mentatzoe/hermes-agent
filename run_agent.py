@@ -776,7 +776,7 @@ class AIAgent(
         kwargs: Dict[str, Any] = dict(messages_snapshot=_clone_background_review_messages(messages_snapshot),
                       review_memory=review_memory, review_skills=review_skills, focus=focus, task_cfg=task_cfg,
                       explicit=explicit)
-        if review_memory:
+        if review_memory or review_skills:
             kwargs['memory_review_binding'] = memory_review_binding_for_agent(self)
         if focus is None and not explicit and _review_should_defer(self, task_cfg):
             from agent.review_idle_queue import QUEUE

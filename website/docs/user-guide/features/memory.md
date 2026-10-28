@@ -444,6 +444,21 @@ and tools not listed here remain denied. Keep the list narrow and prefer tools
 that stage a proposal for human review rather than applying external or
 destructive changes directly. The default is an empty list.
 
+### Reviews with an external memory provider
+
+When an external memory provider is active and offers a review capability (the Honcho plugin does),
+every background review can use the provider's save tools: memory reviews, skill reviews and
+combined reviews alike, even with the built-in memory store off. The skill half of those reviews
+uses a procedure-only prompt. Procedures, workflows and task-specific pitfalls become skills.
+Personal preferences, events and decisions about the user go to the provider and are never written
+into a skill. If the provider can't be reached, or the review has no memory tool, the review leaves
+the personal item unsaved and says so in its reply.
+
+The main conversation's prompt follows the same split. With a provider active, the skills index no
+longer calls skills the home of "the user's preferred approach", and the line that asks the agent
+to save a worked-out workflow as a skill applies only to a workflow no skill covers. Without an
+external provider, reviews and prompts are unchanged.
+
 ### Local models: reviews wait for an idle GPU (`defer`)
 
 On a cloud provider the review finishes in seconds and runs alongside

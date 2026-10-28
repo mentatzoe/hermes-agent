@@ -116,6 +116,17 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
 
 
+def external_memory_active(agent: Any) -> bool:
+    """True when an external memory provider is registered on ``agent`` and its tools are exposed.
+
+    The same gate as the provider's system-prompt block: guidance that sends personal material to
+    the provider must not appear on a session where the provider's tools are gated off.
+    """
+    manager = getattr(agent, "_memory_manager", None)
+    providers = getattr(manager, "providers", None) or []
+    return any(getattr(p, "name", "") != "builtin" for p in providers) and memory_provider_tools_exposed(agent)
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface; return count added."""
     memory_manager = getattr(agent, "_memory_manager", None)

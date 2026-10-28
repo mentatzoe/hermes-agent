@@ -562,6 +562,87 @@ _COMBINED_REVIEW_PROMPT = (
     "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
 )
 
+# Used instead of the skill and combined prompts when an external memory provider is active. The skill
+# prompts above send style and format corrections, frustration and "remember this" into skills; with a
+# provider those are personal memory, so this prompt keeps what makes a good skill and removes the rest.
+# The lesson-layer block is mirrored from _LESSON_LAYER_BLOCK minus its two lines that route standing user
+# preferences into SKILL.md (a test keeps the two in step).
+_PROCEDURAL_LESSON_LAYER_BLOCK = (
+    "What a skill IS: the instructions for doing a class of task the most efficient and correct "
+    "way — the procedure, the tools and commands that work, the order, and the pitfalls that cost "
+    "time. A future session should be able to follow it and produce a correct result on the first "
+    "try. The user's personal preferences are not part of it; they live in memory. Everything "
+    "below is about writing that well:\n"
+    "  • Procedure first: the steps in the order they are done, with the concrete commands, tool "
+    "calls, and decision points. Lessons and pitfalls attach to the step they affect.\n"
+    "  • A pitfall is a generalizable rule + one clause of WHY (the mechanism), imperative. 'Grep the "
+    "test tree for the SYMBOL before widening a helper signature — hand-rolled mocks reimplement the "
+    "old shape and fail on a shard you did not run.' Not a narrative of what happened this session.\n"
+    "  • No PR/issue numbers, dates, ticket IDs, or quoted user text as content — the rule must stand "
+    "without the incident behind it. Keep a short quote ONLY when the quote itself is the clearest "
+    "statement of the rule.\n"
+    "  • The same lesson learned twice is ONE rule. Before adding, search the skill (and its "
+    "references/) for the rule already stated; strengthen or clarify it rather than appending a "
+    "second copy.\n"
+    "  • Not a duplicate of what the environment already teaches: repo AGENTS.md files, tool schema "
+    "descriptions, and other always-loaded context. A skill carries the WORKFLOW and the pitfalls; "
+    "it does not restate the codebase map or a tool's parameter list.\n"
+    "  • Always-on rules (gates that apply to every instance of the task) live in SKILL.md itself, "
+    "whole. references/ is for depth that is only needed sometimes: "
+    "a decision table, a recipe, a domain note — each file topical and reusable, never "
+    "'<date>-<incident>.md'. Prefer extending an existing references/ file over creating one; "
+    "a skill with dozens of one-off references is the failure shape, not the goal.\n"
+    "  • Fix the skill in place when it is wrong: edit the sentence that misled, do not append "
+    "'UPDATE: actually...' underneath it.\n\n"
+)
+
+_PROCEDURAL_SKILL_REVIEW_PROMPT = (
+    "Review the conversation above for reusable procedures, workflows and task-specific pitfalls. "
+    "Keep the ability to create or update skills; a correction to a procedure is skill material. "
+    "A rule that would be right for anyone is a procedure, even when the user asked for it.\n\n"
+    "Personal preferences, purposes, episodes and decisions about the user, the AI, or their "
+    "relationship belong in memory, even when task-specific. A correction about style, tone, format "
+    "or verbosity, frustration, or 'remember this' is not by itself a skill signal. Split mixed "
+    "learning: keep the reusable method in the skill and save the attributed personal preference or "
+    "episode with the memory tools, without copying it into both. Never disguise a personal "
+    "preference as a general procedural rule.\n\n"
+    "If a memory save fails or this review has no memory tool, leave the personal item unsaved and "
+    "say so in your reply. Never put a personal item into a skill instead.\n\n"
+    "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
+    "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and not "
+    "an umbrella hoarding a references/ file per session.\n\n" + _PROCEDURAL_LESSON_LAYER_BLOCK +
+    "Signals that warrant a skill update:\n"
+    "  • User corrected your workflow, approach, or sequence of steps. Encode the correction as a "
+    "pitfall or explicit step in the skill that governs that class of task.\n"
+    "  • Non-trivial technique, fix, workaround, debugging path, or tool-usage pattern emerged that "
+    "a future session would benefit from.\n"
+    "  • A skill that got loaded or consulted this session turned out to be wrong, missing a step, "
+    "or outdated. Patch it now.\n\n"
+    "Preference order — pick the earliest that fits:\n"
+    "  1. UPDATE A CURRENTLY-LOADED SKILL (loaded via /skill-name or read via skill_view). If it "
+    "covers the territory of the new learning, patch that one first, whoever wrote it.\n"
+    "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). Add a subsection, a pitfall, or "
+    "broaden a trigger.\n"
+    "  3. ADD A SUPPORT FILE under an existing umbrella with skill_manage action=write_file: "
+    "`references/<topic>.md` for topical depth (extend an existing topical file rather than adding "
+    "one per session or incident), `templates/<name>.<ext>` for starter files, `scripts/<name>.<ext>` "
+    "for re-runnable actions. Add a one-line pointer in SKILL.md.\n"
+    "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when nothing covers the class. The name must not "
+    "be a PR number, error string, codename, library alone, or a 'fix-X / debug-Y' session artifact.\n\n"
+    "Read-before-write (ENFORCED — skill_manage refuses otherwise): before you patch or edit an "
+    "existing skill's SKILL.md, call skill_view(name) during this review. Before you overwrite or "
+    "remove an EXISTING supporting file, call skill_view(name, file_path=...) for that exact file. "
+    "Content quoted earlier in the transcript does NOT count. Creating a brand-new skill or adding a "
+    "NEW supporting file needs no prior read. If a write is refused with a read-before-write error, "
+    "view the named target once and retry once; do not loop.\n\n"
+    "If you notice two existing skills that overlap, note it in your reply — the background curator "
+    "handles consolidation. Never delete a skill here.\n\n"
+    "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
+    "'Nothing to save.' is an ordinary result. If the conversation produced no new procedure and no "
+    "correction to one, say 'Nothing to save.' and stop; a personal preference with no procedural "
+    "lesson is memory material, not a reason to change a skill."
+)
+
 
 def _preview(text: str, limit: int) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
@@ -1168,8 +1249,7 @@ def _run_review_fork(
     st.review_agent, _rt, _routed = build_cache_parity_fork(
         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
     st.review_agent._review_attended = explicit
-    binding = memory_review_binding if review_memory else None
-    provider_tools = _bind_review_memory_tools(agent, st.review_agent, binding, review_run)
+    provider_tools = _bind_review_memory_tools(agent, st.review_agent, memory_review_binding, review_run)
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
     review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
@@ -1333,6 +1413,37 @@ _PROMPT_NAME_BY_SCOPE = {
 }
 
 
+def _binding_for_review(agent: Any, review_memory: bool, review_skills: bool, captured: Any) -> Optional[MemoryReviewBinding]:
+    """The provider capability this review borrows. Every review kind gets it when a provider offers
+    one, so a skill review that meets a personal preference can save it instead of writing a skill.
+    ``captured`` is a binding taken at enqueue time (deferred reviews) or ``...`` to capture now."""
+    if not (review_memory or review_skills):
+        return None
+    binding = memory_review_binding_for_agent(agent) if captured is Ellipsis else captured
+    return binding if isinstance(binding, MemoryReviewBinding) else None
+
+
+def _review_prompt(agent: Any, review_memory: bool, review_skills: bool, binding: Optional[MemoryReviewBinding]) -> str:
+    """Prompt for one review. With an external memory provider the skill half is the procedural prompt:
+    preferences go to the provider, procedures to skills, and a personal item is never turned into a
+    skill because a memory save was unavailable. Without a provider the upstream prompts are untouched."""
+    from agent.memory_manager import external_memory_active
+
+    native = bool(getattr(agent, "_memory_store", None))
+    if review_skills and (binding is not None or external_memory_active(agent)):
+        halves = [getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)] if review_memory and native else []
+        prompt = "\n\n".join([*halves, _PROCEDURAL_SKILL_REVIEW_PROMPT])
+    elif binding is not None and not native and not review_skills:
+        # No native store: do not send the reviewer to nonexistent MEMORY.md/USER.md targets.
+        prompt = "Review the conversation above for durable memory.\n\n"
+    else:
+        name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
+        prompt = getattr(agent, name, globals()[name])
+    if binding is not None:
+        prompt += "\n\n**External memory review**:\n" + binding.prompt
+    return prompt
+
+
 def spawn_background_review_thread(
     agent: Any, messages_snapshot: List[Dict], review_memory: bool = False,
     review_skills: bool = False, focus: Optional[str] = None,
@@ -1347,18 +1458,8 @@ def spawn_background_review_thread(
     memory operation set."""
     if task_cfg is None:
         task_cfg = _background_review_task_config()
-    # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
-    name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
-    prompt = getattr(agent, name, globals()[name])
-    binding = (memory_review_binding_for_agent(agent) if memory_review_binding is Ellipsis
-               else memory_review_binding) if review_memory else None
-    binding = binding if isinstance(binding, MemoryReviewBinding) else None
-    if binding is not None:
-        if not getattr(agent, "_memory_store", None):
-            # No native store: do not send the reviewer to nonexistent MEMORY.md/USER.md targets.
-            prompt = (getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT) + "\n\n"
-                      if review_skills else "Review the conversation above for durable memory.\n\n")
-        prompt += "\n\n**External memory review**:\n" + binding.prompt
+    binding = _binding_for_review(agent, review_memory, review_skills, memory_review_binding)
+    prompt = _review_prompt(agent, review_memory, review_skills, binding)
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "

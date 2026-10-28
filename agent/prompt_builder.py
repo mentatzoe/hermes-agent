@@ -255,12 +255,22 @@ SESSION_SEARCH_GUIDANCE = (
 # to save as a skill" and "fix it with skill_manage(action='patch')") and skill_manage's own schema. Only
 # the compaction-pruning contract lives here — nothing else teaches it.
 SKILL_SAFETY_HEADING = "## Skill Safety Rule"
-SKILLS_GUIDANCE = (
-    "When you work out a non-trivial workflow, record it with skill_manage for future reuse.\n\n"
+_SKILL_SAFETY_RULE = (
     f"{SKILL_SAFETY_HEADING}\n"
     "A skill placeholder containing `[SKILL_PRUNED]` lost its content in context compression and is inaccessible — "
     "reload it with skill_view(name='...') before acting on anything that depends on it. After reloading, ignore any "
     "remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions."
+)
+SKILLS_GUIDANCE = (
+    "When you work out a non-trivial workflow, record it with skill_manage for future reuse.\n\n" + _SKILL_SAFETY_RULE
+)
+# With an external memory provider the user's personal preferences live there, so the opening no longer
+# asks for every worked-out workflow to become a skill. It keeps the validated wording of the sentence
+# above and only narrows it (see the content-filter note above before rewording).
+SKILLS_GUIDANCE_EXTERNAL_MEMORY = (
+    "When you work out a non-trivial workflow that no skill covers, record it with skill_manage for future "
+    "reuse. A correction about one task, or about how the user wants things, belongs in memory, not in a "
+    "skill.\n\n" + _SKILL_SAFETY_RULE
 )
 
 KANBAN_GUIDANCE = (
@@ -1361,6 +1371,7 @@ def _current_session_platform_hint() -> str:
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
+    external_memory: bool = False,
 ) -> str:
     """Compact skill index for the system prompt.
 
@@ -1369,6 +1380,8 @@ def build_skills_system_prompt(
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
+    ``external_memory`` is True when an external memory provider holds the user's personal preferences:
+    the index then says so instead of calling skills the home of "the user's preferred approach".
     """
     _home_token = None
     if skills_dir_override is not None:
@@ -1383,7 +1396,7 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not extra_roots:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
+            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories, external_memory)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1433,6 +1446,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None", unloadable: "list[str]" = (),
+    external_memory: bool = False,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
@@ -1472,6 +1486,29 @@ def _render_skills_index(
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
+    # Personal preferences live in the external memory provider when one is active: skills carry only
+    # conventions and quality standards, and a skill is saved only for a method that is missing.
+    if external_memory:
+        approach_line = (
+            "Skills also encode conventions and quality standards for tasks like code review, planning, and "
+            "testing — load them even for tasks you already know how to do, because the skill defines how it "
+            "should be done here. The user's personal preferences are in memory, not in skills.\n"
+        )
+        improve_line = (
+            "If a skill you loaded was missing steps, had wrong commands, or needed pitfalls you discovered, "
+            "update it before finishing. Add a skill only for a reusable method that no skill covers; a "
+            "correction about one task, or about how the user wants things, goes to memory.\n"
+        )
+    else:
+        approach_line = (
+            "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
+            "code review, planning, and testing — load them even for tasks you already know how to do, because "
+            "the skill defines how it should be done here.\n"
+        )
+        improve_line = (
+            "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
+            "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
+        )
     return (
         "## Skills\n"
         "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
@@ -1480,13 +1517,10 @@ def _render_skills_index(
         "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
         "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
         f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-        "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
-        "code review, planning, and testing — load them even for tasks you already know how to do, because "
-        "the skill defines how it should be done here.\n"
-        "If a skill has issues, fix it with skill_manage(action='patch').\n"
-        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
-        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
-        "\n"
+        + approach_line
+        + "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        + improve_line
+        + "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
@@ -1503,6 +1537,7 @@ def _oneshot_prompt_variant() -> bool:
 def _build_skills_system_prompt_inner(
     skills_dir: "Path", extra_roots: "list[tuple[int, Path]]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
+    external_memory: bool = False,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1515,7 +1550,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(), tuple(plugin_rows),
+        _oneshot_prompt_variant(), tuple(plugin_rows), bool(external_memory),
     )
     snapshot = _load_skills_snapshot(skills_dir)
     app_gated = snapshot is not None and any(
@@ -1585,7 +1620,8 @@ def _build_skills_system_prompt_inner(
             logger.debug("Could not write skills prompt snapshot: %s", e)
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, unloadable)
+    result = _render_skills_index(
+        skills_by_category, category_descriptions, compact_categories, available_tools, unloadable, external_memory)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
