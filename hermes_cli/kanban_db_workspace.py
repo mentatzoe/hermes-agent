@@ -153,16 +153,33 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     return found
 
 
-def _schema_is_empty(conn: sqlite3.Connection) -> bool:
-    """True when the database holds no tables, indexes, views or triggers at all.
+def _is_intact_empty_database(conn: sqlite3.Connection) -> bool:
+    """True when the database is intact and holds no tables, indexes, views or triggers.
 
     A zero-byte file, a header-only file left by ``VACUUM`` and a database whose
     tables were all dropped read like this. None of them can hold a task. SQLite
     answers from its schema, WAL included, so a board whose tables still sit in
-    the WAL is not mistaken for an empty file. A file SQLite cannot read raises
-    ``sqlite3.Error`` instead; the caller treats that as "cannot tell".
+    the WAL is not mistaken for an empty file.
+
+    An empty schema is not proof on its own. A damaged schema page can read as
+    empty while the pages of the real tables are still in the file, and SQLite
+    raises no error for it. Its page accounting does notice, so a file that
+    reads as empty must also pass ``PRAGMA quick_check``. Only such files pay
+    for the check.
+
+    Returns False for a file with schema objects. Raises ``sqlite3.Error`` for a
+    file SQLite cannot read and for one whose check fails; the caller treats
+    that as "cannot tell".
     """
-    return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+    if conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None:
+        return False
+    verdict = conn.execute("PRAGMA quick_check(1)").fetchall()
+    if len(verdict) != 1 or verdict[0][0] != "ok":
+        detail = str(verdict[0][0]) if verdict else "no result"
+        raise sqlite3.DatabaseError(
+            f"the schema reads as empty but the file fails its integrity check: {detail}"
+        )
+    return True
 
 
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
@@ -170,7 +187,7 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        if _schema_is_empty(other):
+        if _is_intact_empty_database(other):
             _kb._log.debug("Skipping %s: no tables, so no task can use %s", db_file, key)
             return False
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
@@ -191,9 +208,11 @@ def _workspace_in_use_by_other(
     at the same directory. If that set of databases cannot be read, refuse
     the delete (``"unknown"``) and log the board DB that failed, so one broken
     sibling DB is not reported as a live sharer. A sibling file with no tables
-    at all (empty, or a header-only stub) is not unreadable: it holds no task,
-    so it is passed over. Damaged files, locked files and files with tables but
-    no kanban ``tasks`` table still count as unreadable.
+    at all (empty, or a header-only stub) that passes SQLite's integrity check
+    is not unreadable: it holds no task, so it is passed over. Damaged files
+    (including one whose schema page was damaged so that it reads as empty),
+    locked files and files with tables but no kanban ``tasks`` table still
+    count as unreadable.
     """
     try:
         key = _path_key(Path(path).expanduser().resolve(strict=False))

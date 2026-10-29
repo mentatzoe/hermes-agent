@@ -7,8 +7,10 @@ board's database for a live task on the same path. Reading the stub raised ``no 
 tasks``, which counted as "cannot tell", so every finished card kept its directory and recorded
 ``workspace_cleanup_deferred_shared`` with reason ``unknown``.
 
-A file that holds no tables cannot hold a task, so the scan skips it. A file that cannot be read
-at all (damaged, not a database, locked) or that holds unfamiliar tables still blocks removal.
+A file that holds no tables cannot hold a task, so the scan skips it. The skip needs proof that
+the file is intact: a damaged schema page can make a live board read as empty, so a file with no
+tables must also pass SQLite's own integrity check. A file that cannot be read at all (damaged,
+not a database, locked) or that holds unfamiliar tables still blocks removal.
 """
 
 from __future__ import annotations
@@ -109,8 +111,22 @@ def _write_incident_stub(path: Path) -> None:
 
 
 def _write_dropped_tables(path: Path) -> None:
+    """A board that was used and then emptied: the dropped pages sit on the free list."""
     with contextlib.closing(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE tasks (id TEXT)")
+        conn.executemany("INSERT INTO tasks VALUES (?)", [(f"t_{n}" * 20,) for n in range(500)])
+        conn.commit()
+        conn.execute("DROP TABLE tasks")
+        conn.commit()
+
+
+def _write_emptied_auto_vacuum_database(path: Path) -> None:
+    """Used, then emptied, with the file shrinking as it goes (pointer-map pages in play)."""
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        conn.execute("PRAGMA auto_vacuum=FULL")
+        conn.execute("CREATE TABLE tasks (id TEXT)")
+        conn.executemany("INSERT INTO tasks VALUES (?)", [(f"t_{n}" * 20,) for n in range(500)])
+        conn.commit()
         conn.execute("DROP TABLE tasks")
         conn.commit()
 
@@ -156,6 +172,63 @@ def _write_unfamiliar_tables(path: Path) -> None:
     with contextlib.closing(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
         conn.commit()
+
+
+def _damage_schema_page(path: Path, how: str) -> None:
+    """Corrupt page 1 (the schema) so SQLite reads the database as having no tables.
+
+    SQLite raises no error for either shape, and every other page, including the one that holds
+    the tasks, stays in the file. ``PRAGMA quick_check`` is the thing that notices.
+    """
+    data = bytearray(path.read_bytes())
+    page_size = int.from_bytes(data[16:18], "big")
+    if page_size == 1:  # the header stores 65536 as 1
+        page_size = 65536
+    if how == "zeroed-cell-count":
+        assert data[100] == 13 and int.from_bytes(data[103:105], "big") > 0, "page 1 is not a populated leaf"
+        data[103:105] = b"\0\0"
+    else:
+        assert how == "replaced-by-empty-leaf"
+        data[100:page_size] = bytes(page_size - 100)
+        data[100] = 13
+        data[105:107] = (page_size % 65536).to_bytes(2, "big")
+    path.write_bytes(bytes(data))
+
+
+def _write_board_with_zeroed_schema_cell_count(path: Path) -> None:
+    _write_board(path)
+    _damage_schema_page(path, "zeroed-cell-count")
+
+
+def _write_board_with_schema_replaced_by_empty_leaf(path: Path) -> None:
+    _write_board(path)
+    _damage_schema_page(path, "replaced-by-empty-leaf")
+
+
+def _board_with_live_sharer(kind: str, workspace: Path | str) -> Path:
+    """A sibling board whose running task uses *workspace*; returns the file the scan reads.
+
+    ``minimal`` has only the columns the scan reads. ``full`` is a board made by
+    ``kb.create_board``, with the whole schema, checkpointed so the main file holds every page.
+    """
+    if kind == "minimal":
+        rows = [(f"t_{n}", "ready", f"/elsewhere/{n}" * 20) for n in range(400)]
+        rows.append(("t_live", "running", str(workspace)))
+        db = kb.boards_root() / "sharer" / "kanban.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        _write_board(db, rows)
+        return db
+    assert kind == "full"
+    kb.create_board("sharer")
+    with kbc.connect_closing(board="sharer") as other:
+        live = kb.create_task(other, title="still using the report")
+        with kb.write_txn(other):
+            other.execute(
+                "UPDATE tasks SET status='running', workspace_path=? WHERE id=?",
+                (str(workspace), live),
+            )
+        other.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return Path(other.execute("PRAGMA database_list").fetchone()[2])
 
 
 def _plant(write, slug: str = "default") -> Path:
@@ -238,6 +311,7 @@ _NO_TABLES = [
     pytest.param(_write_empty_file, id="zero-byte-file"),
     pytest.param(_write_incident_stub, id="header-only-4096-byte-stub-from-the-incident"),
     pytest.param(_write_dropped_tables, id="every-table-dropped"),
+    pytest.param(_write_emptied_auto_vacuum_database, id="emptied-auto-vacuum-database"),
     pytest.param(_write_empty_wal_database, id="empty-database-in-wal-mode"),
 ]
 
@@ -247,6 +321,8 @@ _CANNOT_TELL = [
     pytest.param(_write_truncated_header, id="header-cut-short"),
     pytest.param(_write_board_cut_to_first_page, id="board-cut-to-its-first-page"),
     pytest.param(_write_board_with_damaged_schema, id="damaged-schema-page"),
+    pytest.param(_write_board_with_zeroed_schema_cell_count, id="schema-page-cell-count-zeroed-reads-empty"),
+    pytest.param(_write_board_with_schema_replaced_by_empty_leaf, id="schema-page-replaced-reads-empty"),
     pytest.param(_write_board_with_damaged_tasks_page, id="schema-intact-tasks-pages-damaged"),
     pytest.param(_write_unfamiliar_tables, id="tables-but-no-tasks-table"),
 ]
@@ -344,6 +420,41 @@ def test_board_whose_tables_are_only_in_the_wal_is_not_mistaken_for_an_empty_fil
         writer.close()
 
 
+# A board with a running task on the completing task's workspace, then damaged so that SQLite
+# reads it as having no tables. The task's pages are still in the file; only the schema is gone.
+_DAMAGED_TO_READ_EMPTY = [
+    pytest.param("minimal", "zeroed-cell-count", id="minimal-board-cell-count-zeroed"),
+    pytest.param("minimal", "replaced-by-empty-leaf", id="minimal-board-schema-replaced"),
+    pytest.param("full", "replaced-by-empty-leaf", id="full-board-schema-replaced"),
+]
+
+
+@pytest.mark.parametrize(("kind", "how"), _DAMAGED_TO_READ_EMPTY)
+def test_the_damage_reads_as_an_empty_schema_without_any_error(kanban_home, kind, how):
+    """Pins the premise of the next test: SQLite itself reports nothing wrong with these files.
+
+    Only the integrity check notices. If a newer SQLite starts raising here, the guard is no
+    longer what protects these shapes, and this is the test that says so.
+    """
+    db = _board_with_live_sharer(kind, "/elsewhere/ws")
+    _damage_schema_page(db, how)
+    with contextlib.closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as reader:
+        assert reader.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+        assert reader.execute("PRAGMA quick_check(1)").fetchall() != [("ok",)]
+
+
+@pytest.mark.parametrize(("kind", "how"), _DAMAGED_TO_READ_EMPTY)
+def test_damaged_board_that_reads_as_empty_keeps_the_workspace_it_may_still_use(kanban_home, kind, how):
+    with kbc.connect_closing() as conn:
+        tid, ws = _running_scratch_task(conn)
+        db = _board_with_live_sharer(kind, ws)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
+        _damage_schema_page(db, how)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "unknown"
+        assert kb.complete_task(conn, tid, summary="done")
+        _assert_outcome(conn, tid, ws, removed=False)
+
+
 # ---------------------------------------------------------------------------
 # The real cleanup paths, with a sibling file planted where the incident had it
 # ---------------------------------------------------------------------------
@@ -351,6 +462,7 @@ def test_board_whose_tables_are_only_in_the_wal_is_not_mistaken_for_an_empty_fil
 _SIBLINGS = [
     pytest.param(_write_incident_stub, True, id="no-tables-removed"),
     pytest.param(_write_garbage, False, id="unreadable-kept"),
+    pytest.param(_write_board_with_schema_replaced_by_empty_leaf, False, id="schema-damaged-to-read-empty-kept"),
 ]
 
 
