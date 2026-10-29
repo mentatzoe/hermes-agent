@@ -201,8 +201,20 @@ def test_detached_fork_executes_captured_tools_through_executor(parent, monkeypa
     assert records[0][0][:3] == (provider.name, "review_write", {"text": "[redacted]"})
 
 
-def test_skills_only_and_btw_forks_have_no_review_dispatch(parent, monkeypatch):
+def test_btw_fork_has_no_review_dispatch(parent):
     agent, provider = parent
+    fork, _rt, _routed = bg.build_cache_parity_fork(agent, {}, max_iterations=1, write_origin="btw")
+    assert getattr(fork, "_memory_review_dispatch", None) is None
+    fork.release_clients()
+    assert not provider.calls and not provider.lifecycle
+
+
+def test_extra_tools_cannot_admit_a_provider_tool_to_a_review_with_no_captured_binding(parent, monkeypatch):
+    """A skills-only review now borrows the provider's tools when the provider offers a capability
+    (tests/agent/test_review_external_memory_routing.py). Without one, a configured ``extra_tools``
+    entry must still not reach the provider: the allowlist can admit a tool, never create access."""
+    agent, provider = parent
+    provider.opt_in = False
     forks = []
 
     def review_turn(fork, **kwargs):
@@ -219,9 +231,6 @@ def test_skills_only_and_btw_forks_have_no_review_dispatch(parent, monkeypatch):
     target()
     assert len(forks) == 1
     assert "Maintain attributed external memory" not in prompt
-    fork, _rt, _routed = bg.build_cache_parity_fork(agent, {}, max_iterations=1, write_origin="btw")
-    assert getattr(fork, "_memory_review_dispatch", None) is None
-    fork.release_clients()
     assert not provider.calls and not provider.lifecycle
 
 

@@ -116,6 +116,27 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
 
 
+def external_memory_active(agent: Any) -> bool:
+    """True when an external memory provider owns personal memory for ``agent``'s prompts.
+
+    Normally that is a registered non-builtin provider whose tools are exposed: the same gate as the
+    provider's system-prompt block, so guidance that sends personal material to the provider never
+    appears where its tools are gated off.
+
+    A detached fork (background review, /btw) has no memory manager on purpose: it must not run the
+    provider's lifecycle. It carries the answer instead, pinned once at fork birth as
+    ``_external_memory_prompt_mode`` (``build_cache_parity_fork`` from the parent, and ``True`` for a
+    review that borrows a captured capability). A pinned mode is read first, so the fork's own
+    system-prompt builds, including its compaction-boundary rebuild, route like the parent's.
+    """
+    pinned = getattr(agent, "_external_memory_prompt_mode", None)
+    if isinstance(pinned, bool):
+        return pinned
+    manager = getattr(agent, "_memory_manager", None)
+    providers = getattr(manager, "providers", None) or []
+    return any(getattr(p, "name", "") != "builtin" for p in providers) and memory_provider_tools_exposed(agent)
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface; return count added."""
     memory_manager = getattr(agent, "_memory_manager", None)
