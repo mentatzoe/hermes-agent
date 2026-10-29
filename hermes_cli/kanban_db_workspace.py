@@ -153,11 +153,26 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     return found
 
 
+def _schema_is_empty(conn: sqlite3.Connection) -> bool:
+    """True when the database holds no tables, indexes, views or triggers at all.
+
+    A zero-byte file, a header-only file left by ``VACUUM`` and a database whose
+    tables were all dropped read like this. None of them can hold a task. SQLite
+    answers from its schema, WAL included, so a board whose tables still sit in
+    the WAL is not mistaken for an empty file. A file SQLite cannot read raises
+    ``sqlite3.Error`` instead; the caller treats that as "cannot tell".
+    """
+    return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+
+
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     uri = db_file.as_uri() + "?mode=ro"
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
+        if _schema_is_empty(other):
+            _kb._log.debug("Skipping %s: no tables, so no task can use %s", db_file, key)
+            return False
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
     finally:
         other.close()
@@ -175,7 +190,10 @@ def _workspace_in_use_by_other(
     The connection covers one board. A ready task on a named board can point
     at the same directory. If that set of databases cannot be read, refuse
     the delete (``"unknown"``) and log the board DB that failed, so one broken
-    sibling DB is not reported as a live sharer.
+    sibling DB is not reported as a live sharer. A sibling file with no tables
+    at all (empty, or a header-only stub) is not unreadable: it holds no task,
+    so it is passed over. Damaged files, locked files and files with tables but
+    no kanban ``tasks`` table still count as unreadable.
     """
     try:
         key = _path_key(Path(path).expanduser().resolve(strict=False))
