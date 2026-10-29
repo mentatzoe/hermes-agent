@@ -153,7 +153,43 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     return found
 
 
-def _is_intact_empty_database(conn: sqlite3.Connection) -> bool:
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_SQLITE_HEADER_BYTES = 100
+
+
+def _has_pages_past_its_declared_size(db_file: Path) -> bool:
+    """True when the main file is longer than the database its own header describes.
+
+    Reads the main file's first 100 bytes and its length, not SQLite's view of the
+    database. The header counts pages (offset 28) of a page size (offset 16, where 1
+    means 65536). A header that is not a SQLite header, or whose page size is not a
+    power of two from 512 up, describes nothing, so any bytes behind it count as
+    unexplained. An empty file holds nothing and is fine.
+
+    With a write-ahead log the main file can be longer than SQLite's current view of
+    the database: DROP TABLE and VACUUM commit an empty database to the log, and the
+    main file keeps its old length until the next checkpoint. That is not a mismatch,
+    because the main file's own header still counts every page it holds. A file left
+    in the middle of a checkpoint (its first page already rewritten, its tail not yet
+    cut off) does read as a mismatch, so it counts as unreadable until a writer
+    finishes the checkpoint.
+    """
+    with open(db_file, "rb") as handle:
+        header = handle.read(_SQLITE_HEADER_BYTES)
+        size = os.fstat(handle.fileno()).st_size
+    if size == 0:
+        return False
+    if len(header) < _SQLITE_HEADER_BYTES or not header.startswith(_SQLITE_MAGIC):
+        return True
+    page_size = int.from_bytes(header[16:18], "big")
+    if page_size == 1:
+        page_size = 65536
+    if page_size < 512 or page_size & (page_size - 1):
+        return True
+    return size > page_size * int.from_bytes(header[28:32], "big")
+
+
+def _is_intact_empty_database(conn: sqlite3.Connection, db_file: Path) -> bool:
     """True when the database is intact and holds no tables, indexes, views or triggers.
 
     A zero-byte file, a header-only file left by ``VACUUM`` and a database whose
@@ -161,18 +197,31 @@ def _is_intact_empty_database(conn: sqlite3.Connection) -> bool:
     answers from its schema, WAL included, so a board whose tables still sit in
     the WAL is not mistaken for an empty file.
 
-    An empty schema is not proof on its own. A damaged schema page can read as
-    empty while the pages of the real tables are still in the file, and SQLite
-    raises no error for it. Its page accounting does notice, so a file that
-    reads as empty must also pass ``PRAGMA quick_check``. Only such files pay
-    for the check.
+    An empty schema is not proof on its own, and neither is a clean integrity
+    check. Two kinds of damage leave a used board's pages in the file while SQLite
+    reads an empty database and raises nothing:
+
+    - A damaged schema page. SQLite's page accounting notices the orphaned pages,
+      so a file that reads as empty must pass ``PRAGMA quick_check``.
+    - An old, empty first page written back over a used board. The header then
+      counts one page and SQLite trusts the count, so ``quick_check`` and
+      ``integrity_check`` both pass and the board's pages sit behind it, never
+      walked. The file is longer than its own header says, which is what gives it
+      away, so a file that reads as empty must also not hold more than its header
+      counts.
+
+    Only files that read as empty pay for either check.
 
     Returns False for a file with schema objects. Raises ``sqlite3.Error`` for a
-    file SQLite cannot read and for one whose check fails; the caller treats
+    file SQLite cannot read and for one whose checks fail; the caller treats
     that as "cannot tell".
     """
     if conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None:
         return False
+    if _has_pages_past_its_declared_size(db_file):
+        raise sqlite3.DatabaseError(
+            "the schema reads as empty but the file holds pages past the size its header declares"
+        )
     verdict = conn.execute("PRAGMA quick_check(1)").fetchall()
     if len(verdict) != 1 or verdict[0][0] != "ok":
         detail = str(verdict[0][0]) if verdict else "no result"
@@ -187,7 +236,7 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        if _is_intact_empty_database(other):
+        if _is_intact_empty_database(other, db_file):
             _kb._log.debug("Skipping %s: no tables, so no task can use %s", db_file, key)
             return False
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
@@ -209,10 +258,10 @@ def _workspace_in_use_by_other(
     the delete (``"unknown"``) and log the board DB that failed, so one broken
     sibling DB is not reported as a live sharer. A sibling file with no tables
     at all (empty, or a header-only stub) that passes SQLite's integrity check
-    is not unreadable: it holds no task, so it is passed over. Damaged files
-    (including one whose schema page was damaged so that it reads as empty),
-    locked files and files with tables but no kanban ``tasks`` table still
-    count as unreadable.
+    and is no longer than its own header says is not unreadable: it holds no
+    task, so it is passed over. Damaged files (including one whose first page
+    was damaged or replaced so that it reads as empty), locked files and files
+    with tables but no kanban ``tasks`` table still count as unreadable.
     """
     try:
         key = _path_key(Path(path).expanduser().resolve(strict=False))
