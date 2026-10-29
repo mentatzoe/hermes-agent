@@ -269,7 +269,7 @@ SKILLS_GUIDANCE = (
 # above and only narrows it (see the content-filter note above before rewording).
 SKILLS_GUIDANCE_EXTERNAL_MEMORY = (
     "When you work out a non-trivial workflow that no skill covers, record it with skill_manage for future "
-    "reuse. A correction about one task, or about how the user wants things, belongs in memory, not in a "
+    "reuse. A personal preference, or something true only of one task, belongs in memory, not in a "
     "skill.\n\n" + _SKILL_SAFETY_RULE
 )
 
@@ -1497,7 +1497,7 @@ def _render_skills_index(
         improve_line = (
             "If a skill you loaded was missing steps, had wrong commands, or needed pitfalls you discovered, "
             "update it before finishing. Add a skill only for a reusable method that no skill covers; a "
-            "correction about one task, or about how the user wants things, goes to memory.\n"
+            "personal preference, or something true only of one task, goes to memory.\n"
         )
     else:
         approach_line = (

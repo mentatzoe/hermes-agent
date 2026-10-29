@@ -456,8 +456,10 @@ the personal item unsaved and says so in its reply.
 
 The main conversation's prompt follows the same split. With a provider active, the skills index no
 longer calls skills the home of "the user's preferred approach", and the line that asks the agent
-to save a worked-out workflow as a skill applies only to a workflow no skill covers. Without an
-external provider, reviews and prompts are unchanged.
+to save a worked-out workflow as a skill applies only to a workflow no skill covers. A background
+review's own system prompt follows the split too, whether it runs on the review model or on the
+conversation's model, and after it compacts. Without an external provider, reviews and prompts are
+unchanged.
 
 ### Local models: reviews wait for an idle GPU (`defer`)
 

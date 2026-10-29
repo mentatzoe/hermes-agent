@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from agent.i18n import t
-from agent.memory_manager import MemoryReviewDispatch, memory_review_binding_for_agent
+from agent.memory_manager import MemoryReviewDispatch, external_memory_active, memory_review_binding_for_agent
 from agent.memory_provider import MemoryReviewBinding
 from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
 from agent.thread_scoped_output import thread_scoped_silence
@@ -639,8 +639,9 @@ _PROCEDURAL_SKILL_REVIEW_PROMPT = (
     "handles consolidation. Never delete a skill here.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
     "'Nothing to save.' is an ordinary result. If the conversation produced no new procedure and no "
-    "correction to one, say 'Nothing to save.' and stop; a personal preference with no procedural "
-    "lesson is memory material, not a reason to change a skill."
+    "correction to one, make no skill change. A personal preference with no procedural lesson is never "
+    "a reason to touch a skill; save it with the memory tools if this review has them. Say 'Nothing to "
+    "save.' and stop only when there is nothing for either the skills or the provider."
 )
 
 
@@ -1066,6 +1067,11 @@ def build_cache_parity_fork(
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
     review_agent._user_profile_enabled = agent._user_profile_enabled
+    # The fork keeps no memory manager (skip_memory above), so its own system-prompt builds cannot
+    # tell whether an external provider owns personal memory. Pin the parent's answer once, here, before
+    # anything can build a prompt: a routed fork builds its first prompt itself, and a same-model fork
+    # rebuilds at its first compaction. Only a flag moves; no provider, lifecycle or cached bytes do.
+    review_agent._external_memory_prompt_mode = external_memory_active(agent)
     review_agent._memory_nudge_interval = review_agent._skill_nudge_interval = 0
     # _skip_mcp_refresh: the between-turns MCP refresh would add late-connecting MCP tools and
     # break tools[] parity. PERSISTENCE ISOLATION (curator-takeover root cause): sharing the
@@ -1225,6 +1231,11 @@ def _bind_review_memory_tools(agent: Any, review_agent: Any, binding: Optional[M
     review_agent._memory_review_dispatch = MemoryReviewDispatch(
         binding, is_active=lambda: review_run is None or not (
             review_run.cancel_requested.is_set() or review_run.request_done.is_set()))
+    # The capability and the prompt routing travel together: a review that holds a captured binding is
+    # an external-memory review for its system prompt too, even if the parent's gate has closed since
+    # the binding was captured (a deferred review). Otherwise the system prompt would contradict the
+    # procedural review request beneath it.
+    review_agent._external_memory_prompt_mode = True
     names = set(binding.tool_names)
     # Routed forks build a fresh schema surface; copy only already-exposed review tools.
     # Same-model forks already carry the exact parent snapshot and must not change its bytes.
@@ -1427,8 +1438,6 @@ def _review_prompt(agent: Any, review_memory: bool, review_skills: bool, binding
     """Prompt for one review. With an external memory provider the skill half is the procedural prompt:
     preferences go to the provider, procedures to skills, and a personal item is never turned into a
     skill because a memory save was unavailable. Without a provider the upstream prompts are untouched."""
-    from agent.memory_manager import external_memory_active
-
     native = bool(getattr(agent, "_memory_store", None))
     if review_skills and (binding is not None or external_memory_active(agent)):
         halves = [getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)] if review_memory and native else []

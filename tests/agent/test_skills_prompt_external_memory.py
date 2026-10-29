@@ -55,6 +55,8 @@ def test_skills_index_with_a_provider_points_personal_preferences_at_memory(skil
     # What the section is for survives: load skills, fix wrong steps, update a skill that was missing steps.
     assert "skill_view(name)" in index and "skill_manage(action='patch')" in index
     assert "update it before finishing" in index
+    # Only personal or task-local material is sent to memory; a correction to a method stays skill material.
+    assert "personal preference" in index and "correction about one task" not in index
     assert "demo-skill" in index
 
 
@@ -105,6 +107,9 @@ def test_tool_guidance_with_a_provider_stops_recording_every_workflow_as_a_skill
     # The unconditional opening is gone; a workflow no skill covers can still become one.
     assert "When you work out a non-trivial workflow, record it" not in guidance
     assert "no skill covers" in guidance and "belongs in memory" in guidance
+    # What goes to memory is personal or task-local material. A correction to a method is not named here,
+    # because it is skill material and the sentence must not read as sending it to memory.
+    assert "personal preference" in guidance and "correction about one task" not in guidance
     # The compaction-pruning contract that the opening sentence shares a block with stays.
     assert "[SKILL_PRUNED]" in guidance
 
