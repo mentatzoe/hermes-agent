@@ -134,6 +134,19 @@ def _write_emptied_auto_vacuum_database(path: Path) -> None:
         conn.commit()
 
 
+def _write_emptied_database_with_64k_pages(path: Path) -> None:
+    """Pages of 65536 bytes, which the file header stores as 1 (the largest size does not fit in two bytes)."""
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        conn.execute("PRAGMA page_size=65536")
+        conn.execute("CREATE TABLE tasks (id TEXT)")
+        conn.executemany("INSERT INTO tasks VALUES (?)", [(f"t_{n}" * 20,) for n in range(500)])
+        conn.commit()
+        conn.execute("DROP TABLE tasks")
+        conn.commit()
+    assert path.read_bytes()[16:18] == b"\x00\x01", "the header should store 65536 as 1"
+    assert path.stat().st_size > 65536, "the emptied file should still hold its old pages"
+
+
 def _write_empty_wal_database(path: Path) -> None:
     with contextlib.closing(sqlite3.connect(path)) as conn:
         assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
@@ -260,6 +273,17 @@ def _write_incident_stub_with_a_page_after_it(path: Path) -> None:
     path.write_bytes(_INCIDENT_STUB_HEADER.ljust(_PAGE, b"\0") + bytes(_PAGE))
 
 
+def _write_emptied_database_followed_by_a_page_its_header_does_not_count(path: Path) -> None:
+    """A database that really was emptied (its header counts every page it holds), then one more page.
+
+    The header counts many pages here, not one, so a rule fitted to the replay (a header that
+    counts a single page) would let this through.
+    """
+    _write_dropped_tables(path)
+    assert int.from_bytes(path.read_bytes()[28:32], "big") > 2
+    path.write_bytes(path.read_bytes() + bytes(_PAGE))
+
+
 def _board_with_live_sharer(kind: str, workspace: Path | str) -> Path:
     """A sibling board whose running task uses *workspace*; returns the file the scan reads.
 
@@ -367,6 +391,7 @@ _NO_TABLES = [
     pytest.param(_write_incident_stub, id="header-only-4096-byte-stub-from-the-incident"),
     pytest.param(_write_dropped_tables, id="every-table-dropped"),
     pytest.param(_write_emptied_auto_vacuum_database, id="emptied-auto-vacuum-database"),
+    pytest.param(_write_emptied_database_with_64k_pages, id="emptied-database-with-64k-pages"),
     pytest.param(_write_empty_wal_database, id="empty-database-in-wal-mode"),
 ]
 
@@ -382,6 +407,10 @@ _CANNOT_TELL = [
     pytest.param(_write_board_with_first_108_bytes_replayed, id="first-108-bytes-of-an-empty-page-replayed"),
     pytest.param(_write_board_with_untrusted_empty_header_replayed, id="empty-first-page-replayed-header-not-trusted"),
     pytest.param(_write_incident_stub_with_a_page_after_it, id="incident-stub-with-a-page-the-header-does-not-count"),
+    pytest.param(
+        _write_emptied_database_followed_by_a_page_its_header_does_not_count,
+        id="emptied-database-with-a-page-the-header-does-not-count",
+    ),
     pytest.param(_write_board_with_damaged_tasks_page, id="schema-intact-tasks-pages-damaged"),
     pytest.param(_write_unfamiliar_tables, id="tables-but-no-tasks-table"),
 ]
@@ -519,6 +548,46 @@ def test_board_emptied_through_the_wal_is_skipped_while_its_main_file_is_still_l
         writer.close()
 
 
+def _first_page_the_log_holds_for_the_empty_database(db: Path) -> bytes:
+    """The newest copy of page 1 in a board's write-ahead log: the empty database's first page."""
+    log = Path(str(db) + "-wal").read_bytes()
+    page_size = int.from_bytes(log[8:12], "big")
+    frame = 24 + page_size
+    newest = None
+    for n in range((len(log) - 32) // frame):
+        offset = 32 + n * frame
+        if int.from_bytes(log[offset:offset + 4], "big") == 1:
+            newest = log[offset + 24:offset + frame]
+    assert newest is not None, "the log should hold a copy of page 1"
+    return newest
+
+
+def test_board_whose_checkpoint_stopped_after_page_one_is_unreadable_until_a_writer_finishes_it(kanban_home):
+    """A checkpoint copies pages from the log to the main file in order and cuts the file to its
+    new length last. One that stops in between leaves the empty first page in front of the old
+    pages, the shape of the stale-page replay. The scan cannot tell the two apart, so it waits
+    (unknown); the next writer to finish the checkpoint settles it and the board is skipped.
+    """
+    db = kb.boards_root() / "emptied-board" / "kanban.db"
+    db.parent.mkdir(parents=True)
+    writer = _empty_through_the_wal(db)
+    try:
+        with kbc.connect_closing() as conn:
+            tid, ws = _finished_scratch_task(conn)
+            assert kbw._workspace_in_use_by_other(conn, tid, ws) is None
+            data = bytearray(db.read_bytes())
+            data[:_PAGE] = _first_page_the_log_holds_for_the_empty_database(db)
+            db.write_bytes(bytes(data))
+            interrupted_size = db.stat().st_size
+            assert interrupted_size > 2 * _PAGE
+            assert kbw._workspace_in_use_by_other(conn, tid, ws) == "unknown"
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            assert db.stat().st_size < interrupted_size, "the checkpoint should have cut the file"
+            assert kbw._workspace_in_use_by_other(conn, tid, ws) is None
+    finally:
+        writer.close()
+
+
 def _zero(start: int, stop: int):
     return lambda data: data.__setitem__(slice(start, stop), bytes(stop - start))
 
@@ -526,7 +595,9 @@ def _zero(start: int, stop: int):
 _MAIN_FILE_HEADER_DAMAGE = [
     pytest.param(lambda data: data.__setitem__(slice(0, 16), b"X" * 16), id="magic-string-overwritten"),
     pytest.param(_zero(16, 18), id="page-size-zeroed"),
-    pytest.param(lambda data: data.__setitem__(slice(16, 18), (3000).to_bytes(2, "big")), id="page-size-not-a-power-of-two"),
+    # 8000 is large enough that (page count x page size) still covers the file, so only the
+    # power-of-two rule catches it. SQLite takes the real page size from the log and reads on.
+    pytest.param(lambda data: data.__setitem__(slice(16, 18), (8000).to_bytes(2, "big")), id="page-size-not-a-power-of-two"),
     pytest.param(_zero(0, _PAGE), id="first-page-zeroed"),
 ]
 
@@ -639,6 +710,38 @@ def test_board_whose_old_empty_first_page_was_written_back_keeps_the_workspace_i
         # there, still naming the directory that was kept.
         db.write_bytes(used_board)
         assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        _write_incident_stub_with_a_page_after_it,
+        _write_emptied_database_followed_by_a_page_its_header_does_not_count,
+    ],
+)
+def test_a_page_the_header_does_not_count_is_invisible_to_sqlite(kanban_home, write):
+    """Pins the premise of the cases that plant one: SQLite and both integrity checks see an
+    intact empty database, so only the length of the file gives the extra page away.
+    """
+    db = _plant(write)
+    with contextlib.closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as reader:
+        assert reader.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+        assert reader.execute("PRAGMA quick_check(1)").fetchall() == [("ok",)]
+        assert reader.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
+def test_board_whose_first_page_was_replayed_stays_unreadable_with_log_files_beside_it(kanban_home):
+    """Log files next to the file do not vouch for it. A live board in WAL mode normally has a
+    ``-wal`` and a ``-shm`` beside it, and these are what an unclean stop leaves behind. With
+    nothing in the log, SQLite still reads page 1 from the main file, which is the replayed one.
+    """
+    db = _board_with_live_sharer("full", "/elsewhere/ws")
+    _replay_empty_first_page(db)
+    Path(str(db) + "-wal").write_bytes(b"")
+    Path(str(db) + "-shm").write_bytes(b"")
+    with kbc.connect_closing() as conn:
+        tid, ws = _finished_scratch_task(conn)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "unknown"
 
 
 # ---------------------------------------------------------------------------
