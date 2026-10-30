@@ -25,6 +25,7 @@ class PreparedTurn:
     persistence_owner: Optional[str] = None
     title_user_message: Optional[str] = None
     typed_user_message: Optional[str] = None
+    recoverable_audio_paths: Optional[List[str]] = None
 
 
 @dataclass
@@ -73,6 +74,7 @@ class TurnContext:
     moa_config: Optional[dict] = None
     title_user_message: Optional[str] = None
     typed_user_message: Optional[str] = None
+    recoverable_audio_paths: Optional[List[str]] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.

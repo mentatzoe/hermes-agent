@@ -1533,6 +1533,7 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[Dict[str, Any]]:
         user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory,
+        current_turn_user_idx=s.current_turn_user_idx,
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
@@ -1559,6 +1560,7 @@ def _run_conversation_turn(
     turn_author: Optional[Dict[str, Any]] = None,
     typed_user_message: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    recoverable_audio_paths: Optional[List[str]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
 ) -> Dict[str, Any]:
@@ -1601,6 +1603,7 @@ def _run_conversation_turn(
             turn_author=turn_author,
             typed_user_message=typed_user_message,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
+            recoverable_audio_paths=recoverable_audio_paths,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,
             summarize_user_message_for_log=_summarize_user_message_for_log,
@@ -1723,6 +1726,7 @@ def run_conversation(
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     typed_user_message: Optional[str] = None,
+    recoverable_audio_paths: Optional[List[str]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
 ) -> Dict[str, Any]:
@@ -1758,6 +1762,7 @@ def run_conversation(
                 moa_config=moa_config,
                 turn_author=turn_author,
                 typed_user_message=typed_user_message,
+                recoverable_audio_paths=recoverable_audio_paths,
                 title_user_message=title_user_message,
                 prelude=prelude,
             )

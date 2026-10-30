@@ -1509,8 +1509,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]
     ) -> str:
         event._gateway_typed_stt_transcripts = []
+        event._gateway_recoverable_audio_paths = []
         message_text, _successful_transcripts = await self._enrich_message_with_transcription(
             message_text, audio_paths, typed_transcripts=event._gateway_typed_stt_transcripts,
+            recoverable_audio_paths=event._gateway_recoverable_audio_paths,
         )
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
@@ -1710,6 +1712,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
+        if not _pending_stt_prepared:
+            event._gateway_recoverable_audio_paths = []
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
         # Prefer the caller's resolved session key so this write key matches the consume key at the
         # run_conversation site; derive it here only for tests and legacy standalone callers.
@@ -1723,6 +1727,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
+        from gateway.typed_text import agent_visible_audio_paths
+        owned_file_audio = await asyncio.to_thread(agent_visible_audio_paths, audio_file_paths)
+        event._gateway_recoverable_audio_paths = [] if getattr(event, "internal", False) else list(dict.fromkeys([
+            *getattr(event, "_gateway_recoverable_audio_paths", []),
+            *owned_file_audio,
+        ]))
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
         if "@" in message_text:
@@ -1935,8 +1945,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
         event._gateway_typed_stt_transcripts = []
+        event._gateway_recoverable_audio_paths = []
         enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
             text, audio_paths, typed_transcripts=event._gateway_typed_stt_transcripts,
+            recoverable_audio_paths=event._gateway_recoverable_audio_paths,
         )
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)

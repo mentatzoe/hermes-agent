@@ -9,6 +9,24 @@ logger = logging.getLogger("gateway.run")
 EMPTY_TEXT_PLACEHOLDER = "(The user sent a message with no text content)"
 
 
+def agent_visible_audio_paths(paths):
+    """Ingress attachment paths in the same namespace as tool arguments."""
+    from tools.credential_files import to_agent_visible_cache_path
+    return [to_agent_visible_cache_path(os.path.abspath(path)) for path in paths]
+
+
+def authored_turn_kwargs(run_conversation, ctx):
+    """Forward host-owned sender facts only to agent signatures that accept them."""
+    from agent.interrupt_compat import _accepts_keyword
+    fields = {
+        "turn_author": {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
+                        "is_bot": bool(getattr(ctx.source, "is_bot", False))},
+        "typed_user_message": ctx.typed_user_message,
+        "recoverable_audio_paths": ctx.recoverable_audio_paths,
+    }
+    return {key: value for key, value in fields.items() if _accepts_keyword(run_conversation, key)}
+
+
 def typed_text_for_event(event) -> str:
     """Return only words the sender wrote or spoke, never gateway scaffolding.
 
@@ -29,6 +47,35 @@ def typed_text_for_event(event) -> str:
         transcripts = getattr(event, "_gateway_pending_stt_transcripts", None) or []
     parts.extend(transcript for transcript in transcripts if transcript and transcript.strip())
     return "\n\n".join(parts)
+
+
+def apply_message_timestamp(event, message_text):
+    """Keep model-only prefixes out of persisted sender text; render timestamps only if enabled."""
+    from gateway.run import _load_gateway_config, _message_timestamps_enabled
+    from gateway.run_inbound import strip_discord_triggering_note
+    persist_user_message = None
+    persist_user_timestamp = None
+    try:
+        from hermes_time import get_timezone as _get_evt_tz
+        from gateway.message_timestamps import (
+            coerce_message_timestamp as _coerce_msg_ts,
+            render_user_content_with_timestamp as _render_msg_ts,
+            strip_leading_message_timestamps as _strip_msg_ts,
+        )
+        _evt_tz = _get_evt_tz()
+        if message_text and isinstance(message_text, str):
+            _clean_message_text, _embedded_ts = _strip_msg_ts(message_text, tz=_evt_tz)
+            persist_user_message = strip_discord_triggering_note(event, _clean_message_text)
+            _event_epoch = _coerce_msg_ts(getattr(event, "timestamp", None), tz=_evt_tz)
+            persist_user_timestamp = _event_epoch if _event_epoch is not None else _embedded_ts
+            if _message_timestamps_enabled(_load_gateway_config()):
+                message_text = _render_msg_ts(_clean_message_text, persist_user_timestamp, tz=_evt_tz)
+            else:
+                # Toggle off: the model sees the clean message; timestamp stored for later opt-in.
+                message_text = _clean_message_text
+    except Exception as _ts_err:
+        logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err, exc_info=True)
+    return message_text, persist_user_message, persist_user_timestamp
 
 
 async def transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
@@ -63,10 +110,14 @@ async def transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audi
 
 async def enrich_message_with_transcription(
     self, user_text: str, audio_paths: List[str], *, typed_transcripts: Optional[List[str]] = None,
+    recoverable_audio_paths: Optional[List[str]] = None,
 ) -> tuple[str, List[str]]:
     """Return enriched text and successful transcripts, optionally collecting sender-authored speech."""
     from gateway.run import _probe_audio_duration
     audio_paths = list(dict.fromkeys(audio_paths))
+    owned_paths = dict(zip(audio_paths, await asyncio.to_thread(agent_visible_audio_paths, audio_paths)))
+    if recoverable_audio_paths is not None:
+        recoverable_audio_paths.extend(owned_paths.values())
     if not getattr(self.config, "stt_enabled", True):
         notes = []
         for path in audio_paths:
@@ -92,6 +143,8 @@ async def enrich_message_with_transcription(
             )
             if transcript is not None:
                 successful_transcripts.append(transcript)
+                if recoverable_audio_paths is not None:
+                    recoverable_audio_paths.remove(owned_paths[path])
                 if typed_transcripts is not None and not note.startswith(
                     "[This recording is Aleph's own earlier voice reply"
                 ):

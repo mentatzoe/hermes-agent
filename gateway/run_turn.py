@@ -1457,36 +1457,6 @@ class GatewayTurnMixin:
                 source, t("gateway.notify.no_home_channel", platform=platform_name.title(), sethome_cmd=sethome_cmd),
             )
 
-    def _hmwa_apply_message_timestamp(self, event, message_text):
-        """Capture the platform event time as message metadata and keep the persisted transcript
-        clean — strip any leading timestamp prefix and the Discord triggering-message note (a
-        model instruction, not authored text) — regardless of the toggle; only the in-context
-        RENDER is gated behind gateway.message_timestamps.enabled (default OFF)."""
-        from gateway.run import _load_gateway_config, _message_timestamps_enabled
-        from gateway.run_inbound import strip_discord_triggering_note
-        persist_user_message = None
-        persist_user_timestamp = None
-        try:
-            from hermes_time import get_timezone as _get_evt_tz
-            from gateway.message_timestamps import (
-                coerce_message_timestamp as _coerce_msg_ts,
-                render_user_content_with_timestamp as _render_msg_ts,
-                strip_leading_message_timestamps as _strip_msg_ts,
-            )
-            _evt_tz = _get_evt_tz()
-            if message_text and isinstance(message_text, str):
-                _clean_message_text, _embedded_ts = _strip_msg_ts(message_text, tz=_evt_tz)
-                persist_user_message = strip_discord_triggering_note(event, _clean_message_text)
-                _event_epoch = _coerce_msg_ts(getattr(event, "timestamp", None), tz=_evt_tz)
-                persist_user_timestamp = _event_epoch if _event_epoch is not None else _embedded_ts
-                if _message_timestamps_enabled(_load_gateway_config()):
-                    message_text = _render_msg_ts(_clean_message_text, persist_user_timestamp, tz=_evt_tz)
-                else:
-                    # Toggle off: the model sees the clean message; timestamp stored for later opt-in.
-                    message_text = _clean_message_text
-        except Exception as _ts_err:
-            logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
-        return message_text, persist_user_message, persist_user_timestamp
 
     async def _hmwa_stop_typing_for_turn(self, event, source):
         """Stop the typing indicator (never raises). Slack AI status is scoped to a thread/
@@ -2108,9 +2078,8 @@ class GatewayTurnMixin:
         if message_text is None:
             return None, _session_env_tokens
 
-        message_text, persist_user_message, persist_user_timestamp = (
-            self._hmwa_apply_message_timestamp(event, message_text)
-        )
+        from gateway.typed_text import apply_message_timestamp
+        message_text, persist_user_message, persist_user_timestamp = apply_message_timestamp(event, message_text)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
@@ -2132,6 +2101,7 @@ class GatewayTurnMixin:
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
             typed_user_message=getattr(event, "_gateway_typed_user_content", None),
+            recoverable_audio_paths=getattr(event, "_gateway_recoverable_audio_paths", []),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2195,6 +2165,7 @@ class GatewayTurnMixin:
                 channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
                 typed_user_message=prepared.typed_user_message,
+                recoverable_audio_paths=prepared.recoverable_audio_paths,
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
@@ -3847,6 +3818,7 @@ class GatewayTurnMixin:
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
         next_typed_message = None
+        next_recoverable_audio_paths = []
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -3879,6 +3851,7 @@ class GatewayTurnMixin:
             if next_message is None:
                 return result
             next_typed_message = getattr(pending_event, "_gateway_typed_user_content", None)
+            next_recoverable_audio_paths = getattr(pending_event, "_gateway_recoverable_audio_paths", [])
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
             next_message_id = self._reply_anchor_for_event(pending_event)
@@ -3940,6 +3913,7 @@ class GatewayTurnMixin:
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 typed_user_message=next_typed_message,
+                recoverable_audio_paths=next_recoverable_audio_paths,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
@@ -4274,6 +4248,7 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
         typed_user_message: Optional[str] = None,
+        recoverable_audio_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4308,6 +4283,7 @@ class GatewayTurnMixin:
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
             typed_user_message=typed_user_message,
+            recoverable_audio_paths=recoverable_audio_paths,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,

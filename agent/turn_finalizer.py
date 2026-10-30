@@ -524,9 +524,14 @@ def finalize_turn(
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
     _turn_exit_reason, _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    current_turn_user_idx=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
+    # The loop's maintained index addresses this completed-turn snapshot (including any
+    # in-turn compression). Later scaffold removal / post-turn micro-compaction must not
+    # change its row addresses or discard successful tool results before memory sees them.
+    memory_messages = list(messages)
 
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
@@ -768,7 +773,8 @@ def finalize_turn(
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
+        interrupted=interrupted, messages=memory_messages,
+        current_turn_user_idx=current_turn_user_idx,
     )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
