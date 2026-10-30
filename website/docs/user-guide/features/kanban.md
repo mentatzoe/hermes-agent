@@ -325,6 +325,8 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  allow_default_assignee: false    # optional: reserve default for conversation
+  orchestrator_profile: pm         # pick an installed worker for decomposition
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile
@@ -387,6 +389,28 @@ or set `kanban.dispatch_profiles` per home to declare exactly which assignees
 that home may claim — anything else lands in the dispatcher's
 `skipped_nonspawnable` bucket instead of spawning, and no longer counts as
 spawnable work for the gateway's wake-up probe.
+
+To prevent assignment rather than merely skipping dispatch, set
+`kanban.allow_default_assignee: false` in the shared Kanban home's `config.yaml`
+(`HERMES_KANBAN_HOME`, otherwise the root Hermes home). The default is `true` for
+compatibility. The shared policy applies to every existing or future board, even
+when a named profile writes the card. Create, assign, reassign, triage fan-out and
+review handoffs reject `default` before changing the card. The dashboard returns
+a clear HTTP 400 and no longer offers that profile in its assignment picker.
+Case and surrounding whitespace do not bypass the rule. An unreadable or
+non-boolean policy fails closed for assignment to `default`.
+
+Use an installed worker for `orchestrator_profile`; decomposition falls back to
+that worker when the default profile is reserved. Leaving `default_assignee`
+empty still leaves unassigned ready cards untouched by the dispatcher. Setting
+it to a worker also enables dispatcher auto-assignment, so do not use it as a
+decomposer-only setting if a creator temporarily leaves cards unassigned while
+establishing their holds.
+
+Existing assignments and history are not rewritten. Move old worker cards
+explicitly, preserving approval holds and schedules. A running process must load
+this code before it can enforce the policy; after that it rereads the setting at
+each assignment. Direct SQLite edits are outside this application-level policy.
 
 ### Idempotent create (for automation / webhooks)
 
