@@ -2065,8 +2065,9 @@ class GatewayTurnMixin:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
 
         # Keep human text separate from skills, sender metadata, and other model context.
-        # Preserve the source before auto-load rewrites event.text; STT is added later by inbound prep.
-        event._gateway_typed_source_text = event.text or ""
+        # Preserve the source before auto-load rewrites event.text; slash dispatch may already have saved it.
+        if not hasattr(event, "_gateway_typed_source_text"):
+            event._gateway_typed_source_text = event.text or ""
         # With no text (e.g. voice-only), retain the existing enriched-message title fallback.
         title_user_message = event.text or None
 
@@ -3845,6 +3846,7 @@ class GatewayTurnMixin:
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
+        next_typed_message = None
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -3876,6 +3878,7 @@ class GatewayTurnMixin:
             )
             if next_message is None:
                 return result
+            next_typed_message = getattr(pending_event, "_gateway_typed_user_content", None)
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
             next_message_id = self._reply_anchor_for_event(pending_event)
@@ -3936,6 +3939,7 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
+                typed_user_message=next_typed_message,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,

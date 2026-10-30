@@ -1168,6 +1168,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Rewrite ``/<bundle>`` / ``/<skill>`` invocations into the skill prompt on ``event.text``;
         returns a reply string when the command is disabled/unknown/failed, else None.
         resolve_skill_command_key() handles the Telegram underscore/hyphen round-trip (/claude_code)."""
+        if not hasattr(event, "_gateway_typed_source_text"):
+            event._gateway_typed_source_text = event.text or ""
         if not command or self._hm_bundle_slash_rewrite(event, source, _quick_key, command):
             return None
         try:
