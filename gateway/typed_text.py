@@ -19,7 +19,9 @@ def typed_text_for_event(event) -> str:
     if getattr(event, "internal", False):
         return ""
     parts = []
-    text = getattr(event, "text", None) or ""
+    text = getattr(event, "_gateway_typed_source_text", None)
+    if text is None:
+        text = getattr(event, "text", None) or ""
     if text.strip() and text.strip() != EMPTY_TEXT_PLACEHOLDER:
         parts.append(text)
     transcripts = getattr(event, "_gateway_typed_stt_transcripts", None)

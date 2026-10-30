@@ -2065,6 +2065,8 @@ class GatewayTurnMixin:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
 
         # Keep human text separate from skills, sender metadata, and other model context.
+        # Preserve the source before auto-load rewrites event.text; STT is added later by inbound prep.
+        event._gateway_typed_source_text = event.text or ""
         # With no text (e.g. voice-only), retain the existing enriched-message title fallback.
         title_user_message = event.text or None
 
@@ -4267,6 +4269,7 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        typed_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4300,6 +4303,7 @@ class GatewayTurnMixin:
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
+            typed_user_message=typed_user_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
