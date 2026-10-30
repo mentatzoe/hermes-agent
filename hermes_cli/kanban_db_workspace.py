@@ -86,10 +86,19 @@ def _is_terminal_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(_TERMINAL_TASK_SQL, (task_id,)).fetchone() is not None
 
 
+# A finished task keeps its directory while one of its own children is unfinished
+# (_cleanup_workspace defers for that child; this is _ACTIVE_CHILDREN_SQL correlated
+# to the outer row). Until that child finishes, the path is still in use. Without
+# this, a parent sharing a directory with such a task would sweep it away.
+_HOLDS_FOR_OPEN_CHILD_SQL = (
+    "EXISTS (SELECT 1 FROM task_links hl "
+    "JOIN tasks hc ON hc.id = hl.child_id "
+    f"WHERE hl.parent_id = tasks.id AND hc.status NOT IN {_TERMINAL_STATUSES_SQL})"
+)
 _OTHER_LIVE_PATHS_SQL = (
     "SELECT workspace_path FROM tasks "
     "WHERE id != ? AND workspace_path IS NOT NULL "
-    f"AND status NOT IN {_TERMINAL_STATUSES_SQL}"
+    f"AND (status NOT IN {_TERMINAL_STATUSES_SQL} OR {_HOLDS_FOR_OPEN_CHILD_SQL})"
 )
 # Sibling boards mint their own ids, so the id being cleaned up here can
 # name a different live task there. Do not exclude it.
@@ -170,7 +179,9 @@ def _workspace_in_use_by_other(
 
     ``gc``, completion and deferred parent cleanup used to ``rmtree`` a shared
     ``workspace_path`` as soon as one of its tasks went terminal. Compare the
-    resolved path: a row may store ``~`` or a symlinked spelling.
+    resolved path: a row may store ``~`` or a symlinked spelling. A task that
+    has finished but still has an unfinished child keeps its directory for that
+    child, so it counts as using the path too.
 
     The connection covers one board. A ready task on a named board can point
     at the same directory. If that set of databases cannot be read, refuse
@@ -217,7 +228,7 @@ def _defer_shared_workspace_cleanup(
     if reason == "shared":
         _kb._log.warning(
             "Deferring workspace cleanup for task %s: %s is still used by "
-            "another non-terminal task",
+            "another task (unfinished, or finished with an unfinished child)",
             task_id, path,
         )
     else:
@@ -385,6 +396,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
+            # This task keeps its own workspace, but its parent may have been
+            # waiting only for this task to finish (aleph-vault#284).
+            _try_cleanup_parent_workspaces(conn, task_id)
             return
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
