@@ -109,6 +109,22 @@ def test_kanban_guidance_fallback_requires_owned_worker_task(monkeypatch, task_i
         assert (_tool_guidance_block(agent) == KANBAN_GUIDANCE) is expected
 
 
+def test_worker_guidance_selects_pr_contract_by_required_checks(monkeypatch):
+    from agent.system_prompt import _tool_guidance_block
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    agent = _make_agent(valid_tool_names={"kanban_show"})
+    delattr(agent, "_kanban_worker_guidance")
+
+    guidance = _tool_guidance_block(agent)
+    assert "only after verifying" in guidance
+    assert "target branch has repository-required checks" in guidance
+    assert "without required checks, keep PR cards `local-only`" in guidance
+    assert "verified merge commit and tree in the result" in guidance
+    assert "metadata.published_pr" in guidance
+    assert "repository-required exact-head CI passes" in guidance
+
+
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("names", [
     set(), {"memory"}, {"memory", "skill_view", "skills_list"},

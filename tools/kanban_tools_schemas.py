@@ -503,8 +503,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "work. Defaults to false (classic single-shot worker)."
         )),
         "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
+            "Declare at creation: local-only (default). Use OWNER/REPO or an exact GitHub PR URL "
+            "only after verifying that the PR's target branch has repository-required checks. "
+            "For repositories without required checks, keep PR cards local-only and record the "
+            "verified merge commit and tree in the result. PR contracts cannot complete until "
+            "repository-required exact-head CI passes; on publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
