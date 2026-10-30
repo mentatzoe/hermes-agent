@@ -201,9 +201,8 @@ def _length_differs_from_declared_size(db_file: Path) -> bool:
     database file cancels every POSIX lock this process holds on it, so a SQLite
     connection of ours to the same board would silently lose its protection
     (``sqlite_safe_read`` explains why). When this process has a tracked connection to
-    the file, the guard refuses and this function raises. Call it before the scan opens
-    its own connection, never while one is open; ``_other_board_uses_path`` explains the
-    order.
+    the file, the guard refuses and this function raises. Call it only while none of our
+    own connections to the file is open; ``_other_board_uses_path`` explains the order.
     """
     try:
         with offline_file_access(db_file, what="read the header of"):
@@ -229,9 +228,9 @@ def _length_differs_from_declared_size(db_file: Path) -> bool:
 def _extent_problem(db_file: Path) -> Optional[Exception]:
     """Why the main file's header cannot vouch for the file, or None when it can.
 
-    Returns the error instead of raising it: the caller reads the header before it
-    opens its own connection, and only needs the answer if the schema turns out to be
-    empty (see ``_other_board_uses_path``).
+    Returns the error instead of raising it, so that the caller can read the header
+    while none of its connections is open and decide afterwards what the answer means
+    (see ``_other_board_uses_path``).
     """
     try:
         differs = _length_differs_from_declared_size(db_file)
@@ -267,13 +266,12 @@ def _is_intact_empty_database(
       was smaller, or as unused space inside an oversized first page when it had
       larger pages. The file is not the length its own header says, which is what
       gives it away, so a file that reads as empty must also be exactly that long.
-      *extent_problem* is that answer (``_extent_problem``), taken before *conn* was
-      opened because the header cannot be read once a connection of ours exists.
+      *extent_problem* is that answer (``_extent_problem``), read while none of our
+      connections to the file was open, because the header cannot be read raw while
+      one is.
 
     Only a file that reads as empty is refused on the header's account or pays for
-    ``quick_check``. For a file with tables *extent_problem* is ignored, so the header
-    read that every sibling now pays for (a hundred bytes) never changes how a board is
-    read.
+    ``quick_check``. For a file with tables *extent_problem* is ignored.
 
     Returns False for a file with schema objects. Raises ``sqlite3.Error`` (or the
     ``OSError`` that stopped the header read) for a file SQLite cannot read, for one
@@ -296,23 +294,24 @@ def _is_intact_empty_database(
 def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     """Whether the board database *db_file* has a live task on the workspace *key*.
 
-    The order of the first three steps is what keeps SQLite's locks intact. A bare
-    ``open()`` and ``close()`` of a database file cancels every POSIX lock this
-    process holds on it, so a raw read must never run while a connection of ours to
-    the same file is in the middle of a read (``sqlite_safe_read`` explains why).
+    A bare ``open()`` and ``close()`` of a database file cancels every POSIX lock this
+    process holds on it, whoever holds it (``sqlite_safe_read`` explains why). So the
+    header is read raw only for a file with no tables, and only while no connection of
+    ours is open on it.
 
-    1. Read the header, before this scan has a connection. If another connection of
-       this process is registered on the file, the guard refuses and the refusal is
-       kept for later instead of raised.
-    2. Open the connection with ``connect_tracked``, so that an overlapping scan of
-       the same file, on another thread, is refused in its turn instead of cancelling
-       the locks of this one. Opening it before step 1 would make the guard refuse
-       every empty sibling and bring back the symptom of #283.
-    3. Look at the schema. A board with tables goes through the ordinary query and
-       the header result is not used, so a board that this process (the gateway, for
-       one) keeps open still reports its live tasks. Only a file with no tables
-       needs the header result, and then the refusal or the length mismatch makes it
-       "cannot tell".
+    1. Open a tracked connection and look at the schema. A board with tables is read
+       the ordinary way and nothing is read raw, so a board that this process keeps
+       open (the gateway does), or that other code reads without registering, keeps
+       its locks.
+    2. A file with no tables: close that connection and read the header. The guard
+       refuses while any registered connection to the file is open, a second scan's
+       for one, and the refusal counts against the file. Reading before the first
+       connection would touch every sibling. Reading with it open would make the
+       guard refuse every empty sibling and bring back the symptom of #283.
+    3. Open a tracked connection again and look at the schema again, in case tables
+       were added in the meantime, then run the integrity check. The connection is
+       registered, so a scan on another thread is refused its header read for as long
+       as this one is reading.
 
     The statements run in autocommit mode, so SQLite holds its read lock only while
     one of them runs. Like the scan the base had, the answer describes the board at
@@ -320,8 +319,15 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     Closing that gap would take a lock held until the directory is gone, which is a
     larger change than this scan.
     """
-    extent_problem = _extent_problem(db_file)
     uri = db_file.as_uri() + "?mode=ro"
+    other = connect_tracked(uri, uri=True, timeout=1.0)
+    try:
+        other.row_factory = sqlite3.Row
+        if other.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None:
+            return _conn_uses_path(other, task_id, key, exclude_task_id=False)
+    finally:
+        other.close()
+    extent_problem = _extent_problem(db_file)
     other = connect_tracked(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row

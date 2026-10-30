@@ -16,10 +16,11 @@ it declares). A file that cannot be read at all (damaged, not a database, locked
 unfamiliar tables still blocks removal.
 
 The scan must also leave SQLite's own locks alone. A plain ``open()`` and ``close()`` of a database
-file cancels every lock this process holds on it, so a header read that runs while a connection of
-ours is in the middle of a read lets a writer in another process commit under that read. The scan
-reads the header before it opens its own connection and opens that connection tracked, so a second
-scan of the same file refuses its header read instead of running it.
+file cancels every lock this process holds on it, whoever holds it, so a header read that runs while
+a connection of ours is in the middle of a read lets a writer in another process commit under that
+read. The scan reads the header only for a file with no tables, and only while it has no connection
+of its own to that file. Its connections are registered, so a second scan of the same file refuses
+its header read instead of running it, and a board with tables is read through SQLite alone.
 """
 
 from __future__ import annotations
@@ -965,24 +966,29 @@ def _write_emptied_database_in_journal_mode(journal_mode: str):
     return write
 
 
+_SCHEMA_LOOK = "SELECT 1 FROM sqlite_master LIMIT 1"
+_INTEGRITY_CHECK = "PRAGMA quick_check(1)"
+
+
 @contextlib.contextmanager
-def _scan_stopped_inside_its_integrity_check(monkeypatch: pytest.MonkeyPatch, run):
-    """Run *run* on another thread and hold it inside ``PRAGMA quick_check`` of a sibling board.
+def _scan_stopped_inside(monkeypatch: pytest.MonkeyPatch, run, statement: str):
+    """Run *run* on another thread and hold it inside *statement*, the first time a scan runs it.
 
     The stop is a SQLite progress handler on the connection that scan opens, so the scan's own code
-    runs up to the integrity check and SQLite itself holds the read lock. The connection is
-    changed where ``sqlite3.connect`` is called, which the scan reaches directly or through
-    ``connect_tracked``, so the stop works whichever of the two opens it. Yields a dict that gets
-    ``scan`` (what *run* returned) or ``error`` once the scan is let go again.
+    runs up to *statement* and SQLite itself holds the read lock. The connection is changed where
+    ``sqlite3.connect`` is called, which the scan reaches directly or through ``connect_tracked``,
+    so the stop works whichever of the two opens it. A scan that looks at the schema of an empty
+    file twice (once on each of its two connections) is stopped on the first look only. Yields a
+    dict that gets ``scan`` (what *run* returned) or ``error`` once the scan is let go again.
     """
     inside, resume = threading.Event(), threading.Event()
     outcome: dict[str, object] = {}
-    scan_thread = "scan-stopped-inside-its-integrity-check"
+    scan_thread = "scan-stopped-inside-a-statement"
     real_connect = sqlite3.connect
 
     class StoppingConnection(sqlite3.Connection):
         def execute(self, sql, *args):
-            if sql == "PRAGMA quick_check(1)":
+            if sql == statement and not inside.is_set():
                 stopped: list[bool] = []
 
                 def stop():
@@ -1019,7 +1025,7 @@ def _scan_stopped_inside_its_integrity_check(monkeypatch: pytest.MonkeyPatch, ru
         deadline = time.monotonic() + 60
         while not inside.wait(0.05) and thread.is_alive() and time.monotonic() < deadline:
             pass
-        assert inside.is_set(), f"the scan did not reach its integrity check: {outcome}"
+        assert inside.is_set(), f"the scan did not reach {statement!r}: {outcome}"
         yield outcome
     finally:
         resume.set()
@@ -1032,16 +1038,21 @@ def _scan_stopped_inside_its_integrity_check(monkeypatch: pytest.MonkeyPatch, ru
     "journal_mode",
     [pytest.param("DELETE", id="rollback-journal"), pytest.param("WAL", id="write-ahead-log")],
 )
+@pytest.mark.parametrize(
+    "statement",
+    [pytest.param(_SCHEMA_LOOK, id="first-look-at-the-schema"), pytest.param(_INTEGRITY_CHECK, id="integrity-check")],
+)
 def test_a_second_scan_of_the_same_file_leaves_the_first_scans_read_lock_in_place(
-    kanban_home, monkeypatch, journal_mode
+    kanban_home, monkeypatch, journal_mode, statement
 ):
-    """Scan one is stopped inside its integrity check, holding SQLite's read lock on the sibling.
-    Scan two reads the same file. The length check reads the header with a plain ``open()`` and
-    ``close()``, and closing any descriptor of a file cancels every POSIX lock this process holds on
-    it. When scan one's connection was not registered, scan two's read went ahead and cancelled the
-    lock under scan one, so a writer in another process could commit in the middle of its read.
-    Scan one's connection is registered now, so scan two's header read is refused instead and scan
-    two counts the file as unreadable.
+    """Scan one is stopped inside a statement, holding SQLite's read lock on the sibling: either its
+    first look at the schema, on the connection it opens first, or its integrity check, on the one it
+    opens after reading the header. Scan two reads the same file. The length check reads the header
+    with a plain ``open()`` and ``close()``, and closing any descriptor of a file cancels every POSIX
+    lock this process holds on it. If either of scan one's connections were not registered, scan
+    two's read would go ahead and cancel the lock under scan one, and a writer in another process
+    could commit in the middle of its read. Both are registered, so scan two's header read is refused
+    instead and scan two counts the file as unreadable.
     """
     db = _plant(_write_emptied_database_in_journal_mode(journal_mode))
     with kbc.connect_closing() as conn:
@@ -1051,10 +1062,10 @@ def test_a_second_scan_of_the_same_file_leaves_the_first_scans_read_lock_in_plac
             with kbc.connect_closing() as other_thread_conn:
                 return kbw._workspace_in_use_by_other(other_thread_conn, tid, ws)
 
-        with _scan_stopped_inside_its_integrity_check(monkeypatch, first_scan) as first:
+        with _scan_stopped_inside(monkeypatch, first_scan, statement) as first:
             assert _other_process("read-lock", db) == "held", (
-                "scan one should hold SQLite's read lock inside its integrity check; "
-                "its own header read must not have cancelled it"
+                "scan one should hold SQLite's read lock inside the statement; "
+                "nothing before it may have cancelled it"
             )
             second = kbw._workspace_in_use_by_other(conn, tid, ws)
             assert _other_process("read-lock", db) == "held", "scan two cancelled scan one's read lock"
@@ -1083,7 +1094,7 @@ def test_completion_does_not_delete_a_workspace_that_a_sibling_commits_a_task_fo
             with kbc.connect_closing() as other_thread_conn:
                 return kb.complete_task(other_thread_conn, tid, summary="done")
 
-        with _scan_stopped_inside_its_integrity_check(monkeypatch, complete) as completion:
+        with _scan_stopped_inside(monkeypatch, complete, _INTEGRITY_CHECK) as completion:
             second = kbw._workspace_in_use_by_other(conn, tid, ws)
             attempt = _other_process("share", db, ws)
             assert attempt.startswith("refused"), (attempt, second)
@@ -1095,9 +1106,9 @@ def test_completion_does_not_delete_a_workspace_that_a_sibling_commits_a_task_fo
 
 
 def test_populated_sibling_that_this_process_keeps_open_still_reports_its_live_task(kanban_home):
-    """The refusal of a header read matters only for a file with no tables. A process that keeps a
-    board open (the gateway does) has it registered, so the guard refuses to read its header; the
-    task rows are read the ordinary way and a live task there still protects the directory.
+    """A board with tables is read through SQLite alone. A process that keeps a board open (the
+    gateway does) has it registered, so the guard would refuse to read its header; the scan never
+    asks, reads the task rows the ordinary way, and a live task there still protects the directory.
     """
     with kbc.connect_closing() as conn:
         tid, ws = _running_scratch_task(conn)
@@ -1108,6 +1119,76 @@ def test_populated_sibling_that_this_process_keeps_open_still_reports_its_live_t
             assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
         finally:
             held.close()
+
+
+def _in_write_ahead_log_mode(db: Path) -> None:
+    with contextlib.closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].upper() == "WAL"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(
+    "journal_mode",
+    [pytest.param("DELETE", id="rollback-journal"), pytest.param("WAL", id="write-ahead-log")],
+)
+def test_a_reader_the_process_does_not_register_keeps_its_read_lock_while_a_populated_sibling_is_scanned(
+    kanban_home, journal_mode
+):
+    """Other code in this process reads board files without registering the connection: the count of
+    notification subscriptions, the claim check of a worker's turn recovery, and the read-only
+    connect for a fenced child. The guard cannot see such a reader, and a plain ``open()`` and
+    ``close()`` of the file cancels the lock it holds. So the scan must not read the header of a
+    board that has tables. Here an unregistered reader is in the middle of a statement on a populated
+    sibling while the scan runs; its lock is still held afterwards, and in rollback-journal mode a
+    writer in another process is still kept out.
+    """
+    with kbc.connect_closing() as conn:
+        tid, ws = _running_scratch_task(conn)
+        db = _board_with_live_sharer("minimal", ws)
+        if journal_mode == "WAL":
+            _in_write_ahead_log_mode(db)
+        reader = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+        try:
+            # Keep the cursor: SQLite holds the read lock only while the statement is alive, and
+            # CPython finalises it as soon as the cursor is collected.
+            statement = reader.execute("SELECT * FROM tasks")
+            assert statement.fetchone() is not None
+            assert not has_live_connection(db)
+            assert _other_process("read-lock", db) == "held"
+            assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
+            assert _other_process("read-lock", db) == "held", "the scan cancelled the reader's read lock"
+            if journal_mode == "DELETE":
+                assert _other_process("write", db).startswith("refused"), "a writer got in under the reader"
+        finally:
+            reader.close()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(
+    "journal_mode",
+    [pytest.param("DELETE", id="rollback-journal"), pytest.param("WAL", id="write-ahead-log")],
+)
+def test_tables_added_while_the_scan_reads_the_header_are_not_missed(kanban_home, monkeypatch, journal_mode):
+    """The scan looks at the schema of an empty file twice: on a connection it closes before it reads
+    the header, and again on the connection that goes on to the integrity check. A separate process
+    gives the file a running task in between, while the scan has no connection open. The second look
+    sees the table, so the file is read as a board and the directory is kept. A scan that trusted its
+    first look would find the file intact and let the directory go.
+    """
+    db = _plant(_write_emptied_database_in_journal_mode(journal_mode))
+    read_header = kbw._extent_problem
+    with kbc.connect_closing() as conn:
+        tid, ws = _finished_scratch_task(conn)
+
+        def read_header_then_let_another_process_commit(db_file):
+            problem = read_header(db_file)
+            assert not has_live_connection(db_file)
+            assert _other_process("share", db_file, ws) == "committed"
+            return problem
+
+        monkeypatch.setattr(kbw, "_extent_problem", read_header_then_let_another_process_commit)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
+    assert not has_live_connection(db)
 
 
 @pytest.mark.parametrize(
@@ -1122,12 +1203,14 @@ def test_populated_sibling_that_this_process_keeps_open_still_reports_its_live_t
 def test_a_header_that_cannot_be_read_matters_only_for_a_file_with_no_tables(
     kanban_home, monkeypatch, failure, kind, expected
 ):
-    """The header is read before the scan knows whether the file has tables. A failed read is kept and
-    held against the file only when the file turns out to hold none, because only then is the header
-    all there is to vouch for it.
+    """The header is read for a file with no tables, and for no other. A read that fails counts
+    against that file, because the header is all there is to vouch for it. A board with tables is
+    never asked, so the same failure cannot touch it.
     """
+    asked: list[Path] = []
 
     def cannot_read(db_file):
+        asked.append(db_file)
         raise failure
 
     monkeypatch.setattr(kbw, "_length_differs_from_declared_size", cannot_read)
@@ -1138,6 +1221,7 @@ def test_a_header_that_cannot_be_read_matters_only_for_a_file_with_no_tables(
         else:
             _plant(_write_incident_stub)
         assert kbw._workspace_in_use_by_other(conn, tid, ws) == expected
+    assert len(asked) == (0 if kind == "populated" else 1)
 
 
 # ---------------------------------------------------------------------------
