@@ -27,6 +27,20 @@ def authored_turn_kwargs(run_conversation, ctx):
     return {key: value for key, value in fields.items() if _accepts_keyword(run_conversation, key)}
 
 
+def authored_steer_kwargs(verb, event):
+    """Keep busy-event sender facts out of rendered text; older agents accept text only."""
+    from agent.interrupt_compat import _accepts_keyword
+    if event is None or not _accepts_keyword(verb, "facts"):
+        return {}
+    internal = getattr(event, "internal", False)
+    return {"facts": {
+        "sender_id": None if internal else (event.source.user_id or None),
+        "typed_user_content": typed_text_for_event(event),
+        "recoverable_audio_paths": [] if internal else list(
+            getattr(event, "_gateway_recoverable_audio_paths", None) or []),
+    }}
+
+
 def typed_text_for_event(event) -> str:
     """Return only words the sender wrote or spoke, never gateway scaffolding.
 

@@ -3738,21 +3738,13 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     return context
 
 
-def _requeue_pending_steer(agent, steer_text: str) -> None:
-    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
-    # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
-    # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
-    # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+def _requeue_pending_steer(agent, steer_text) -> None:
+    """Return drained entries ahead of any newer calls, without losing sender facts."""
+    from agent.interrupt_control import _ic_lock, _ic_slot
+    entries = [{"text": steer_text}] if isinstance(steer_text, str) else steer_text
+    with _ic_lock(agent, "_pending_steer_lock"):
+        existing = _ic_slot(agent, "_pending_steer_lock", "_pending_steer")
+        agent._pending_steer = entries + (existing or [])
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -3777,8 +3769,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
-    if not steer_text:
+    entries = agent._drain_pending_steer(with_entries=True)
+    if not entries:
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
@@ -3787,9 +3779,12 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # requeue so the fallback path delivers it as a normal next-turn
         # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        _requeue_pending_steer(agent, entries)
         return
-    messages.append(steer_user_row(steer_text))
+    from agent.steer_facts import delivered_steer_row
+    row = delivered_steer_row(agent, entries)
+    messages.append(row)
+    steer_text = row["content"]
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

@@ -746,9 +746,8 @@ def finalize_turn(
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+    from agent.steer_facts import handoff_pending_steer
+    handoff_pending_steer(agent, result)
     agent._response_was_previewed = False
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:

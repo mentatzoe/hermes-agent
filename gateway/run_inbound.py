@@ -1710,6 +1710,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         follow-up paths so attribution, image enrichment, STT, document notes, reply context and
         @ references behave the same. Side effect: buffers per-session native image paths when the
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
+        from gateway.steer_followup import prepare_steer_followup
+        if prepare_steer_followup(event):
+            return event.text
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         if not _pending_stt_prepared:

@@ -2157,6 +2157,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from gateway.steer_followup import steer_followup_metadata
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2172,7 +2173,8 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
-                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event),
+                    **steer_followup_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -3633,8 +3635,12 @@ class GatewayTurnMixin:
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
         if leftover_steer:
+            from gateway.steer_followup import steer_followup_event
+            entries = result.get("pending_steer_entries")
+            steer_event = steer_followup_event(self, session_key, source, leftover_steer, entries) if entries else None
             if not pending and not pending_event:
                 pending = leftover_steer
+                pending_event = steer_event
                 logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
             elif pending_event and adapter and session_key:
                 # User steered during the turn, but a background event or queued message arrived.
@@ -3653,22 +3659,16 @@ class GatewayTurnMixin:
                         overflow.insert(0, pending_event)
                     else:
                         self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
-                pending_event = None
+                pending_event = steer_event
                 pending = leftover_steer
                 logger.debug(
                     "Delivering leftover /steer before queued event for session %s: '%s...'",
                     session_key, pending[:40],
                 )
             elif pending and not pending_event:
-                from gateway.platforms.base import MessageEvent
                 # A deferred steer continues the active channel context, just like an
                 # eventless follow-up. Reuse its pins without marking the user as internal.
-                steer_prompt, steer_source = self._pinned_channel_inputs(
-                    session_key, None, source, internal=True,
-                )
-                steer_event = MessageEvent(
-                    text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
-                )
+                steer_event = steer_event or steer_followup_event(self, session_key, source, leftover_steer)
                 if session_key:
                     self._enqueue_fifo(session_key, steer_event, adapter)
                 logger.debug(
@@ -3780,6 +3780,7 @@ class GatewayTurnMixin:
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
         from gateway.run import _preserve_queued_followup_history_offset
+        from gateway.steer_followup import steer_followup_metadata
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
         )
@@ -3918,7 +3919,8 @@ class GatewayTurnMixin:
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
-                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
+                    **steer_followup_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(

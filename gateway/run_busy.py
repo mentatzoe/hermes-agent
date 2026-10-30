@@ -318,10 +318,9 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
-        """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
+    def _steer_running_agent(self, running_agent: Any, text: str, **kwargs) -> bool:
+        """Send facts to the parent; fan-out to active subagents stays text-only."""
+        accepted = bool(running_agent.steer(text, **kwargs))
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -684,10 +683,13 @@ class GatewayBusySessionMixin:
     ) -> bool:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
+            from gateway.typed_text import authored_steer_kwargs
             call_text = self._steer_text_with_origin(text, event) if event else text
+            method = getattr(running_agent, verb)
+            kwargs = authored_steer_kwargs(method, event)
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                return self._steer_running_agent(running_agent, call_text, **kwargs)
+            return bool(method(call_text, **kwargs))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False

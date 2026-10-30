@@ -201,7 +201,7 @@ class TestActiveTurnRedirect:
 
         assert agent.redirect("also check migrations") is True
         assert agent._pending_redirect is None
-        assert agent._pending_steer == "also check migrations"
+        assert agent._pending_steer == [{"text": "also check migrations"}]
         assert agent._interrupt_requested is False
 
 
@@ -544,7 +544,7 @@ class TestSteerClearedOnInterrupt:
 
         agent.steer("will be dropped")
         agent._pending_redirect = "also drop this"
-        assert agent._pending_steer == "will be dropped"
+        assert agent._pending_steer == [{"text": "will be dropped"}]
 
         agent.clear_interrupt(hard_cancel=True)
         assert agent._pending_steer is None
@@ -568,13 +568,13 @@ class TestSteerClearedOnInterrupt:
         agent._pending_redirect = "correction"
 
         agent.clear_interrupt(preserve_redirect=True)
-        assert agent._pending_steer == "must survive the rebuild"
+        assert agent._pending_steer == [{"text": "must survive the rebuild"}]
         # preserve_redirect semantics unchanged: the correction survives too.
         assert agent._pending_redirect == "correction"
 
         # A plain soft clear (no flags) preserves the steer as well.
         agent.clear_interrupt()
-        assert agent._pending_steer == "must survive the rebuild"
+        assert agent._pending_steer == [{"text": "must survive the rebuild"}]
         assert agent._pending_redirect is None
 
 

@@ -4,6 +4,7 @@ Soft/hard interrupt requests, tool-thread interrupt propagation, pending steer/r
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
 import contextlib
+from copy import deepcopy
 import logging
 import threading
 from typing import Optional
@@ -264,20 +265,23 @@ class InterruptControlMixin:
                 self._pending_steer = None
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, facts: Optional[dict] = None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        interrupt). Keep each call's sender facts beside its unchanged model text."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        entry = {"text": cleaned}
+        if facts is not None:
+            entry["facts"] = deepcopy(facts)
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            self._pending_steer = (existing or []) + [entry]
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
         return True
 
-    def redirect(self, text: str) -> bool:
+    def redirect(self, text: str, *, facts: Optional[dict] = None) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
@@ -305,7 +309,7 @@ class InterruptControlMixin:
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = self.steer(cleaned)
+            accepted = self.steer(cleaned, **({"facts": facts} if facts is not None else {}))
             if accepted:
                 tracker = getattr(self, "_tool_worker_threads", None)
                 tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
@@ -352,9 +356,11 @@ class InterruptControlMixin:
             self._pending_redirect = None
         return text
 
-    def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot; None when nothing is pending."""
+    def _drain_pending_steer(self, *, with_entries: bool = False):
+        """Drain entries for transcript delivery, or text for legacy surface handoffs."""
         with _ic_lock(self, "_pending_steer_lock"):
-            text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            entries = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = None
-        return text
+        if with_entries or not entries:
+            return entries
+        return "\n".join(entry["text"] for entry in entries)
