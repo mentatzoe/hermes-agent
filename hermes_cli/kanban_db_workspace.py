@@ -579,8 +579,10 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 if row["workspace_kind"] in _REMOVABLE_KINDS and row["workspace_path"]:
                     _remove_finished_parent_workspace(conn, parent_id, row)
                 frontier.append(parent_id)
-    except Exception:
-        pass  # best-effort
+    except Exception:  # health: allow BLE001 -- cleanup is best effort and must never block completion; the traceback is logged
+        # A silent failure here is how a finished parent's directory stays on disk
+        # (aleph-vault#284), so the traceback goes to the log.
+        _kb._log.warning("Parent workspace sweep from task %s failed", task_id, exc_info=True)
 
 
 def _remove_finished_parent_workspace(
