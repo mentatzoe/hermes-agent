@@ -18,7 +18,9 @@ unfinished child, and a directory several tasks share exists while any of them n
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -196,7 +198,7 @@ def _orders(edges):
 def _sharing(edges, mode):
     """Which tasks use one directory. A decomposed child inherits its parent's path verbatim."""
     names = _names(edges)
-    if mode == "none":
+    if mode in ("none", "nested"):
         return set()
     if mode == "pair":
         return set(edges[0])
@@ -207,7 +209,7 @@ CASES = [
     pytest.param(edges, order, share, id=f"{graph}-{'.'.join(order)}-share_{share}")
     for graph, edges in GRAPHS.items()
     for order in _orders(edges)
-    for share in ("none", "pair", "all")
+    for share in ("none", "pair", "all", "nested")
 ]
 
 
@@ -215,10 +217,16 @@ CASES = [
 def test_a_directory_exists_exactly_while_something_needs_it(
     kanban_home: Path, edges, order, share
 ) -> None:
-    """After every completion: a task's directory exists while the task is unfinished or has an
-    unfinished child; a directory shared by several tasks exists while any of them needs it."""
+    """After every completion: a directory exists while a task that needs it keeps its files at or
+    below it. A task needs its directory while it is unfinished or has an unfinished child.
+
+    Modes: "none" gives every task its own directory, "pair" and "all" make some tasks share one,
+    and "nested" puts each task's directory inside its first parent's (an explicit child path)."""
     names = _names(edges)
     children = {n: [c for p, c in edges if p == n] for n in names}
+    first_parent: dict[str, str] = {}
+    for parent, child in edges:
+        first_parent.setdefault(child, parent)
     sharers = _sharing(edges, share)
     with kbc.connect_closing() as conn:
         ids = {n: kb.create_task(conn, title=n) for n in names}
@@ -231,6 +239,12 @@ def test_a_directory_exists_exactly_while_something_needs_it(
                 shared_dir.mkdir(parents=True, exist_ok=True)
                 kbw.set_workspace_path(conn, ids[n], shared_dir)
                 dirs[n] = shared_dir
+            elif share == "nested" and n in first_parent:
+                nested = dirs[first_parent[n]] / ids[n]
+                nested.mkdir(parents=True)
+                (nested / "handoff.txt").write_text(n, encoding="utf-8")
+                kbw.set_workspace_path(conn, ids[n], nested)
+                dirs[n] = nested
             else:
                 dirs[n] = _bind_scratch(conn, ids[n])
 
@@ -240,7 +254,14 @@ def test_a_directory_exists_exactly_while_something_needs_it(
             return n not in finished or any(c not in finished for c in children[n])
 
         def expected() -> dict[str, bool]:
-            return {n: any(needed(m) for m in names if dirs[m] == dirs[n]) for n in names}
+            return {
+                n: any(
+                    needed(m)
+                    for m in names
+                    if dirs[m] == dirs[n] or dirs[n] in dirs[m].parents
+                )
+                for n in names
+            }
 
         def actual() -> dict[str, bool]:
             return {n: dirs[n].is_dir() for n in names}
@@ -320,3 +341,117 @@ def test_parent_sweep_leaves_a_directory_shared_with_a_task_that_holds_it_for_it
         assert kb.complete_task(conn, grandchild, summary="grandchild done")
         assert not shared.exists()
         assert not grandchild_ws.exists()
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (PR 51): sibling boards, nested directories, whole-component paths
+# ---------------------------------------------------------------------------
+
+
+def _bind_path(conn, task_id: str, path: Path) -> Path:
+    """Give a task an explicit directory with a handoff file in it."""
+    path.mkdir(parents=True, exist_ok=True)
+    kbw.set_workspace_path(conn, task_id, path)
+    (path / "handoff.txt").write_text(task_id, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("holder_finishes", ["complete", "archive"])
+def test_parent_sweep_leaves_a_directory_a_sibling_board_holds_for_its_open_child(
+    kanban_home: Path, holder_finishes: str
+) -> None:
+    """Another board's finished card names the parent's directory and keeps it for its own open
+    child. The sweep must read that board with the same rule as this one."""
+    kb.create_board("other")
+    with kbc.connect_closing() as conn, kbc.connect_closing(board="other") as other:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        grandchild = kb.create_task(conn, title="grandchild", parents=[child])
+        parent_ws = _bind_scratch(conn, parent)
+        child_ws = _bind_scratch(conn, child)
+        grandchild_ws = _bind_scratch(conn, grandchild)
+
+        holder = kb.create_task(other, title="holder on another board", workspace_path=str(parent_ws))
+        holder_child = kb.create_task(other, title="its open child", parents=[holder])
+        holder_child_ws = _bind_path(other, holder_child, kb.workspaces_root(board="other") / holder_child)
+        if holder_finishes == "complete":
+            assert kb.complete_task(other, holder, summary="handoff stays for the child")
+        else:
+            assert kb.archive_task(other, holder)
+
+        assert kb.complete_task(conn, parent, summary="parent done")
+        assert kb.complete_task(conn, child, summary="child done, its own child is open")
+        assert kb.get_task(other, holder_child).status != "done"
+        assert (parent_ws / "handoff.txt").is_file(), "the sweep removed what the other board's card holds"
+        assert child_ws.is_dir() and grandchild_ws.is_dir() and holder_child_ws.is_dir()
+
+        # Once the other board's child finishes, nothing needs the directory any more.
+        assert kb.complete_task(other, holder_child, summary="done")
+        assert kb.complete_task(conn, grandchild, summary="grandchild done")
+        assert not parent_ws.exists()
+
+
+@pytest.mark.parametrize("child_finishes", ["complete", "archive"])
+def test_parent_sweep_leaves_a_child_directory_nested_inside_it(
+    kanban_home: Path, child_finishes: str
+) -> None:
+    """The child's directory sits inside the parent's. Removing the parent removes the child's
+    handoff files, so the parent stays until the child needs nothing, then goes with it."""
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        grandchild = kb.create_task(conn, title="grandchild", parents=[child])
+        parent_ws = _bind_scratch(conn, parent)
+        child_ws = _bind_path(conn, child, parent_ws / "child")
+        grandchild_ws = _bind_scratch(conn, grandchild)
+
+        assert kb.complete_task(conn, parent, summary="parent done")
+        if child_finishes == "complete":
+            assert kb.complete_task(conn, child, summary="child done")
+        else:
+            assert kb.archive_task(conn, child)
+        assert kb.get_task(conn, grandchild).status != "done"
+        assert (child_ws / "handoff.txt").is_file(), "the sweep removed the child's handoff with the parent"
+        assert parent_ws.is_dir() and grandchild_ws.is_dir()
+
+        assert kb.complete_task(conn, grandchild, summary="grandchild done")
+        assert not grandchild_ws.exists()
+        assert not child_ws.exists()
+        assert not parent_ws.exists(), "nothing came back for the parent once the last hold was released"
+
+
+def test_a_directory_whose_name_extends_another_is_not_inside_it(kanban_home: Path) -> None:
+    """``abcd`` is not under ``abc``. Only whole path components count as nesting."""
+    with kbc.connect_closing() as conn:
+        owner = kb.create_task(conn, title="owner")
+        neighbour = kb.create_task(conn, title="neighbour, still unfinished")
+        root = kb.workspaces_root()
+        owner_ws = _bind_path(conn, owner, root / "abc")
+        neighbour_ws = _bind_path(conn, neighbour, root / "abcd")
+
+        assert kb.complete_task(conn, owner, summary="owner done")
+        assert not owner_ws.exists()
+        assert neighbour_ws.is_dir()
+
+
+def test_a_sibling_board_without_links_that_names_the_directory_fails_closed(kanban_home: Path) -> None:
+    """A finished card on a board whose links cannot be read might be holding the directory for a
+    child. Refuse the delete rather than guess. A board that does not name the directory is not
+    asked about links at all."""
+    with kbc.connect_closing() as conn:
+        owner = kb.create_task(conn, title="owner")
+        owner_ws = _bind_scratch(conn, owner)
+        board = kb.boards_root() / "no-links" / "kanban.db"
+        board.parent.mkdir(parents=True)
+        with contextlib.closing(sqlite3.connect(board)) as sibling:
+            sibling.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, workspace_path TEXT)")
+            sibling.execute("INSERT INTO tasks VALUES ('t_elsewhere', 'done', '/somewhere/else')")
+            sibling.commit()
+        assert kbw._workspace_in_use_by_other(conn, owner, owner_ws) is None
+
+        with contextlib.closing(sqlite3.connect(board)) as sibling:
+            sibling.execute("INSERT INTO tasks VALUES ('t_names_it', 'done', ?)", (str(owner_ws),))
+            sibling.commit()
+        assert kbw._workspace_in_use_by_other(conn, owner, owner_ws) == "unknown"
+        assert kb.complete_task(conn, owner, summary="owner done")
+        assert (owner_ws / "handoff.txt").is_file()
