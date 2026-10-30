@@ -12,6 +12,22 @@ from typing import Any, Callable, List, Optional
 
 
 @dataclass
+class PreparedTurn:
+    """Inputs to the agent run assembled by ``_hmwa_prepare_turn``."""
+
+    history: Any
+    context_prompt: str
+    message_text: Any
+    persist_user_message: Any
+    persist_user_timestamp: Any
+    persist_user_display_kind: Optional[str]
+    persistence_session_id: Optional[str] = None
+    persistence_owner: Optional[str] = None
+    title_user_message: Optional[str] = None
+    typed_user_message: Optional[str] = None
+
+
+@dataclass
 class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
@@ -56,6 +72,7 @@ class TurnContext:
     inbound_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
     title_user_message: Optional[str] = None
+    typed_user_message: Optional[str] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.

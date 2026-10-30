@@ -650,12 +650,15 @@ class MemoryManager:
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[List[Dict[str, Any]]] = None,
-                 turn_author: Optional[Dict[str, Any]] = None) -> None:
+                 turn_author: Optional[Dict[str, Any]] = None,
+                 typed_user_content: Optional[str] = None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
-        ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
+        ``turn_author`` and the exact ``typed_user_content`` subset reach only providers whose
+        ``sync_turn`` accepts them. ``None`` means the host did not separate typed text; an empty string
+        means the turn contained no human-authored words.
 
         Everything forwarded is provider egress: turn strings AND the ``messages`` transcript slice
         (tool outputs included) go through ``_redact_for_provider`` so secrets are never archived
@@ -665,9 +668,13 @@ class MemoryManager:
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content:
             return
-        clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
-            clean_user_content, assistant_content, messages)
-        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        clean_user_content, assistant_content, redacted_messages, typed_user_content = _redact_for_provider(
+            clean_user_content, assistant_content, messages, typed_user_content)
+        optional_kwargs = {
+            "messages": redacted_messages,
+            "turn_author": turn_author,
+            "typed_user_content": typed_user_content,
+        }
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: Dict[str, Any] = {"session_id": session_id}

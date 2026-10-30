@@ -1557,6 +1557,7 @@ def _run_conversation_turn(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    typed_user_message: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
@@ -1598,6 +1599,7 @@ def _run_conversation_turn(
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
             turn_author=turn_author,
+            typed_user_message=typed_user_message,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,
@@ -1720,6 +1722,7 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    typed_user_message: Optional[str] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
 ) -> Dict[str, Any]:
@@ -1754,6 +1757,7 @@ def run_conversation(
                 persist_user_platform_id=persist_user_platform_id,
                 moa_config=moa_config,
                 turn_author=turn_author,
+                typed_user_message=typed_user_message,
                 title_user_message=title_user_message,
                 prelude=prelude,
             )

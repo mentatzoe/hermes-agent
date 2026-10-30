@@ -34,7 +34,7 @@ from gateway.session import (
     build_session_context,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import TurnContext
+from gateway.turn_context import PreparedTurn, TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -2030,19 +2030,7 @@ class GatewayTurnMixin:
         )
         self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
 
-    @dataclasses.dataclass
-    class _PreparedTurn:
-        """Inputs to the agent run assembled by ``_hmwa_prepare_turn``."""
-
-        history: Any
-        context_prompt: str
-        message_text: Any
-        persist_user_message: Any
-        persist_user_timestamp: Any
-        persist_user_display_kind: Optional[str]
-        persistence_session_id: Optional[str] = None
-        persistence_owner: Optional[str] = None
-        title_user_message: Optional[str] = None
+    _PreparedTurn = PreparedTurn
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2140,6 +2128,7 @@ class GatewayTurnMixin:
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            typed_user_message=getattr(event, "_gateway_typed_user_content", None),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2202,6 +2191,7 @@ class GatewayTurnMixin:
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
+                typed_user_message=prepared.typed_user_message,
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
