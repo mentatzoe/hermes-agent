@@ -9,10 +9,11 @@ tasks``, which counted as "cannot tell", so every finished card kept its directo
 
 A file that holds no tables cannot hold a task, so the scan skips it. The skip needs proof that
 the file is intact: a damaged schema page can make a live board read as empty, so a file with no
-tables must also pass SQLite's own integrity check, and it must not hold pages past the size its
-own header counts (an old, empty first page written back over a used board passes the integrity
-check and leaves the board's pages behind it). A file that cannot be read at all (damaged, not a
-database, locked) or that holds unfamiliar tables still blocks removal.
+tables must also pass SQLite's own integrity check, and it must be exactly as long as its own
+header says (an old, empty first page written back over a used board passes the integrity check,
+whether the board's pages then sit behind the pages the header counts or inside the larger page
+it declares). A file that cannot be read at all (damaged, not a database, locked) or that holds
+unfamiliar tables still blocks removal.
 """
 
 from __future__ import annotations
@@ -85,11 +86,15 @@ def repo(tmp_path: Path) -> Path:
     return project
 
 
-def _write_board(path: Path, rows: list[tuple[str, str, str]] | None = None) -> int:
+def _write_board(
+    path: Path, rows: list[tuple[str, str, str]] | None = None, *, page_size: int | None = None
+) -> int:
     """A sibling board with the columns the scan reads; returns the root page of ``tasks``."""
     if rows is None:
         rows = [(f"t_{n}", "ready", f"/elsewhere/{n}" * 20) for n in range(400)]
     with contextlib.closing(sqlite3.connect(path)) as conn:
+        if page_size is not None:
+            conn.execute(f"PRAGMA page_size={page_size}")
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, workspace_path TEXT)")
         conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
         conn.commit()
@@ -221,32 +226,39 @@ def _write_board_with_schema_replaced_by_empty_leaf(path: Path) -> None:
     _damage_schema_page(path, "replaced-by-empty-leaf")
 
 
-def _empty_first_page(*, wal: bool) -> bytes:
+def _empty_first_page(*, wal: bool, page_size: int = _PAGE) -> bytes:
     """The first page of an empty database as SQLite writes it: a ``VACUUM`` of a new file."""
     with tempfile.TemporaryDirectory() as scratch:
         db = Path(scratch) / "empty.db"
         with contextlib.closing(sqlite3.connect(db)) as conn:
+            conn.execute(f"PRAGMA page_size={page_size}")
             if wal:
                 assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
             conn.execute("VACUUM")
         page = db.read_bytes()
-    assert len(page) == _PAGE
+    assert len(page) == page_size
     return page
 
 
-def _replay_empty_first_page(path: Path, length: int = _PAGE, *, current_header: bool = True) -> None:
+def _replay_empty_first_page(
+    path: Path, length: int = _PAGE, *, current_header: bool = True, donor_page_size: int = _PAGE
+) -> None:
     """Write the first *length* bytes of an old, empty first page back over a used board.
 
     The page comes from an empty database in the board's own journal mode. Every other page
-    stays where it was. The replayed header counts one page and SQLite trusts that count, so it
-    reads an empty database of one page: both integrity checks walk the pages the header counts
-    and find nothing wrong, while the board's own pages sit behind it, unread. This is a
+    stays where it was. The replayed header counts the pages of that old database and SQLite
+    trusts the count, so it reads an empty database of one page: both integrity checks walk the
+    pages the header counts and find nothing wrong, while the board's own pages sit outside
+    them, unread. Behind the counted page when the old database had pages of the board's size
+    or smaller than the file. Inside the page the header declares when the old database had
+    larger pages and the file is shorter than one of them (``donor_page_size``). This is a
     constructed replay. The incident's stub holds no pages behind its first one and cannot
     produce it. With ``current_header=False`` the version-valid-for number no longer matches the
     change counter, SQLite stops trusting the count and sizes the database by the file instead.
     """
     data = bytearray(path.read_bytes())
-    data[:length] = _empty_first_page(wal=data[18] == 2)[:length]
+    assert length <= len(data), "a longer replay would grow the file instead of covering it"
+    data[:length] = _empty_first_page(wal=data[18] == 2, page_size=donor_page_size)[:length]
     if not current_header:
         data[92:96] = (int.from_bytes(data[24:28], "big") + 1).to_bytes(4, "big")
     path.write_bytes(bytes(data))
@@ -284,20 +296,54 @@ def _write_emptied_database_followed_by_a_page_its_header_does_not_count(path: P
     path.write_bytes(path.read_bytes() + bytes(_PAGE))
 
 
-def _board_with_live_sharer(kind: str, workspace: Path | str) -> Path:
+def _write_small_board_with_larger_page_replayed(path: Path) -> None:
+    """The first 108 bytes of an old, empty database with 64 KiB pages over a board of 512-byte pages.
+
+    The board is 1536 bytes, shorter than the one 65536-byte page the replayed header declares.
+    """
+    _write_board(path, [("t_live", "running", "/elsewhere/live")], page_size=512)
+    _replay_empty_first_page(path, 108, donor_page_size=65536)
+
+
+def _write_incident_stub_cut_to(length: int):
+    """The incident's stub with only its first *length* bytes: shorter than the one page its header declares."""
+
+    def write(path: Path) -> None:
+        path.write_bytes(_INCIDENT_STUB_HEADER.ljust(_PAGE, b"\0")[:length])
+
+    return write
+
+
+def _write_incident_stub_with_page_count_zeroed(path: Path) -> None:
+    """A header that counts no pages, as SQLite wrote before 3.7.0: it declares nothing, so the file is unexplained."""
+    data = bytearray(_INCIDENT_STUB_HEADER.ljust(_PAGE, b"\0"))
+    data[28:32] = bytes(4)
+    path.write_bytes(bytes(data))
+
+
+def _board_with_live_sharer(kind: str, workspace: Path | str, *, page_size: int | None = None) -> Path:
     """A sibling board whose running task uses *workspace*; returns the file the scan reads.
 
     ``minimal`` has only the columns the scan reads. ``full`` is a board made by
     ``kb.create_board``, with the whole schema, checkpointed so the main file holds every page.
+    With *page_size* the board is small: pages of that size, and (for ``minimal``) only the
+    one running task, so the file is shorter than a single page of a larger size.
     """
     if kind == "minimal":
-        rows = [(f"t_{n}", "ready", f"/elsewhere/{n}" * 20) for n in range(400)]
+        rows = [(f"t_{n}", "ready", f"/elsewhere/{n}" * 20) for n in range(400)] if page_size is None else []
         rows.append(("t_live", "running", str(workspace)))
         db = kb.boards_root() / "sharer" / "kanban.db"
         db.parent.mkdir(parents=True, exist_ok=True)
-        _write_board(db, rows)
+        _write_board(db, rows, page_size=page_size)
         return db
     assert kind == "full"
+    if page_size is not None:
+        # The page size of an existing file is the one thing ``create_board`` leaves alone.
+        seed = kb.boards_root() / "sharer" / "kanban.db"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(seed, isolation_level=None)) as conn:
+            conn.execute(f"PRAGMA page_size={page_size}")
+            conn.execute("VACUUM")
     kb.create_board("sharer")
     with kbc.connect_closing(board="sharer") as other:
         live = kb.create_task(other, title="still using the report")
@@ -411,6 +457,11 @@ _CANNOT_TELL = [
         _write_emptied_database_followed_by_a_page_its_header_does_not_count,
         id="emptied-database-with-a-page-the-header-does-not-count",
     ),
+    pytest.param(_write_small_board_with_larger_page_replayed, id="empty-first-page-from-larger-pages-replayed"),
+    pytest.param(_write_incident_stub_cut_to(107), id="incident-stub-cut-to-107-bytes"),
+    pytest.param(_write_incident_stub_cut_to(512), id="incident-stub-cut-to-512-bytes"),
+    pytest.param(_write_incident_stub_cut_to(_PAGE - 1), id="incident-stub-one-byte-short-of-its-page"),
+    pytest.param(_write_incident_stub_with_page_count_zeroed, id="incident-stub-header-counts-no-pages"),
     pytest.param(_write_board_with_damaged_tasks_page, id="schema-intact-tasks-pages-damaged"),
     pytest.param(_write_unfamiliar_tables, id="tables-but-no-tasks-table"),
 ]
@@ -592,12 +643,30 @@ def _zero(start: int, stop: int):
     return lambda data: data.__setitem__(slice(start, stop), bytes(stop - start))
 
 
+def _page_size_that_is_not_a_power_of_two_yet_matches_the_length(data: bytearray) -> None:
+    """Pad the file to a multiple of 12288 and make the header say 12288-byte pages.
+
+    The header then counts exactly the bytes in the file, so a length check alone is satisfied.
+    Only the rule that a page size is a power of two can object.
+    """
+    page_size = 12288
+    data.extend(bytes(-len(data) % page_size))
+    data[16:18] = page_size.to_bytes(2, "big")
+    data[28:32] = (len(data) // page_size).to_bytes(4, "big")
+    assert int.from_bytes(data[28:32], "big") * page_size == len(data)
+
+
 _MAIN_FILE_HEADER_DAMAGE = [
     pytest.param(lambda data: data.__setitem__(slice(0, 16), b"X" * 16), id="magic-string-overwritten"),
     pytest.param(_zero(16, 18), id="page-size-zeroed"),
-    # 8000 is large enough that (page count x page size) still covers the file, so only the
-    # power-of-two rule catches it. SQLite takes the real page size from the log and reads on.
+    # SQLite takes the real page size from the log and reads on. 8000 is not a power of two and
+    # (page count x page size) does not equal the length, so two rules refuse it. The next case
+    # makes the length match, so that only the power-of-two rule is left.
     pytest.param(lambda data: data.__setitem__(slice(16, 18), (8000).to_bytes(2, "big")), id="page-size-not-a-power-of-two"),
+    pytest.param(
+        _page_size_that_is_not_a_power_of_two_yet_matches_the_length,
+        id="page-size-not-a-power-of-two-and-the-length-matches",
+    ),
     pytest.param(_zero(0, _PAGE), id="first-page-zeroed"),
 ]
 
@@ -730,6 +799,83 @@ def test_a_page_the_header_does_not_count_is_invisible_to_sqlite(kanban_home, wr
         assert reader.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
 
 
+# The same boards with their first 108 or 512 bytes replaced by those of an empty database that had
+# LARGER pages (the file header and the header of the empty schema leaf). The header now declares
+# one page of 8, 32 or 64 KiB. The board is shorter than that, so SQLite reads its real pages as
+# unused space inside the one big first page. The board is built with 512-byte pages, as one that
+# was converted from larger pages would be.
+_LARGER_PAGE_REPLAYED = [
+    pytest.param("minimal", 108, 8192, id="minimal-board-108-bytes-from-8k-pages"),
+    pytest.param("minimal", 512, 32768, id="minimal-board-512-bytes-from-32k-pages"),
+    pytest.param("minimal", 108, 65536, id="minimal-board-108-bytes-from-64k-pages"),
+    pytest.param("full", 108, 65536, id="full-board-108-bytes-from-64k-pages"),
+    pytest.param("full", 512, 65536, id="full-board-512-bytes-from-64k-pages"),
+]
+
+
+@pytest.mark.parametrize(("kind", "length", "donor_page_size"), _LARGER_PAGE_REPLAYED)
+def test_the_larger_page_replay_reads_as_an_empty_database_that_passes_both_integrity_checks(
+    kanban_home, kind, length, donor_page_size
+):
+    """Pins the premise of the next test: neither SQLite nor either integrity check sees a problem.
+
+    Only the length of the file gives the replay away. If a newer SQLite starts to notice a file
+    shorter than the pages its header declares, the length check is no longer what protects
+    these shapes, and this is the test that says so.
+    """
+    db = _board_with_live_sharer(kind, "/elsewhere/ws", page_size=512)
+    used_bytes = db.stat().st_size
+    assert 512 < used_bytes < donor_page_size
+    _replay_empty_first_page(db, length, donor_page_size=donor_page_size)
+    assert db.stat().st_size == used_bytes
+    with contextlib.closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as reader:
+        assert reader.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+        assert reader.execute("PRAGMA page_size").fetchone()[0] == donor_page_size
+        assert reader.execute("PRAGMA page_count").fetchone()[0] == 1
+        assert reader.execute("PRAGMA quick_check(1)").fetchall() == [("ok",)]
+        assert reader.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
+@pytest.mark.parametrize(("kind", "length", "donor_page_size"), _LARGER_PAGE_REPLAYED)
+def test_board_whose_first_page_came_back_from_larger_pages_keeps_the_workspace_it_may_still_use(
+    kanban_home, kind, length, donor_page_size
+):
+    with kbc.connect_closing() as conn:
+        tid, ws = _running_scratch_task(conn)
+        db = _board_with_live_sharer(kind, ws, page_size=512)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
+        used_board = db.read_bytes()
+        _replay_empty_first_page(db, length, donor_page_size=donor_page_size)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "unknown"
+        assert kb.complete_task(conn, tid, summary="done")
+        _assert_outcome(conn, tid, ws, removed=False)
+        # Nothing was lost on the board: put its first page back and the running task is still
+        # there, still naming the directory that was kept.
+        db.write_bytes(used_board)
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) == "shared"
+
+
+def test_empty_sibling_that_this_process_holds_open_is_not_read_behind_its_back(kanban_home):
+    """A bare ``open()`` and ``close()`` of a database file cancels the POSIX locks that every
+    connection of this process holds on it (``sqlite_safe_read`` explains why). The length check
+    reads the file's first bytes, so it goes through ``offline_file_access``: with a tracked
+    connection to the sibling open, it refuses and the board counts as unreadable. Once the
+    connection is gone the stub is skipped again.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    db = _plant(_write_incident_stub)
+    held = connect_tracked(db)
+    try:
+        with kbc.connect_closing() as conn:
+            tid, ws = _finished_scratch_task(conn)
+            assert kbw._workspace_in_use_by_other(conn, tid, ws) == "unknown"
+    finally:
+        held.close()
+    with kbc.connect_closing() as conn:
+        assert kbw._workspace_in_use_by_other(conn, tid, ws) is None
+
+
 def test_board_whose_first_page_was_replayed_stays_unreadable_with_log_files_beside_it(kanban_home):
     """Log files next to the file do not vouch for it. A live board in WAL mode normally has a
     ``-wal`` and a ``-shm`` beside it, and these are what an unclean stop leaves behind. With
@@ -753,6 +899,7 @@ _SIBLINGS = [
     pytest.param(_write_garbage, False, id="unreadable-kept"),
     pytest.param(_write_board_with_schema_replaced_by_empty_leaf, False, id="schema-damaged-to-read-empty-kept"),
     pytest.param(_write_board_with_empty_first_page_replayed, False, id="empty-first-page-replayed-kept"),
+    pytest.param(_write_small_board_with_larger_page_replayed, False, id="empty-first-page-from-larger-pages-kept"),
 ]
 
 

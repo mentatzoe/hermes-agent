@@ -18,6 +18,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 
+from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 from hermes_cli.worktree_ops import release_lsp_clients
 
 if TYPE_CHECKING:
@@ -157,26 +158,56 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 _SQLITE_HEADER_BYTES = 100
 
 
-def _has_pages_past_its_declared_size(db_file: Path) -> bool:
-    """True when the main file is longer than the database its own header describes.
+def _length_differs_from_declared_size(db_file: Path) -> bool:
+    """True when the main file is not exactly as long as the database its own header describes.
 
     Reads the main file's first 100 bytes and its length, not SQLite's view of the
     database. The header counts pages (offset 28) of a page size (offset 16, where 1
     means 65536). A header that is not a SQLite header, or whose page size is not a
-    power of two from 512 up, describes nothing, so any bytes behind it count as
+    power of two from 512 up, describes nothing, so every byte in the file counts as
     unexplained. An empty file holds nothing and is fine.
+
+    SQLite notices a mismatch in neither direction. A file longer than its header says
+    keeps pages behind the ones the header counts, and no check walks them. A file
+    shorter than its header says (a header copied from a database with larger pages)
+    makes SQLite read the file's real pages as unused space inside one big first page.
+    Either way the schema can read as empty and both integrity checks can say ``ok``
+    while a used board's pages sit in the file.
 
     With a write-ahead log the main file can be longer than SQLite's current view of
     the database: DROP TABLE and VACUUM commit an empty database to the log, and the
     main file keeps its old length until the next checkpoint. That is not a mismatch,
     because the main file's own header still counts every page it holds. A file left
-    in the middle of a checkpoint (its first page already rewritten, its tail not yet
-    cut off) does read as a mismatch, so it counts as unreadable until a writer
+    in the middle of a checkpoint does read as a mismatch, whether its first page is
+    already rewritten and its tail not yet cut off, or its first page already counts
+    pages that the copying has not yet reached. It counts as unreadable until a writer
     finishes the checkpoint.
+
+    A header that matches the file's length is trusted. A stale one-page header declares
+    at most 64 KiB, so it can only match a file that small, and a board Hermes has
+    initialised is larger. A stale header that counts the whole file still has to pass
+    ``quick_check``, which fails when the free list it describes names pages the board
+    uses. What no check here can tell apart is a file whose first pages were rewritten
+    into a complete, consistent empty database: it looks like the result of a real
+    ``DROP TABLE``.
+
+    The read goes through ``offline_file_access``. A bare ``open()`` and ``close()`` of a
+    database file cancels every POSIX lock this process holds on it, so a connection of
+    ours to the same board would silently lose its protection (``sqlite_safe_read``
+    explains why). When this process has a tracked connection to the file, the guard
+    refuses and the board counts as unreadable. Kanban gives every board it opens its
+    tables first, so a tracked connection to a file that still reads as empty is not
+    expected. The scan's own connection is untracked, so the guard does not see it.
     """
-    with open(db_file, "rb") as handle:
-        header = handle.read(_SQLITE_HEADER_BYTES)
-        size = os.fstat(handle.fileno()).st_size
+    try:
+        with offline_file_access(db_file, what="read the header of"):
+            with open(db_file, "rb") as handle:
+                header = handle.read(_SQLITE_HEADER_BYTES)
+                size = os.fstat(handle.fileno()).st_size
+    except LiveConnectionError as exc:
+        raise sqlite3.OperationalError(
+            f"{db_file} is open in this process, so its header was not read"
+        ) from exc
     if size == 0:
         return False
     if len(header) < _SQLITE_HEADER_BYTES or not header.startswith(_SQLITE_MAGIC):
@@ -186,7 +217,7 @@ def _has_pages_past_its_declared_size(db_file: Path) -> bool:
         page_size = 65536
     if page_size < 512 or page_size & (page_size - 1):
         return True
-    return size > page_size * int.from_bytes(header[28:32], "big")
+    return size != page_size * int.from_bytes(header[28:32], "big")
 
 
 def _is_intact_empty_database(conn: sqlite3.Connection, db_file: Path) -> bool:
@@ -204,11 +235,12 @@ def _is_intact_empty_database(conn: sqlite3.Connection, db_file: Path) -> bool:
     - A damaged schema page. SQLite's page accounting notices the orphaned pages,
       so a file that reads as empty must pass ``PRAGMA quick_check``.
     - An old, empty first page written back over a used board. The header then
-      counts one page and SQLite trusts the count, so ``quick_check`` and
-      ``integrity_check`` both pass and the board's pages sit behind it, never
-      walked. The file is longer than its own header says, which is what gives it
-      away, so a file that reads as empty must also not hold more than its header
-      counts.
+      counts the pages of the old database and SQLite trusts the count, so
+      ``quick_check`` and ``integrity_check`` both pass while the board's pages sit
+      outside what the header counts, never walked: behind it when the old database
+      was smaller, or as unused space inside an oversized first page when it had
+      larger pages. The file is not the length its own header says, which is what
+      gives it away, so a file that reads as empty must also be exactly that long.
 
     Only files that read as empty pay for either check.
 
@@ -218,9 +250,9 @@ def _is_intact_empty_database(conn: sqlite3.Connection, db_file: Path) -> bool:
     """
     if conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is not None:
         return False
-    if _has_pages_past_its_declared_size(db_file):
+    if _length_differs_from_declared_size(db_file):
         raise sqlite3.DatabaseError(
-            "the schema reads as empty but the file holds pages past the size its header declares"
+            "the schema reads as empty but the file is not the length its header declares"
         )
     verdict = conn.execute("PRAGMA quick_check(1)").fetchall()
     if len(verdict) != 1 or verdict[0][0] != "ok":
@@ -258,7 +290,7 @@ def _workspace_in_use_by_other(
     the delete (``"unknown"``) and log the board DB that failed, so one broken
     sibling DB is not reported as a live sharer. A sibling file with no tables
     at all (empty, or a header-only stub) that passes SQLite's integrity check
-    and is no longer than its own header says is not unreadable: it holds no
+    and is exactly as long as its own header says is not unreadable: it holds no
     task, so it is passed over. Damaged files (including one whose first page
     was damaged or replaced so that it reads as empty), locked files and files
     with tables but no kanban ``tasks`` table still count as unreadable.
