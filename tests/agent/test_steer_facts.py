@@ -56,11 +56,11 @@ def test_pre_api_requeue_preserves_entries_until_a_tool_row_exists():
     # An arriving second steer cannot replace the first one's facts when the drain requeues.
     agent.steer('legacy text')
     messages = [{'role': 'user', 'content': 'opening text'}]
-    _inject_steer_after_newest_tool_result(agent, messages, pending)
+    _inject_steer_after_newest_tool_result(agent, messages, pending, current_turn_user_idx=0)
     assert agent._turn_recoverable_audio_paths == []
     messages.append({'role': 'tool', 'tool_call_id': 'one', 'content': 'done'})
     pending = agent._drain_pending_steer(with_entries=True)
-    _inject_steer_after_newest_tool_result(agent, messages, pending)
+    _inject_steer_after_newest_tool_result(agent, messages, pending, current_turn_user_idx=0)
     assert {entry['text']: entry.get('facts') for entry in messages[-1]['steer_entries']} == {
         '[host audio notice]': facts, 'legacy text': None}
     assert agent._turn_recoverable_audio_paths == ['/audio/current.ogg']

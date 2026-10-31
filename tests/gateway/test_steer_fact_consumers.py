@@ -30,9 +30,12 @@ def test_in_turn_consumers_preserve_each_call(consumer):
     verb = agent.redirect if agent._executing_tools else agent.steer
     for entry in entries:
         assert verb(entry['text'], **({'facts': entry['facts']} if 'facts' in entry else {}))
-    messages = [{'role': 'tool', 'tool_call_id': 'call', 'content': 'done'}]
+    messages = [{'role': 'user', 'content': 'current request'},
+                {'role': 'tool', 'tool_call_id': 'call', 'content': 'done'}]
     if consumer == 'pre-api':
-        _inject_steer_after_newest_tool_result(agent, messages, agent._drain_pending_steer(with_entries=True))
+        _inject_steer_after_newest_tool_result(
+            agent, messages, agent._drain_pending_steer(with_entries=True), current_turn_user_idx=0,
+        )
     else:
         apply_pending_steer_to_tool_results(agent, messages, 1)
     assert messages[-1]['steer_entries'] == ENTRIES
