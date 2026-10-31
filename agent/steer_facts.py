@@ -1,17 +1,13 @@
 """Delivery of per-call steer facts; model text stays separate from provenance."""
-from agent.prompt_builder import steer_user_row
+from agent.mid_turn_input import mid_turn_human_row
+from agent.prompt_builder import STEER_DISPLAY_KIND, format_steer_marker
 
 
 def delivered_steer_row(agent, entries):
     """Build the delivered user row and add its owned attachments to this turn."""
-    if isinstance(entries, str):
-        return steer_user_row(entries)
-    paths = [path for entry in entries for path in
-             (entry.get('facts') or {}).get('recoverable_audio_paths', [])]
-    if paths:
-        current = getattr(agent, '_turn_recoverable_audio_paths', None) or []
-        agent._turn_recoverable_audio_paths = list(dict.fromkeys([*current, *paths]))
-    return steer_user_row('\n'.join(entry['text'] for entry in entries), entries=entries)
+    text = entries if isinstance(entries, str) else '\n'.join(entry['text'] for entry in entries)
+    return mid_turn_human_row(agent, entries, content=format_steer_marker(text).lstrip(),
+                              display_kind=STEER_DISPLAY_KIND)
 
 
 def handoff_pending_steer(agent, result):

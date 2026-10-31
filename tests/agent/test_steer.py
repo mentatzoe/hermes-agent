@@ -93,7 +93,7 @@ class TestActiveTurnRedirect:
         agent._model_request_active.set()
 
         assert agent.redirect("use Postgres") is True
-        assert agent._pending_redirect == "use Postgres"
+        assert agent._pending_redirect == [{"text": "use Postgres"}]
         assert agent._interrupt_requested is True
         assert agent._interrupt_message is None
 
@@ -103,7 +103,7 @@ class TestActiveTurnRedirect:
 
         assert agent.redirect("first correction") is True
         assert agent.redirect("second correction") is True
-        pending = agent._pending_redirect
+        pending = agent._drain_pending_redirect()
         assert "first correction" in pending and "second correction" in pending
         assert pending.index("first correction") < pending.index("second correction")
 

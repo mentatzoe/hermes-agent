@@ -367,12 +367,13 @@ def begin_iteration(
             _turn_exit_reason=_turn_exit_reason,
         )
 
-    _redirect_text = agent._drain_pending_redirect()
-    if _redirect_text:
-        _apply_active_turn_redirect(agent, messages, _redirect_text)
+    from agent.mid_turn_input import redirect_text
+    _redirect_entries = agent._drain_pending_redirect(with_entries=True)
+    if _redirect_entries:
+        _apply_active_turn_redirect(agent, messages, _redirect_entries)
         if isinstance(original_user_message, str):
             original_user_message = (
-                f"{original_user_message}\n\n" f"User correction during the turn: {_redirect_text}"
+                f"{original_user_message}\n\nUser correction during the turn: {redirect_text(_redirect_entries)}"
             )
         agent._persist_session(messages, conversation_history)
 
@@ -478,9 +479,7 @@ def apply_retry_restarts(
             )
             # The correction that tripped the cap was never applied; hand it back as the
             # next user turn (result["pending_steer"]) instead of losing it to clear_interrupt().
-            _unapplied = agent._drain_pending_redirect()
-            if _unapplied:
-                agent.steer(_unapplied)
+            agent._defer_pending_redirect()
             return _verdict("break")
         # Cancelled request produced no valid assistant item: reuse the same logical
         # iteration after the outer loop appends partial context + correction.

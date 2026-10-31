@@ -319,12 +319,14 @@ def _moa_reference_metrics_for_hook(agent: Any) -> Any:
         return None
 
 
-def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
+def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], entries) -> None:
     """Append a provider-safe checkpoint and correction to the live turn so role alternation
     holds and cached messages stay byte-identical. INVARIANTS: raw chain-of-thought never enters
     replayable content (inlined CoT reads as a prefill jailbreak and bricks the session with
     empty-response storms); the interruption scaffold is replay text carried only in the user
     correction's ``api_content``; an on-screen-empty placeholder is ``display_kind=hidden``."""
+    from agent.mid_turn_input import mid_turn_human_row, redirect_text
+    text = redirect_text(entries)
     visible = agent._strip_think_blocks(getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
 
     checkpoint_parts = [_INTERRUPT_SCAFFOLD_MARKER]
@@ -349,7 +351,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         # as assistant text the model echoes it (#81841).
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    append_message(messages, mid_turn_human_row(agent, entries, content=text, api_content=correction))
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
