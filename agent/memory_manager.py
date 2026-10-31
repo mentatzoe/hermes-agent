@@ -110,6 +110,10 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     Same gate as ``inject_memory_provider_tools`` so a provider's ``system_prompt_block()``
     never advertises tools absent from the tool surface.
     """
+    # Delegation still blocks the builtin memory writer. A distinct, provider-
+    # opted-in reader inherits the parent's permission without enabling that writer.
+    if getattr(getattr(agent, "_memory_manager", None), "read_only", False) is True:
+        return True
     tools = getattr(agent, "tools", None)
     present = isinstance(tools, (list, tuple)) and any(_tool_name(t) == "memory" for t in tools)
     enabled, disabled = getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)
