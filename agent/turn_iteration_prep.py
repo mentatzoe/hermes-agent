@@ -172,13 +172,23 @@ def prepare_iteration(
     # 401 was a storm, and the pool benched the sole credential for all of them.
     agent._adopt_nous_key_before_expiry()
 
+    # Compaction may have rebuilt the list since the turn's index was recorded.
+    # Settle it before steer delivery, not after an insertion into old history.
+    if user_message is not None and not _anchors_current_turn(messages, current_turn_user_idx, user_message):
+        current_turn_user_idx = _reanchor(agent, messages, user_message)
+
     # Drain a /steer sent during the last API call so it lands THIS iteration. Delivered as a
     # standalone user row after the newest tool result (never smeared onto the tool row: that
     # row is already persisted append-only, so replay would diverge from the live request and
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
-    _pre_api_steer = agent._drain_pending_steer()
+    _pre_api_steer = agent._drain_pending_steer(with_entries=True)
     if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+        steer_boundary = current_turn_user_idx if (
+            user_message is not None and _anchors_current_turn(messages, current_turn_user_idx, user_message)
+        ) else None
+        _inject_steer_after_newest_tool_result(
+            agent, messages, _pre_api_steer, current_turn_user_idx=steer_boundary,
+        )
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -281,15 +291,21 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
-    """Append the steer marker as a standalone user row after the newest tool message; with no
-    tool message, put the text back so the post-tool-execution drain delivers it later."""
-    for _si in range(len(messages) - 1, -1, -1):
+def _inject_steer_after_newest_tool_result(
+    agent: Any, messages: Any, steer_text, *, current_turn_user_idx: Any = None,
+) -> None:
+    """Deliver only after a live-turn tool; otherwise retain original entries for follow-up."""
+    lower_bound = current_turn_user_idx if (
+        type(current_turn_user_idx) is int and 0 <= current_turn_user_idx < len(messages)
+    ) else len(messages)
+    for _si in range(len(messages) - 1, lower_bound, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
-            from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
-            logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
+            from agent.steer_facts import delivered_steer_row
+            # Eligibility comes from the live tool, but delivery is append-only:
+            # another drain may already have delivered a correction after it.
+            messages.append(delivered_steer_row(agent, steer_text))
+            logger.debug("Pre-API-call steer drain: appended user row after live tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer
     _requeue_pending_steer(agent, steer_text)
@@ -367,12 +383,13 @@ def begin_iteration(
             _turn_exit_reason=_turn_exit_reason,
         )
 
-    _redirect_text = agent._drain_pending_redirect()
-    if _redirect_text:
-        _apply_active_turn_redirect(agent, messages, _redirect_text)
+    from agent.mid_turn_input import redirect_text
+    _redirect_entries = agent._drain_pending_redirect(with_entries=True)
+    if _redirect_entries:
+        _apply_active_turn_redirect(agent, messages, _redirect_entries)
         if isinstance(original_user_message, str):
             original_user_message = (
-                f"{original_user_message}\n\n" f"User correction during the turn: {_redirect_text}"
+                f"{original_user_message}\n\nUser correction during the turn: {redirect_text(_redirect_entries)}"
             )
         agent._persist_session(messages, conversation_history)
 
@@ -478,9 +495,7 @@ def apply_retry_restarts(
             )
             # The correction that tripped the cap was never applied; hand it back as the
             # next user turn (result["pending_steer"]) instead of losing it to clear_interrupt().
-            _unapplied = agent._drain_pending_redirect()
-            if _unapplied:
-                agent.steer(_unapplied)
+            agent._defer_pending_redirect()
             return _verdict("break")
         # Cancelled request produced no valid assistant item: reuse the same logical
         # iteration after the outer loop appends partial context + correction.

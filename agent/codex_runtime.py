@@ -694,7 +694,7 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
 
 
 def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_user_message: Any,
-                       should_review_memory: bool) -> dict[str, Any]:
+                       should_review_memory: bool, current_turn_user_idx: int | None = None) -> dict[str, Any]:
     """Post-turn bookkeeping mirroring the chat_completions loop; returns usage fields."""
     # run_conversation() already bumped _turns_since_memory / _user_turn_count; only _iters_since_skill is ours.
     agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
@@ -709,6 +709,7 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
     if not turn.interrupted and turn.error is None:
         _call_guarded(getattr(agent, "_sync_external_memory_for_turn", None), "external memory sync raised", kwargs=dict(
             original_user_message=original_user_message, final_response=turn.final_text, interrupted=False, messages=messages,
+            current_turn_user_idx=current_turn_user_idx,
         ))
     # Background review fork: only when a trigger tripped AND a real final response exists.
     if turn.final_text and not turn.interrupted and (should_review_memory or should_review_skills):
@@ -719,7 +720,8 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
 
 
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
-                              effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
+                              effective_task_id: str, should_review_memory: bool = False,
+                              current_turn_user_idx: int | None = None) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
@@ -755,6 +757,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         _store_codex_thread_id(agent, turn.thread_id)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
+        current_turn_user_idx=current_turn_user_idx,
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,

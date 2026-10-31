@@ -106,6 +106,7 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
         # Both independent per-turn carriers must survive the gateway/facade/loop
         # handoff: title text must not displace upstream memory author attribution.
         assert agent._turn_author == {"id": "user", "name": "Example", "is_bot": False}
+        assert agent._turn_typed_user_message == question
         assert question in model_inputs[0]
         for payload in payloads.values():
             assert payload in model_inputs[0]

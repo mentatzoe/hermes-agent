@@ -36,7 +36,9 @@ def _agent():
     budget = SimpleNamespace(refunds=0)
     budget.refund = lambda: setattr(budget, "refunds", budget.refunds + 1)
     agent = SimpleNamespace(iteration_budget=budget, steered=[])
-    agent._drain_pending_redirect = lambda: "last correction"
+    from run_agent import AIAgent
+    agent._drain_pending_redirect = lambda **kwargs: "last correction"
+    agent._defer_pending_redirect = lambda: AIAgent._defer_pending_redirect(agent)
     agent.steer = agent.steered.append
     return agent
 
@@ -71,7 +73,7 @@ def test_back_to_back_restart_refunds_are_bounded(flag):
 def _interrupted_agent(tool_interrupt_reason):
     agent = SimpleNamespace(
         _interrupt_requested=True, _tool_interrupt_reason=tool_interrupt_reason, quiet_mode=True,
-        _drain_pending_redirect=lambda: None, _checkpoint_mgr=SimpleNamespace(new_turn=lambda: None),
+        _drain_pending_redirect=lambda **kwargs: None, _checkpoint_mgr=SimpleNamespace(new_turn=lambda: None),
     )
     return begin_iteration(
         agent, messages=[], conversation_history=[], original_user_message="hi",

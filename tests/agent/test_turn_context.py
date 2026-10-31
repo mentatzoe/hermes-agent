@@ -316,6 +316,30 @@ def test_turn_author_reaches_the_agent_through_the_real_facade(monkeypatch):
     assert agent._turn_author is None
 
 
+def test_typed_user_message_reaches_agent_stash_through_real_facade_and_resets(monkeypatch):
+    """The exact typed subset crosses the public facade and is fresh on every cached-agent turn."""
+    from types import SimpleNamespace
+    from run_agent import AIAgent
+
+    class _Completions:
+        def create(self, **_kw):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None, reasoning=None, reasoning_content=None),
+                finish_reason="stop")], usage=None, model="test-model")
+
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI",
+                        lambda **_kw: SimpleNamespace(chat=SimpleNamespace(completions=_Completions())))
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *a, **k: [])
+    agent = AIAgent(model="test-model", api_key="k", base_url="http://localhost:1/v1", platform="cli",
+                    max_iterations=2, quiet_mode=True, skip_memory=True)
+    agent._disable_streaming = True
+
+    agent.run_conversation("[Alex] typed words\n\n[Host notice]", typed_user_message="typed words")
+    assert agent._turn_typed_user_message == "typed words"
+    agent.run_conversation("next turn without a typed subset")
+    assert agent._turn_typed_user_message is None
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
