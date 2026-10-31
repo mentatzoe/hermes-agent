@@ -9,6 +9,7 @@ import threading
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+from agent.mid_turn_input import pending_human_input, redirect_text
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
 
@@ -264,20 +265,21 @@ class InterruptControlMixin:
                 self._pending_steer = None
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, facts: Optional[dict] = None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        interrupt). Keep each call's sender facts beside its unchanged model text."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        entry = pending_human_input(cleaned, facts)
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            self._pending_steer = (existing or []) + [entry]
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
         return True
 
-    def redirect(self, text: str) -> bool:
+    def redirect(self, text: str, *, facts: Optional[dict] = None) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
@@ -305,7 +307,7 @@ class InterruptControlMixin:
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = self.steer(cleaned)
+            accepted = self.steer(cleaned, **({"facts": facts} if facts is not None else {}))
             if accepted:
                 tracker = getattr(self, "_tool_worker_threads", None)
                 tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
@@ -323,9 +325,7 @@ class InterruptControlMixin:
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
                 return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
-            )
+            self._pending_redirect = (existing or []) + [pending_human_input(cleaned, facts)]
             self._interrupt_requested = True
             self._interrupt_message = None
             self._turn_user_intervened = True
@@ -345,16 +345,36 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_redirect_lock"):
             return bool(_ic_slot(self, "_pending_redirect_lock", "_pending_redirect"))
 
-    def _drain_pending_redirect(self) -> Optional[str]:
-        """Return and clear pending active-turn correction text."""
+    def _drain_pending_redirect(self, *, with_entries: bool = False):
+        """Drain entries for row delivery, or text for existing surface callers."""
         with _ic_lock(self, "_pending_redirect_lock"):
-            text = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
+            entries = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             self._pending_redirect = None
-        return text
+        if with_entries or not entries:
+            return entries
+        return redirect_text(entries)
 
-    def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot; None when nothing is pending."""
+    def _drain_pending_steer(self, *, with_entries: bool = False):
+        """Drain entries for transcript delivery, or text for legacy surface handoffs."""
         with _ic_lock(self, "_pending_steer_lock"):
-            text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            entries = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = None
-        return text
+        if with_entries or not entries:
+            return entries
+        return "\n".join(entry["text"] for entry in entries)
+
+    def _defer_pending_redirect(self):
+        """Keep an unapplied correction's facts when the redirect restart budget ends."""
+        entries = self._drain_pending_redirect(with_entries=True)
+        if not entries:
+            return
+        if isinstance(entries, str):
+            self.steer(entries)  # legacy internal caller
+            return
+        # The late steer joins with one newline; retain redirect's two-newline
+        # separator without combining the authors into a single pending entry.
+        deferred = [dict(entry, text=("\n[Additional user correction]\n" if i else "") + entry["text"])
+                    for i, entry in enumerate(entries)]
+        with _ic_lock(self, "_pending_steer_lock"):
+            existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            self._pending_steer = (existing or []) + deferred

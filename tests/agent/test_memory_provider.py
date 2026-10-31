@@ -94,6 +94,14 @@ class AuthorMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, turn_author))
 
 
+class TypedMemoryProvider(AuthorMemoryProvider):
+    """Provider that opts into the exact human-typed subset of the host message."""
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None,
+                  turn_author=None, typed_user_content=None):
+        self.synced_turns.append((user_content, assistant_content, turn_author, typed_user_content))
+
+
 class BlockingPrefetchProvider(FakeMemoryProvider):
     """External provider whose prefetch call blocks until released."""
 
@@ -284,6 +292,26 @@ class TestMemoryManager:
         assert legacy.synced_turns == [("user", "assistant")] * 2
         assert messages_only.synced_turns == [("user", "assistant", "s1", None), ("user", "assistant", "", None)]
         assert author_aware.synced_turns == [("user", "assistant", author), ("user", "assistant", None)]
+
+    def test_sync_all_forwards_typed_text_only_to_providers_that_accept_it(self):
+        """The exact typed subset, including an explicit empty string, is opt-in like turn_author."""
+        legacy = FakeMemoryProvider("legacy")
+        typed = TypedMemoryProvider("typed")
+
+        for provider in (legacy, typed):
+            mgr = MemoryManager()
+            mgr.add_provider(provider)
+            mgr.sync_all("framed user text", "assistant", typed_user_content="typed words")
+            mgr.sync_all("machine prompt", "assistant", typed_user_content="")
+            mgr.flush_pending(timeout=5)
+
+        assert legacy.synced_turns == [
+            ("framed user text", "assistant"), ("machine prompt", "assistant"),
+        ]
+        assert typed.synced_turns == [
+            ("framed user text", "assistant", None, "typed words"),
+            ("machine prompt", "assistant", None, ""),
+        ]
 
 
     # -- Tool routing -------------------------------------------------------

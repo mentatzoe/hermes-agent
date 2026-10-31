@@ -93,7 +93,7 @@ class TestActiveTurnRedirect:
         agent._model_request_active.set()
 
         assert agent.redirect("use Postgres") is True
-        assert agent._pending_redirect == "use Postgres"
+        assert agent._pending_redirect == [{"text": "use Postgres"}]
         assert agent._interrupt_requested is True
         assert agent._interrupt_message is None
 
@@ -103,7 +103,7 @@ class TestActiveTurnRedirect:
 
         assert agent.redirect("first correction") is True
         assert agent.redirect("second correction") is True
-        pending = agent._pending_redirect
+        pending = agent._drain_pending_redirect()
         assert "first correction" in pending and "second correction" in pending
         assert pending.index("first correction") < pending.index("second correction")
 
@@ -201,7 +201,7 @@ class TestActiveTurnRedirect:
 
         assert agent.redirect("also check migrations") is True
         assert agent._pending_redirect is None
-        assert agent._pending_steer == "also check migrations"
+        assert agent._pending_steer == [{"text": "also check migrations"}]
         assert agent._interrupt_requested is False
 
 
@@ -544,7 +544,7 @@ class TestSteerClearedOnInterrupt:
 
         agent.steer("will be dropped")
         agent._pending_redirect = "also drop this"
-        assert agent._pending_steer == "will be dropped"
+        assert agent._pending_steer == [{"text": "will be dropped"}]
 
         agent.clear_interrupt(hard_cancel=True)
         assert agent._pending_steer is None
@@ -568,13 +568,13 @@ class TestSteerClearedOnInterrupt:
         agent._pending_redirect = "correction"
 
         agent.clear_interrupt(preserve_redirect=True)
-        assert agent._pending_steer == "must survive the rebuild"
+        assert agent._pending_steer == [{"text": "must survive the rebuild"}]
         # preserve_redirect semantics unchanged: the correction survives too.
         assert agent._pending_redirect == "correction"
 
         # A plain soft clear (no flags) preserves the steer as well.
         agent.clear_interrupt()
-        assert agent._pending_steer == "must survive the rebuild"
+        assert agent._pending_steer == [{"text": "must survive the rebuild"}]
         assert agent._pending_redirect is None
 
 
@@ -699,7 +699,9 @@ class TestPreApiCallSteerDrain:
             tool_row,
         ]
         agent.steer("focus on error handling")
-        _inject_steer_after_newest_tool_result(agent, messages, agent._drain_pending_steer())
+        _inject_steer_after_newest_tool_result(
+            agent, messages, agent._drain_pending_steer(), current_turn_user_idx=0,
+        )
         assert tool_row == before
         assert messages[-2] is tool_row
         assert messages[-1]["role"] == "user"

@@ -318,10 +318,9 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
-        """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
+    def _steer_running_agent(self, running_agent: Any, text: str, **kwargs) -> bool:
+        """Send facts to the parent; fan-out to active subagents stays text-only."""
+        accepted = bool(running_agent.steer(text, **kwargs))
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -684,10 +683,13 @@ class GatewayBusySessionMixin:
     ) -> bool:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
+            from gateway.typed_text import authored_steer_kwargs
             call_text = self._steer_text_with_origin(text, event) if event else text
+            method = getattr(running_agent, verb)
+            kwargs = authored_steer_kwargs(method, event)
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                return self._steer_running_agent(running_agent, call_text, **kwargs)
+            return bool(method(call_text, **kwargs))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -1111,9 +1113,16 @@ class GatewayBusySessionMixin:
         # /steer lands BETWEEN tool-call iterations of the same run (appended to the last tool
         # result) — no interrupt, no new user turn, no role-alternation violation.
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from copy import copy
+        from gateway.typed_text import authored_steer_kwargs
         steer_text = event.get_command_args().strip()
         if not steer_text:
             return t("gateway.steer.usage")
+        # Capture the parsed payload before sender/channel rendering, just as
+        # ordinary busy steering does. Do not alter the original command event.
+        event = copy(event)
+        event.text = steer_text
+        event._gateway_typed_source_text = steer_text
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
 
@@ -1121,11 +1130,7 @@ class GatewayBusySessionMixin:
             # Turn-boundary fallback: queue the steer text as its own follow-up turn.
             adapter = self._delivery_adapter_for(source)
             if adapter:
-                self._enqueue_fifo(quick_key, MessageEvent(
-                    text=steer_text, message_type=MessageType.TEXT, source=event.source,
-                    message_id=event.message_id, channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
-                ), adapter)
+                self._enqueue_fifo(quick_key, event, adapter)
             return reply
 
         if running_agent is _AGENT_PENDING_SENTINEL:
@@ -1133,7 +1138,11 @@ class GatewayBusySessionMixin:
         if not running_agent or not hasattr(running_agent, "steer"):
             return _queue_fallback(t("gateway.steer.queued_no_agent"))
         try:
-            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+            steer_text = await self._prepare_busy_steer_text(event)
+            accepted = self._steer_running_agent(
+                running_agent, self._steer_text_with_origin(steer_text, event),
+                **authored_steer_kwargs(running_agent.steer, event),
+            )
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)

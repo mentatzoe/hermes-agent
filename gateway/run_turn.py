@@ -34,7 +34,7 @@ from gateway.session import (
     build_session_context,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import TurnContext
+from gateway.turn_context import PreparedTurn, TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -1457,36 +1457,6 @@ class GatewayTurnMixin:
                 source, t("gateway.notify.no_home_channel", platform=platform_name.title(), sethome_cmd=sethome_cmd),
             )
 
-    def _hmwa_apply_message_timestamp(self, event, message_text):
-        """Capture the platform event time as message metadata and keep the persisted transcript
-        clean — strip any leading timestamp prefix and the Discord triggering-message note (a
-        model instruction, not authored text) — regardless of the toggle; only the in-context
-        RENDER is gated behind gateway.message_timestamps.enabled (default OFF)."""
-        from gateway.run import _load_gateway_config, _message_timestamps_enabled
-        from gateway.run_inbound import strip_discord_triggering_note
-        persist_user_message = None
-        persist_user_timestamp = None
-        try:
-            from hermes_time import get_timezone as _get_evt_tz
-            from gateway.message_timestamps import (
-                coerce_message_timestamp as _coerce_msg_ts,
-                render_user_content_with_timestamp as _render_msg_ts,
-                strip_leading_message_timestamps as _strip_msg_ts,
-            )
-            _evt_tz = _get_evt_tz()
-            if message_text and isinstance(message_text, str):
-                _clean_message_text, _embedded_ts = _strip_msg_ts(message_text, tz=_evt_tz)
-                persist_user_message = strip_discord_triggering_note(event, _clean_message_text)
-                _event_epoch = _coerce_msg_ts(getattr(event, "timestamp", None), tz=_evt_tz)
-                persist_user_timestamp = _event_epoch if _event_epoch is not None else _embedded_ts
-                if _message_timestamps_enabled(_load_gateway_config()):
-                    message_text = _render_msg_ts(_clean_message_text, persist_user_timestamp, tz=_evt_tz)
-                else:
-                    # Toggle off: the model sees the clean message; timestamp stored for later opt-in.
-                    message_text = _clean_message_text
-        except Exception as _ts_err:
-            logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
-        return message_text, persist_user_message, persist_user_timestamp
 
     async def _hmwa_stop_typing_for_turn(self, event, source):
         """Stop the typing indicator (never raises). Slack AI status is scoped to a thread/
@@ -2030,19 +2000,7 @@ class GatewayTurnMixin:
         )
         self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
 
-    @dataclasses.dataclass
-    class _PreparedTurn:
-        """Inputs to the agent run assembled by ``_hmwa_prepare_turn``."""
-
-        history: Any
-        context_prompt: str
-        message_text: Any
-        persist_user_message: Any
-        persist_user_timestamp: Any
-        persist_user_display_kind: Optional[str]
-        persistence_session_id: Optional[str] = None
-        persistence_owner: Optional[str] = None
-        title_user_message: Optional[str] = None
+    _PreparedTurn = PreparedTurn
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2077,6 +2035,9 @@ class GatewayTurnMixin:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
 
         # Keep human text separate from skills, sender metadata, and other model context.
+        # Preserve the source before auto-load rewrites event.text; slash dispatch may already have saved it.
+        if not hasattr(event, "_gateway_typed_source_text"):
+            event._gateway_typed_source_text = event.text or ""
         # With no text (e.g. voice-only), retain the existing enriched-message title fallback.
         title_user_message = event.text or None
 
@@ -2117,9 +2078,8 @@ class GatewayTurnMixin:
         if message_text is None:
             return None, _session_env_tokens
 
-        message_text, persist_user_message, persist_user_timestamp = (
-            self._hmwa_apply_message_timestamp(event, message_text)
-        )
+        from gateway.typed_text import apply_message_timestamp
+        message_text, persist_user_message, persist_user_timestamp = apply_message_timestamp(event, message_text)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
@@ -2140,6 +2100,8 @@ class GatewayTurnMixin:
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            typed_user_message=getattr(event, "_gateway_typed_user_content", None),
+            recoverable_audio_paths=getattr(event, "_gateway_recoverable_audio_paths", []),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2195,6 +2157,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from gateway.steer_followup import steer_followup_metadata
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2202,13 +2165,16 @@ class GatewayTurnMixin:
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
+                typed_user_message=prepared.typed_user_message,
+                recoverable_audio_paths=prepared.recoverable_audio_paths,
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
-                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event),
+                    **steer_followup_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -3669,8 +3635,12 @@ class GatewayTurnMixin:
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
         if leftover_steer:
+            from gateway.steer_followup import steer_followup_event
+            entries = result.get("pending_steer_entries")
+            steer_event = steer_followup_event(self, session_key, source, leftover_steer, entries) if entries else None
             if not pending and not pending_event:
                 pending = leftover_steer
+                pending_event = steer_event
                 logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
             elif pending_event and adapter and session_key:
                 # User steered during the turn, but a background event or queued message arrived.
@@ -3689,22 +3659,16 @@ class GatewayTurnMixin:
                         overflow.insert(0, pending_event)
                     else:
                         self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
-                pending_event = None
+                pending_event = steer_event
                 pending = leftover_steer
                 logger.debug(
                     "Delivering leftover /steer before queued event for session %s: '%s...'",
                     session_key, pending[:40],
                 )
             elif pending and not pending_event:
-                from gateway.platforms.base import MessageEvent
                 # A deferred steer continues the active channel context, just like an
                 # eventless follow-up. Reuse its pins without marking the user as internal.
-                steer_prompt, steer_source = self._pinned_channel_inputs(
-                    session_key, None, source, internal=True,
-                )
-                steer_event = MessageEvent(
-                    text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
-                )
+                steer_event = steer_event or steer_followup_event(self, session_key, source, leftover_steer)
                 if session_key:
                     self._enqueue_fifo(session_key, steer_event, adapter)
                 logger.debug(
@@ -3816,6 +3780,7 @@ class GatewayTurnMixin:
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
         from gateway.run import _preserve_queued_followup_history_offset
+        from gateway.steer_followup import steer_followup_metadata
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
         )
@@ -3853,6 +3818,8 @@ class GatewayTurnMixin:
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
+        next_typed_message = None
+        next_recoverable_audio_paths = []
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -3884,6 +3851,8 @@ class GatewayTurnMixin:
             )
             if next_message is None:
                 return result
+            next_typed_message = getattr(pending_event, "_gateway_typed_user_content", None)
+            next_recoverable_audio_paths = getattr(pending_event, "_gateway_recoverable_audio_paths", [])
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
             next_message_id = self._reply_anchor_for_event(pending_event)
@@ -3944,11 +3913,14 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
+                typed_user_message=next_typed_message,
+                recoverable_audio_paths=next_recoverable_audio_paths,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
-                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
+                    **steer_followup_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4277,6 +4249,8 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        typed_user_message: Optional[str] = None,
+        recoverable_audio_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4310,6 +4284,8 @@ class GatewayTurnMixin:
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,
+            typed_user_message=typed_user_message,
+            recoverable_audio_paths=recoverable_audio_paths,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,

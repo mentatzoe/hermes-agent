@@ -5,6 +5,7 @@ clone lookup) and sync markers after commit."""
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from typing import Any, Callable, Dict, List, Mapping
 
@@ -13,7 +14,7 @@ from agent.message_metadata import (
     CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, copy_identity_fields, message_uid_or_none)
 from hermes_state_common import _id_chunks, _placeholders
 from hermes_state_identity import _fill_missing_tool_call_uids, _restore_row_identity
-from hermes_state_messages import _MESSAGE_WRITE_COLUMNS
+from hermes_state_messages import _MESSAGE_WRITE_COLUMNS, SessionMessagesMixin
 
 
 # Durable payload columns a row-addressed rewrite may change: every INSERT column except row identity,
@@ -41,6 +42,15 @@ _SYNC_FIELDS = ("role",) + _REPAIR_COLUMNS
 _METADATA_ONLY = "_metadata_only"
 _CONTENT_ONLY = "_content_only"
 
+# These keys share the metadata column but hold canonical human source facts,
+# unlike reactions/display hints. Version and rewrite only this owned subset.
+_SOURCE_INPUT_KEYS = frozenset({"steer_entries", "mid_turn_entries"})
+
+
+def _source_input_metadata(row: Mapping[str, Any]) -> dict:
+    metadata = SessionMessagesMixin._decode_display_metadata(row["display_metadata"]) or {}
+    return {key: metadata[key] for key in _SOURCE_INPUT_KEYS if key in metadata}
+
 
 def transcript_row_snapshot(row: Mapping[str, Any]) -> str:
     """Fixed-size digest of the owned (non-metadata) columns (the CAS version) of a ``SELECT *`` messages row.
@@ -63,6 +73,9 @@ def transcript_row_snapshot(row: Mapping[str, Any]) -> str:
         else:
             tag, data = (b"F" if isinstance(value, float) else b"I"), repr(value).encode("ascii")
         digest.update(tag + len(data).to_bytes(8, "big") + data)
+    inputs = _source_input_metadata(row)
+    if inputs:
+        digest.update(b"I" + json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -159,7 +172,8 @@ def resolve_and_repair_transcript_batch(
                     # Replays never decode token_count (the agent flush row sets it to None): None means
                     # "unknown", not NULL.
                     serialized = {**serialized, "token_count": target_row["token_count"]}
-                if any(target_row[column] != serialized[column] for column in _OWNED_COLUMNS):
+                if (any(target_row[column] != serialized[column] for column in _OWNED_COLUMNS)
+                        or _source_input_metadata(target_row) != _source_input_metadata(serialized)):
                     _rewrite_row(conn, session_id, target_row, serialized)
                     wrote = True
                 missing = {c: target_row[c] for c in _LIVE_MISSING_METADATA if msg.get(c) is None}
@@ -216,11 +230,15 @@ def _rewrite_row(
         ).fetchall()
     ] if old_identity is not None else []
 
-    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed.
+    # Preserve fresh display metadata; only canonical input facts are ours to rewrite.
+    metadata = SessionMessagesMixin._decode_display_metadata(target_row["display_metadata"]) or {}
+    metadata = {key: value for key, value in metadata.items() if key not in _SOURCE_INPUT_KEYS}
+    metadata.update(_source_input_metadata(serialized))
     assignments = ", ".join(f"{column} = ?" for column in _OWNED_COLUMNS)
     conn.execute(
-        f"UPDATE messages SET {assignments} WHERE id = ? AND session_id = ?",
-        [*(serialized[column] for column in _OWNED_COLUMNS), int(target_row["id"]), session_id],
+        f"UPDATE messages SET {assignments}, display_metadata = ? WHERE id = ? AND session_id = ?",
+        [*(serialized[column] for column in _OWNED_COLUMNS), json.dumps(metadata) if metadata else None,
+         int(target_row["id"]), session_id],
     )
     _restore_display_index(conn, session_id, target_row, serialized, old_identity, old_peer_ids)
 
@@ -324,6 +342,8 @@ def sync_flushed_message_markers(batch_msgs: List[Dict[str, Any]], batch_rows: L
         elif isinstance(canonical, dict) and canonical.get(_CONTENT_ONLY):
             written["content"] = canonical["content"]
         elif isinstance(canonical, dict):
+            # The winner's persisted source facts replace the old live-key view too.
+            written.pop("steer_entries", None)
             for key in _SYNC_FIELDS:
                 if key in canonical and canonical[key] is not None:
                     written[key] = canonical[key]
