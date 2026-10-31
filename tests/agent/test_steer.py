@@ -699,7 +699,9 @@ class TestPreApiCallSteerDrain:
             tool_row,
         ]
         agent.steer("focus on error handling")
-        _inject_steer_after_newest_tool_result(agent, messages, agent._drain_pending_steer())
+        _inject_steer_after_newest_tool_result(
+            agent, messages, agent._drain_pending_steer(), current_turn_user_idx=0,
+        )
         assert tool_row == before
         assert messages[-2] is tool_row
         assert messages[-1]["role"] == "user"
