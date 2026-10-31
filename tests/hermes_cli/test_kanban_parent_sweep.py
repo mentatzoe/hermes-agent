@@ -455,3 +455,171 @@ def test_a_sibling_board_without_links_that_names_the_directory_fails_closed(kan
         assert kbw._workspace_in_use_by_other(conn, owner, owner_ws) == "unknown"
         assert kb.complete_task(conn, owner, summary="owner done")
         assert (owner_ws / "handoff.txt").is_file()
+
+
+@pytest.mark.parametrize("protection", ["dirty", "unpushed", "locked", "clean"])
+@pytest.mark.parametrize("later_sibling", [False, True])
+@pytest.mark.parametrize("finish", ["complete", "archive"])
+def test_enclosing_cleanup_respects_nested_worktree_retention(
+    kanban_home: Path, repo: Path, protection: str, later_sibling: bool, finish: str
+) -> None:
+    """Neither the ancestor walk nor a later sibling may override Git's refusal.
+
+    The clean control also proves that normal child teardown releases the outer
+    directory, rather than keeping every directory that once held a worktree.
+    """
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent")
+        outer = _bind_scratch(conn, parent)
+        child = kb.create_task(
+            conn, title="nested worktree", parents=[parent],
+            workspace_kind="worktree", workspace_path=str(outer / "checkout"),
+        )
+        nested = outer / "checkout"
+        kbw._ensure_git_worktree(repo, nested, f"wt/{child}")
+        grandchild = kb.create_task(conn, title="grandchild", parents=[child])
+        grandchild_ws = _bind_scratch(conn, grandchild)
+        sibling = kb.create_task(conn, title="later sibling", parents=[parent]) if later_sibling else None
+        expected = "hello\n"
+        if protection in ("dirty", "unpushed"):
+            expected = "work that must survive\n"
+            (nested / "README.md").write_text(expected, encoding="utf-8")
+        if protection == "unpushed":
+            _git("-C", str(nested), "commit", "-am", "unpublished")
+        if protection == "locked":
+            _git("-C", str(repo), "worktree", "lock", str(nested))
+        head = _git("-C", str(nested), "rev-parse", "HEAD").strip()
+
+        for task in (parent, child):
+            assert kb.complete_task(conn, task, summary="done")
+            assert nested.is_dir()
+        if finish == "archive":
+            assert kb.archive_task(conn, grandchild)
+        else:
+            assert kb.complete_task(conn, grandchild, summary="done")
+        assert not grandchild_ws.exists()
+        if sibling:
+            assert kb.complete_task(conn, sibling, summary="later retry of parent cleanup")
+
+        if protection == "clean":
+            assert not nested.exists() and not outer.exists()
+        else:
+            assert (nested / "README.md").read_text(encoding="utf-8") == expected
+            assert _git("-C", str(nested), "rev-parse", "HEAD").strip() == head
+            assert str(nested) in _git("-C", str(repo), "worktree", "list", "--porcelain")
+
+
+def test_enclosing_cleanup_keeps_the_nested_worktrees_common_repository(
+    kanban_home: Path, repo: Path
+) -> None:
+    """resolve_workspace creates a child in a scratch-owned repository. Keep
+    both the checkout and the only copy of its unpublished commit objects.
+    """
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="scratch-owned repository")
+        outer = _bind_scratch(conn, parent)
+        _git("init", str(outer))
+        _git("-C", str(outer), "config", "user.email", "t@example.com")
+        _git("-C", str(outer), "config", "user.name", "t")
+        _git("-C", str(outer), "remote", "add", "origin", str(repo.parent / "origin.git"))
+        _git("-C", str(outer), "fetch", "origin")
+        branch = _git("-C", str(repo), "branch", "--show-current").strip()
+        _git("-C", str(outer), "checkout", "-b", "fixture", f"origin/{branch}")
+        child = kb.create_task(
+            conn, title="child", parents=[parent],
+            workspace_kind="worktree", workspace_path=str(outer),
+        )
+        task = kb.get_task(conn, child)
+        assert task is not None
+        actual = kbw.resolve_workspace(task)
+        assert actual == outer / ".worktrees" / child
+        kbw.set_workspace_path(conn, child, actual)
+        (actual / "README.md").write_text("only copy\n", encoding="utf-8")
+        _git("-C", str(actual), "commit", "-am", "unpublished")
+        head = _git("-C", str(actual), "rev-parse", "HEAD").strip()
+        grandchild = kb.create_task(conn, title="grandchild", parents=[child])
+        _bind_scratch(conn, grandchild)
+        for task in (parent, child, grandchild):
+            assert kb.complete_task(conn, task, summary="done")
+        assert (outer / ".git").is_dir()
+        assert _git("-C", str(actual), "rev-parse", "HEAD").strip() == head
+        assert _git("-C", str(outer), "show", f"{head}:README.md") == "only copy\n"
+
+
+@pytest.mark.parametrize("other_board", [False, True])
+@pytest.mark.parametrize("placement", ["equal", "nested"])
+@pytest.mark.parametrize("kind", ["dir", "worktree"])
+def test_scratch_cleanup_cannot_override_a_finished_retained_workspace(
+    kanban_home: Path, repo: Path, other_board: bool, placement: str, kind: str
+) -> None:
+    """The safety decision survives a fresh completion/GC call on either board."""
+    if other_board:
+        kb.create_board("other")
+    with contextlib.ExitStack() as stack:
+        conn = stack.enter_context(kbc.connect_closing())
+        holder_conn = stack.enter_context(kbc.connect_closing(board="other")) if other_board else conn
+        owner = kb.create_task(conn, title="scratch owner")
+        outer = kb.workspaces_root() / owner
+        retained = outer / "nested" if placement == "nested" else outer
+        holder = kb.create_task(
+            holder_conn, title="retained workspace", workspace_kind=kind, workspace_path=str(retained),
+        )
+        if kind == "worktree":
+            kbw._ensure_git_worktree(repo, retained, f"wt/{holder}")
+        else:
+            retained.mkdir(parents=True)
+        (retained / "keep.txt").write_text("retained\n", encoding="utf-8")
+        assert kb.complete_task(holder_conn, holder, summary="done; directory retained")
+        kbw.set_workspace_path(conn, owner, outer)
+        assert kb.complete_task(conn, owner, summary="done")
+        assert kb.archive_task(conn, owner)
+        assert kanban_ops._cmd_gc(argparse.Namespace(event_retention_days=0, log_retention_days=0)) == 0
+        assert (retained / "keep.txt").read_text(encoding="utf-8") == "retained\n"
+
+
+@pytest.mark.parametrize("other_board", [False, True])
+def test_finished_equal_worktree_sharers_can_still_remove_a_clean_checkout(
+    kanban_home: Path, repo: Path, other_board: bool
+) -> None:
+    """Retaining an enclosing directory must not deadlock equal-path Git teardown."""
+    if other_board:
+        kb.create_board("other")
+    with contextlib.ExitStack() as stack:
+        conn = stack.enter_context(kbc.connect_closing())
+        other = stack.enter_context(kbc.connect_closing(board="other")) if other_board else conn
+        path = repo / ".worktrees" / "shared"
+        first = kb.create_task(conn, title="first", workspace_kind="worktree", workspace_path=str(path))
+        last = kb.create_task(other, title="last", workspace_kind="worktree", workspace_path=str(path))
+        kbw._ensure_git_worktree(repo, path, "fixture-shared")
+        assert kb.complete_task(conn, first, summary="done")
+        assert path.is_dir()
+        assert kb.complete_task(other, last, summary="done")
+        assert not path.exists()
+
+
+@pytest.mark.parametrize("other_board", [False, True])
+def test_unreadable_retained_path_refuses_enclosing_cleanup(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, other_board: bool
+) -> None:
+    if other_board:
+        kb.create_board("other")
+    with contextlib.ExitStack() as stack:
+        conn = stack.enter_context(kbc.connect_closing())
+        other = stack.enter_context(kbc.connect_closing(board="other")) if other_board else conn
+        owner = kb.create_task(conn, title="scratch")
+        outer = _bind_scratch(conn, owner)
+        inside = outer / "permanent"
+        holder = kb.create_task(other, title="dir", workspace_kind="dir", workspace_path=str(inside))
+        inside.mkdir()
+        assert kb.complete_task(other, holder, summary="done")
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == inside:
+                raise PermissionError("retained workspace is unreadable")
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        assert kbw._workspace_in_use_by_other(conn, owner, outer) == "unknown"
+        assert kb.complete_task(conn, owner, summary="done")
+        assert outer.is_dir()
