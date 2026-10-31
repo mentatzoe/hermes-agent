@@ -40,6 +40,16 @@ def retain_mid_turn_entries(row: dict, entries: list[PendingHumanInput]) -> None
     row["display_metadata"] = {**(row.get("display_metadata") or {}), "mid_turn_entries": snapshot}
 
 
+def merge_mid_turn_entries(previous: dict, following: dict) -> bool:
+    """Conserve accepted occurrences when a canonical row absorbs its successor."""
+    incoming = [*((following.get("display_metadata") or {}).get("steer_entries") or []),
+                *(mid_turn_entries(following) or [])]
+    if not incoming:
+        return False
+    retain_mid_turn_entries(previous, [*(mid_turn_entries(previous) or []), *incoming])
+    return True
+
+
 def mid_turn_human_row(agent, entries, *, content: str, **metadata) -> dict:
     """Build any delivered human row without deriving facts from its rendered text.
 
