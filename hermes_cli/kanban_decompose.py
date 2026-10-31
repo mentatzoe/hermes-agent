@@ -138,19 +138,23 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
     credential-less incognito profile, say — and that profile must never
     silently become the owner of work the card was assigned away from (#114294).
     """
+    from hermes_cli.kanban_assignment_policy import assignment_allowed, assignment_assignee
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get(key) or "").strip()
     for candidate in (explicit, (fallback or "").strip()):
-        if candidate:
+        if candidate and assignment_allowed(candidate):
             try:
                 if profiles_mod.profile_exists(candidate):
                     return candidate
             except Exception:
                 pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    resolved = assignment_assignee(active)
+    assert resolved is not None
+    return resolved
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -161,6 +165,8 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return [], set()
+    from hermes_cli.kanban_assignment_policy import assignment_allowed
+    all_profiles = [p for p in all_profiles if assignment_allowed(p.name)]
     roster = []
     for p in all_profiles:
         desc = (p.description or "").strip()
@@ -209,9 +215,14 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
         cfg = {}
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     roster, valid_names = _build_roster()
+    from hermes_cli.kanban_assignment_policy import default_assignment_allowed, assignment_allowed
+    orchestrator = _resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee)
+    default_fallback = root_assignee
+    if not default_assignment_allowed() and (not root_assignee or not assignment_allowed(root_assignee)):
+        default_fallback = orchestrator
     return _Routing(
-        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee),
-        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=root_assignee),
+        orchestrator=orchestrator,
+        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=default_fallback),
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
@@ -313,7 +324,10 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
-    routing = _load_routing(root_assignee=task.assignee)
+    try:
+        routing = _load_routing(root_assignee=task.assignee)
+    except ValueError as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(

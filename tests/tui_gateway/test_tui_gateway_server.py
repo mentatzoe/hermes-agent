@@ -820,7 +820,6 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch, tmp_path
 ):
     """Agent construction must start MCP discovery under the selected profile."""
-    import threading
     import uuid
 
     from hermes_constants import get_hermes_home
@@ -844,14 +843,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         lambda: seen.append(str(get_hermes_home())),
     )
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
-    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
-    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
-    # CI runs this huge file serially under load; a prior session's _build can
-    # still be finishing (session.info emit) when the next test starts, so a
-    # 2s Event wait flakes. Unique sid + longer bound; still fail closed.
-    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    # This tests discovery's profile binding, not session-info's Git probes,
+    # plugin hooks or cold tool discovery after the fake _make_agent returns.
+    monkeypatch.setattr(server, "_announce_built_agent", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
 
     ready = threading.Event()
@@ -867,8 +862,13 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         server._start_agent_build(sid, session)
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
         assert ready.wait(timeout=5), "agent_ready never set after build"
+        assert session.get("agent_error") is None
     finally:
+        worker = session.get("_agent_build_thread")
+        if worker is not None:
+            worker.join(timeout=5)
         server._sessions.pop(sid, None)
+        assert worker is not None and not worker.is_alive(), "build outlived its test patches"
 
     assert seen == [str(profile_home)]
 
@@ -22763,12 +22763,12 @@ def test_prompt_submit_row_id_db_fallback_ordinal_mapping_verifies_content(
 
 
 def _join_turn_thread(sess, timeout=10.0):
-    """Join the real turn ``prompt.submit`` started, so nothing it does races the
-    assertions or leaks into the next test. The submit's dispatch thread hands off to a
-    ``prompt-turn-*`` worker that replaces ``_run_thread``: follow the handle until it
-    stops changing."""
+    """Join the real dispatch and prompt-turn workers within one shared deadline.
+    Follow replacement _run_thread handles so no turn outlives this test."""
     deadline = time.monotonic() + timeout
     while isinstance(run_thread := sess.get("_run_thread"), threading.Thread):
+        # _start_session_work publishes the replacement before Thread.start().
+        assert run_thread._started.wait(timeout=max(0.0, deadline - time.monotonic())), "prompt.submit turn thread did not start"
         run_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         assert not run_thread.is_alive(), "prompt.submit turn thread did not finish"
         if sess.get("_run_thread") is run_thread:
