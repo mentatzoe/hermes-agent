@@ -39,6 +39,8 @@ def server():
     # server's ``current_transport()`` never reads (first-in-process test sees ``_stdio_transport`` as caller).
     import tui_gateway.server_requests  # noqa: F401
     import tui_gateway.transport  # noqa: F401
+    # Keep contracts outside patch.dict too: cold Pydantic catalog construction is setup, not response latency.
+    import tui_gateway.contracts  # noqa: F401
     with patch.dict("sys.modules", {
         "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
         "hermes_cli.env_loader": MagicMock(),
@@ -68,8 +70,6 @@ def server():
     from tui_gateway import server_requests
     server_requests.reset_for_tests()
     mod._live_transports.clear()
-
-
 
 
 @pytest.fixture()

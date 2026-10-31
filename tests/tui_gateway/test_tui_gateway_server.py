@@ -820,7 +820,6 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch, tmp_path
 ):
     """Agent construction must start MCP discovery under the selected profile."""
-    import threading
     import uuid
 
     from hermes_constants import get_hermes_home
@@ -844,14 +843,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         lambda: seen.append(str(get_hermes_home())),
     )
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
-    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
-    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
-    # CI runs this huge file serially under load; a prior session's _build can
-    # still be finishing (session.info emit) when the next test starts, so a
-    # 2s Event wait flakes. Unique sid + longer bound; still fail closed.
-    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    # This tests discovery's profile binding, not session-info's Git probes,
+    # plugin hooks or cold tool discovery after the fake _make_agent returns.
+    monkeypatch.setattr(server, "_announce_built_agent", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
 
     ready = threading.Event()
@@ -867,8 +862,13 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         server._start_agent_build(sid, session)
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
         assert ready.wait(timeout=5), "agent_ready never set after build"
+        assert session.get("agent_error") is None
     finally:
+        worker = session.get("_agent_build_thread")
+        if worker is not None:
+            worker.join(timeout=5)
         server._sessions.pop(sid, None)
+        assert worker is not None and not worker.is_alive(), "build outlived its test patches"
 
     assert seen == [str(profile_home)]
 
