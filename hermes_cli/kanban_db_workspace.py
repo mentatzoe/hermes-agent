@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 import time
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
@@ -86,10 +86,22 @@ def _is_terminal_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(_TERMINAL_TASK_SQL, (task_id,)).fetchone() is not None
 
 
+# A finished task keeps its directory while one of its own children is unfinished
+# (_cleanup_workspace defers for that child), so until that child finishes the path is
+# still in use. Without this, removing a parent's directory could take away the
+# handoff files of a finished task that shares or contains it.
+# Finished rows are read apart from the unfinished ones, and the children of a finished
+# row are looked up only when its path overlaps the directory being removed. A board
+# whose links cannot be read therefore refuses the delete only when the answer depends on them.
 _OTHER_LIVE_PATHS_SQL = (
     "SELECT workspace_path FROM tasks "
     "WHERE id != ? AND workspace_path IS NOT NULL "
     f"AND status NOT IN {_TERMINAL_STATUSES_SQL}"
+)
+_OTHER_FINISHED_PATHS_SQL = (
+    "SELECT id, workspace_path FROM tasks "
+    "WHERE id != ? AND workspace_path IS NOT NULL "
+    f"AND status IN {_TERMINAL_STATUSES_SQL}"
 )
 # Sibling boards mint their own ids, so the id being cleaned up here can
 # name a different live task there. Do not exclude it.
@@ -98,24 +110,86 @@ _ANY_LIVE_PATHS_SQL = (
     "WHERE workspace_path IS NOT NULL "
     f"AND status NOT IN {_TERMINAL_STATUSES_SQL}"
 )
+_ANY_FINISHED_PATHS_SQL = (
+    "SELECT id, workspace_path FROM tasks "
+    "WHERE workspace_path IS NOT NULL "
+    f"AND status IN {_TERMINAL_STATUSES_SQL}"
+)
+
+
+def _path_is_within(path_key: str, root_key: str) -> bool:
+    """True when *path_key* is *root_key* or lies below it, by whole path components.
+
+    ``/w/t_ab`` is not within ``/w/t_a``: a string prefix is not a parent directory.
+    """
+    return PurePath(path_key).is_relative_to(PurePath(root_key))
+
+
+def _stored_path_within(stored: Optional[str], key: str) -> bool:
+    """Whether a stored ``workspace_path`` resolves to *key* or to something below it."""
+    if not stored:
+        return False
+    try:
+        stored_key = _path_key(Path(stored).expanduser().resolve(strict=False))
+    except OSError:
+        return False
+    return _path_is_within(stored_key, key)
+
+
+def _finished_workspace_is_retained(
+    conn: sqlite3.Connection, row: sqlite3.Row, key: str, *, worktree_cleanup: bool
+) -> bool:
+    """A retained checkout cannot be removed through an enclosing directory.
+
+    A terminal worktree that still exists has not passed its own safe teardown
+    (dirty, unpushed, locked or unreadable). Let that teardown remove it first.
+    A dir workspace is deliberately permanent. Read the kind only for an
+    overlapping path that exists, so unrelated old/minimal rows need no new columns.
+    """
+    path = Path(row["workspace_path"]).expanduser()
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    kind = conn.execute(
+        "SELECT workspace_kind FROM tasks WHERE id = ?", (row["id"],)
+    ).fetchone()["workspace_kind"]
+    if kind == "dir":
+        return True
+    if kind != "worktree":
+        return False
+    # Equal worktree sharers can use the normal Git safety checks together.
+    # Scratch rmtree never gets that exemption, even at exactly the same path.
+    return not worktree_cleanup or _path_key(path.resolve(strict=False)) != key
 
 
 def _conn_uses_path(
-    conn: sqlite3.Connection, task_id: str, key: str, *, exclude_task_id: bool = True
+    conn: sqlite3.Connection, task_id: str, key: str, *, exclude_task_id: bool = True,
+    worktree_cleanup: bool = False,
 ) -> bool:
+    """Whether a task that still needs its directory sits at *key* or below it.
+
+    A task needs its directory while it is unfinished, and while it has an
+    unfinished child (a finished card keeps its handoff files for that child).
+    Removing *key* removes everything under it, so a needed directory nested
+    inside *key* counts the same as one that is equal to it.
+
+    Finished dir/worktree paths can remain intentionally retained after their
+    children finish. A database or filesystem error reaches the caller, which
+    refuses the delete.
+    """
     if exclude_task_id:
-        rows = conn.execute(_OTHER_LIVE_PATHS_SQL, (task_id,)).fetchall()
+        live_sql, finished_sql, params = _OTHER_LIVE_PATHS_SQL, _OTHER_FINISHED_PATHS_SQL, (task_id,)
     else:
-        rows = conn.execute(_ANY_LIVE_PATHS_SQL).fetchall()
-    for row in rows:
-        other = row["workspace_path"]
-        if not other:
-            continue
-        try:
-            other_key = _path_key(Path(other).expanduser().resolve(strict=False))
-        except OSError:
-            continue
-        if other_key == key:
+        live_sql, finished_sql, params = _ANY_LIVE_PATHS_SQL, _ANY_FINISHED_PATHS_SQL, ()
+    for row in conn.execute(live_sql, params).fetchall():
+        if _stored_path_within(row["workspace_path"], key):
+            return True
+    for row in conn.execute(finished_sql, params).fetchall():
+        if _stored_path_within(row["workspace_path"], key) and (
+            _has_active_children(conn, row["id"])
+            or _finished_workspace_is_retained(conn, row, key, worktree_cleanup=worktree_cleanup)
+        ):
             return True
     return False
 
@@ -153,27 +227,38 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     return found
 
 
-def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
+def _other_board_uses_path(
+    db_file: Path, task_id: str, key: str, *, worktree_cleanup: bool = False
+) -> bool:
     uri = db_file.as_uri() + "?mode=ro"
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        return _conn_uses_path(other, task_id, key, exclude_task_id=False)
+        return _conn_uses_path(
+            other, task_id, key, exclude_task_id=False, worktree_cleanup=worktree_cleanup,
+        )
     finally:
         other.close()
 
 
 def _workspace_in_use_by_other(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, worktree_cleanup: bool = False
 ) -> Optional[str]:
     """Why *path* must be kept: ``"shared"``, ``"unknown"``, or None when free.
 
     ``gc``, completion and deferred parent cleanup used to ``rmtree`` a shared
     ``workspace_path`` as soon as one of its tasks went terminal. Compare the
-    resolved path: a row may store ``~`` or a symlinked spelling.
+    resolved path: a row may store ``~`` or a symlinked spelling. A task still
+    needs its directory while it is unfinished and while it has an unfinished
+    child, and a needed directory inside *path* counts as using *path*, because
+    removing *path* removes it too. An existing finished dir/worktree also keeps
+    its enclosing directory: the sweep must not override its retention checks.
+    Only normal worktree cleanup may treat terminal equal-path worktree sharers
+    as free, since Git's own safety checks still guard that removal.
 
-    The connection covers one board. A ready task on a named board can point
-    at the same directory. If that set of databases cannot be read, refuse
+    The connection covers one board. A task on a named board can point
+    at the same directory, and the same lifetime rule applies there. If that set
+    of databases cannot be read, or a board's tasks or links cannot, refuse
     the delete (``"unknown"``) and log the board DB that failed, so one broken
     sibling DB is not reported as a live sharer.
     """
@@ -185,9 +270,9 @@ def _workspace_in_use_by_other(
     if not key:
         return None
     try:
-        if _conn_uses_path(conn, task_id, key):
+        if _conn_uses_path(conn, task_id, key, worktree_cleanup=worktree_cleanup):
             return "shared"
-    except sqlite3.Error as exc:
+    except (OSError, sqlite3.Error) as exc:
         _kb._log.warning("Cannot read live workspaces for task %s: %s", task_id, exc)
         return "unknown"
     try:
@@ -197,7 +282,7 @@ def _workspace_in_use_by_other(
         return "unknown"
     for db_file in siblings:
         try:
-            if _other_board_uses_path(db_file, task_id, key):
+            if _other_board_uses_path(db_file, task_id, key, worktree_cleanup=worktree_cleanup):
                 return "shared"
         except (OSError, sqlite3.Error) as exc:
             _kb._log.warning(
@@ -208,16 +293,16 @@ def _workspace_in_use_by_other(
 
 
 def _defer_shared_workspace_cleanup(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, worktree_cleanup: bool = False
 ) -> bool:
-    """Skip removal and record why, when *path* may still be used by a live task."""
-    reason = _workspace_in_use_by_other(conn, task_id, path)
+    """Skip removal when another task needs or intentionally retains *path*."""
+    reason = _workspace_in_use_by_other(conn, task_id, path, worktree_cleanup=worktree_cleanup)
     if reason is None:
         return False
     if reason == "shared":
         _kb._log.warning(
-            "Deferring workspace cleanup for task %s: %s is still used by "
-            "another non-terminal task",
+            "Deferring workspace cleanup for task %s: another task still needs "
+            "%s or a directory inside it",
             task_id, path,
         )
     else:
@@ -248,7 +333,7 @@ def _defer_shared_worktree_cleanup(
     return (
         wt.is_dir()
         and _is_linked_worktree_checkout(wt)
-        and _defer_shared_workspace_cleanup(conn, task_id, path)
+        and _defer_shared_workspace_cleanup(conn, task_id, path, worktree_cleanup=True)
     )
 
 
@@ -385,6 +470,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
+            # This task keeps its own workspace, but its parent may have been
+            # waiting only for this task to finish (aleph-vault#284).
+            _try_cleanup_parent_workspaces(conn, task_id)
             return
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
@@ -501,40 +589,59 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     children are now all done/archived/failed/cancelled (called after each
     child completes).
 
+    A parent that was kept for a nested directory of a descendant is only
+    swept again by a later completion below it, so the walk continues up
+    through every finished ancestor that has nothing left to wait for. Each
+    ancestor gets the same checks as a parent reached directly.
+
     See #33774.
     """
     try:
-        parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ?",
-            (task_id,),
-        ).fetchall()
-        for (parent_id,) in parents:
-            row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
-            if (
-                not row
-                or row["workspace_kind"] not in _REMOVABLE_KINDS
-                or not row["workspace_path"]
-                or not _is_terminal_task(conn, parent_id)
-                or _has_active_children(conn, parent_id)
-            ):
-                continue
-            ws_path = row["workspace_path"]
-            if row["workspace_kind"] == "worktree":
-                if _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
+        seen = {task_id}
+        frontier = [task_id]
+        while frontier:
+            current = frontier.pop()
+            parents = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (current,),
+            ).fetchall()
+            for (parent_id,) in parents:
+                if parent_id in seen:
                     continue
-                _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
-                continue
-            wp = Path(ws_path)
-            if not wp.is_dir():
-                continue
-            if _is_managed_scratch_path(wp):
-                if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
+                seen.add(parent_id)
+                row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
+                if (
+                    not row
+                    or not _is_terminal_task(conn, parent_id)
+                    or _has_active_children(conn, parent_id)
+                ):
                     continue
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
-    except Exception:
-        pass  # best-effort
+                if row["workspace_kind"] in _REMOVABLE_KINDS and row["workspace_path"]:
+                    _remove_finished_parent_workspace(conn, parent_id, row)
+                frontier.append(parent_id)
+    except Exception:  # health: allow BLE001 -- cleanup is best effort and must never block completion; the traceback is logged
+        # A silent failure here is how a finished parent's directory stays on disk
+        # (aleph-vault#284), so the traceback goes to the log.
+        _kb._log.warning("Parent workspace sweep from task %s failed", task_id, exc_info=True)
+
+
+def _remove_finished_parent_workspace(
+    conn: sqlite3.Connection, parent_id: str, row: sqlite3.Row
+) -> None:
+    """Remove one finished, idle parent's workspace unless another task still needs it."""
+    ws_path = row["workspace_path"]
+    if row["workspace_kind"] == "worktree":
+        if not _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
+            _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
+        return
+    wp = Path(ws_path)
+    if not wp.is_dir() or not _is_managed_scratch_path(wp):
+        return
+    if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
+        return
+    release_lsp_clients(str(wp))
+    shutil.rmtree(wp, ignore_errors=True)
+    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
