@@ -22763,12 +22763,12 @@ def test_prompt_submit_row_id_db_fallback_ordinal_mapping_verifies_content(
 
 
 def _join_turn_thread(sess, timeout=10.0):
-    """Join the real turn ``prompt.submit`` started, so nothing it does races the
-    assertions or leaks into the next test. The submit's dispatch thread hands off to a
-    ``prompt-turn-*`` worker that replaces ``_run_thread``: follow the handle until it
-    stops changing."""
+    """Join the real dispatch and prompt-turn workers within one shared deadline.
+    Follow replacement _run_thread handles so no turn outlives this test."""
     deadline = time.monotonic() + timeout
     while isinstance(run_thread := sess.get("_run_thread"), threading.Thread):
+        # _start_session_work publishes the replacement before Thread.start().
+        assert run_thread._started.wait(timeout=max(0.0, deadline - time.monotonic())), "prompt.submit turn thread did not start"
         run_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         assert not run_thread.is_alive(), "prompt.submit turn thread did not finish"
         if sess.get("_run_thread") is run_thread:

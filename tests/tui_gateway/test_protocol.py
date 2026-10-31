@@ -1917,17 +1917,17 @@ def test_unregister_live_transport_stops_delivery(capture, monkeypatch):
 
 
 def test_approval_for_a_ws_client_that_never_advertised_settles_the_queue_entry(server, monkeypatch):
-    """The approval wait is owned by ``tools.approval``'s queue, not by ``server_requests``. When the request
-    cannot be sent (the only client predates server→client requests) the queue entry must be withdrawn too,
-    otherwise ``_await_gateway_decision`` idles for the whole approvals.timeout with no prompt anywhere
-    (#112548). The decision is a withdrawal (``cancelled`` cause), never a user deny."""
+    """Withdraw the queue entry for an unsupported client, not just its server request (#112548).
+    This is cancellation, never user denial; don't wait out approvals.timeout with no prompt.
+    Keep unrelated observers and cold payload setup outside the measured queue/transport path."""
     from tools import approval as approval_mod
     from tools import approval_gateway_wait as wait_mod
 
     peer = _silent_ws()
     _ws_session(server, "ws-old-approval", peer)
     monkeypatch.setattr(wait_mod._ctx, "_get_approval_timeout", lambda: 3)
-    monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kw: None)
+    server._approval_request_payload({"command": "rm -rf build"})
     approval_mod.register_gateway_notify("ws-old-approval", lambda data: server._emit_approval_request("ws-old-approval", data))
     try:
         t0 = time.monotonic()
