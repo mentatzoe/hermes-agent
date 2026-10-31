@@ -236,6 +236,9 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         "platform_message_id": msg.get("platform_message_id") or msg.get("message_id"),
         "observed": bool(msg.get("observed")),
     }
+    if "steer_entries" in msg:
+        from agent.mid_turn_input import retain_mid_turn_entries
+        retain_mid_turn_entries(row, msg["steer_entries"])
     if isinstance(msg.get("_row_id"), int):
         row["_row_id"] = msg["_row_id"]
     # The merge witness rides on the survivor's row (an owned column: a row-addressed rewrite of the

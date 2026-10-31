@@ -663,6 +663,7 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
     from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
     from agent.conversation_compression_archive import MERGED_DURABLE_ROWS
+    from agent.mid_turn_input import mid_turn_entries, retain_mid_turn_entries
     from hermes_state import SessionDB
 
     def _plain_text(content: Any) -> bool:
@@ -697,6 +698,15 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             else:
                 prev.pop(MERGED_DURABLE_ROWS, None)
             prev["content"] = merged_content
+            incoming_entries = [
+                *((msg.get("display_metadata") or {}).get("steer_entries") or []),
+                *(mid_turn_entries(msg) or []),
+            ]
+            if incoming_entries:
+                # Accepted inputs are source facts, not disposable display metadata.
+                # Preserve occurrences (including identical words) in delivery order.
+                retain_mid_turn_entries(prev, [*(mid_turn_entries(prev) or []), *incoming_entries])
+                prev.pop(_DB_PERSISTED_MARKER, None)
             # The clean-text persist override must replace only the absorbed turn, never the
             # unanswered text before it; kept across replay passes (an empty turn absorbs too).
             if prev_content:

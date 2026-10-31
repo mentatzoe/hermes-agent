@@ -925,7 +925,7 @@ class AIAgent(
                 sync_kwargs["typed_user_content"] = typed_user_content
             if current_turn_user_idx is not None:
                 sync_kwargs["current_turn_user_idx"] = current_turn_user_idx
-            recoverable_audio_paths = getattr(self, "_turn_recoverable_audio_paths", None)
+            recoverable_audio_paths = getattr(self, "_turn_opener_recoverable_audio_paths", None)
             if recoverable_audio_paths is not None:
                 sync_kwargs["recoverable_audio_paths"] = list(recoverable_audio_paths)
             self._memory_manager.sync_all(user_text, response_text, **sync_kwargs)

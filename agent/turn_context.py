@@ -1058,6 +1058,12 @@ def build_turn_context(
     # every turn for the same reason as the author; None preserves the legacy whole-message contract.
     agent._turn_typed_user_message = typed_user_message
     agent._turn_recoverable_audio_paths = list(recoverable_audio_paths or ())
+    # The turn-wide tool pool may grow as other people add recordings. It is
+    # not evidence that those recordings belong to the original sender.
+    followup_entries = (persist_user_display_metadata or {}).get("steer_entries")
+    agent._turn_opener_recoverable_audio_paths = (
+        [] if followup_entries is not None else list(recoverable_audio_paths or ())
+    )
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.

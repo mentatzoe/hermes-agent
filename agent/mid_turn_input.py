@@ -23,6 +23,23 @@ def redirect_text(entries: list[PendingHumanInput] | str) -> str:
     return "\n\n[Additional user correction]\n".join(entry["text"] for entry in entries)
 
 
+def mid_turn_entries(row: dict) -> list[PendingHumanInput] | None:
+    """One source list, in its live or persisted representation (never both)."""
+    return row.get("steer_entries", (row.get("display_metadata") or {}).get("mid_turn_entries"))
+
+
+def retain_mid_turn_entries(row: dict, entries: list[PendingHumanInput]) -> None:
+    """Snapshot into the existing durable metadata column; keep the old live-key view.
+
+    The two keys alias the same list, not independently maintained input ledgers.
+    Follow-up opener entries retain their separate existing ``steer_entries`` key
+    inside display_metadata: those replace the opener, whereas these accompany it.
+    """
+    snapshot = deepcopy(entries)
+    row["steer_entries"] = snapshot
+    row["display_metadata"] = {**(row.get("display_metadata") or {}), "mid_turn_entries": snapshot}
+
+
 def mid_turn_human_row(agent, entries, *, content: str, **metadata) -> dict:
     """Build any delivered human row without deriving facts from its rendered text.
 
@@ -32,7 +49,7 @@ def mid_turn_human_row(agent, entries, *, content: str, **metadata) -> dict:
     row = {"role": "user", "content": content, **metadata}
     if isinstance(entries, str):
         return row  # legacy caller has no per-human provenance
-    row["steer_entries"] = deepcopy(entries)
+    retain_mid_turn_entries(row, entries)
     paths = [path for entry in entries for path in
              (entry.get("facts") or {}).get("recoverable_audio_paths", [])]
     if paths:
