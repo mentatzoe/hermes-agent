@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import time
 import unicodedata
@@ -91,7 +92,7 @@ def _is_terminal_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # still in use. Without this, removing a parent's directory could take away the
 # handoff files of a finished task that shares or contains it.
 # Finished rows are read apart from the unfinished ones, and the children of a finished
-# row are looked up only when its path overlaps the directory being removed. A board
+# row are looked up only when its workspace or Git storage overlaps the removal. A board
 # whose links cannot be read therefore refuses the delete only when the answer depends on them.
 _OTHER_LIVE_PATHS_SQL = (
     "SELECT workspace_path FROM tasks "
@@ -129,11 +130,128 @@ def _stored_path_within(stored: Optional[str], key: str) -> bool:
     """Whether a stored ``workspace_path`` resolves to *key* or to something below it."""
     if not stored:
         return False
-    try:
-        stored_key = _path_key(Path(stored).expanduser().resolve(strict=False))
-    except OSError:
-        return False
+    stored_key = _path_key(Path(stored).expanduser().resolve(strict=False))
     return _path_is_within(stored_key, key)
+
+
+def _workspace_git_dirs(stored: str) -> tuple[Path, ...]:
+    """Private/common Git storage of an existing managed workspace.
+
+    An absent checkout or an ancestry with no Git entry has no dependency.
+    Once an entry exists, only Git can resolve it: a failed probe is unknown,
+    not evidence that recursive removal is safe. HEAD also catches bare or
+    separately located repositories without assuming their directory name.
+    This follows a registered workspace's ancestry, not arbitrary repositories
+    or object alternates elsewhere on disk.
+    """
+    path = Path(stored).expanduser().resolve(strict=False)
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return ()
+    if not stat.S_ISDIR(mode):
+        raise OSError(f"Workspace is not a directory: {path}")
+    root = next((directory for directory in (path, *path.parents) if _has_git_entry(directory)), None)
+    if root is None:
+        return ()
+
+    from hermes_cli._subprocess_compat import bounded_probe_run, noninteractive_git_env
+
+    env = noninteractive_git_env()
+    # Discovery describes this workspace, never an ambient repository selected
+    # by the worker's environment. rev-parse executes no checkout filters.
+    for name in (
+        "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES", "GIT_SHALLOW_FILE", "GIT_NAMESPACE",
+    ):
+        env.pop(name, None)
+    env["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "1"
+    # A broken .git entry must not silently fall back to an unrelated enclosing
+    # repository. Bound discovery to the nearest entry we actually observed.
+    if root.parent != root:
+        env["GIT_CEILING_DIRECTORIES"] = str(root.parent)
+    result = bounded_probe_run(
+        ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+        timeout=5, errors="strict", env=env,
+    )
+    lines = result.stdout.splitlines() if result is not None and result.returncode == 0 else []
+    if len(lines) != 2 or not all(Path(line).is_absolute() for line in lines):
+        raise OSError(f"Cannot determine Git storage for workspace {path}")
+    reported = tuple(_lexical_path(line) for line in lines)
+    resolved = tuple(Path(line).resolve(strict=True) for line in lines)
+    if not all(stat.S_ISDIR(directory.stat().st_mode) for directory in resolved):
+        raise OSError(f"Invalid Git storage for workspace {path}")
+    _check_git_storage_locators(root, *resolved)
+    return reported + resolved
+
+
+def _git_locator_target(file: Path, prefix: str = "") -> Path:
+    """Read a standard Git locator, refusing links and nonregular files."""
+    if not stat.S_ISREG(file.lstat().st_mode):
+        raise OSError(f"Uncertain Git locator: {file}")
+    try:
+        with file.open(encoding="utf-8") as stream:
+            value = stream.read(8193).rstrip("\n")
+    except UnicodeError as exc:
+        raise OSError(f"Unreadable Git locator: {file}") from exc
+    if len(value) > 8192 or not value.startswith(prefix):
+        raise OSError(f"Invalid Git locator: {file}")
+    value = value[len(prefix):]
+    if not value or "\n" in value:
+        raise OSError(f"Invalid Git locator: {file}")
+    # A cancelled component (a/../b) still has to exist when Git reads the
+    # locator. Normalizing it away would hide that dependency from removal.
+    # Standard leading ../.. commondir pointers do not cancel a component.
+    if Path(value) != Path(os.path.normpath(value)):
+        raise OSError(f"Noncanonical Git locator: {file}")
+    return _lexical_path(file.parent / value)
+
+
+def _check_git_storage_locators(root: Path, private: Path, common: Path) -> None:
+    """Git canonicalizes away aliases needed to reach its stores.
+
+    Validate its two standard locators without attempting to discover an
+    arbitrary symlink graph. Aliased or unfamiliar locators remain unknown
+    and therefore keep the removal target, rather than losing a hidden link.
+    """
+    entry = root / ".git"
+    try:
+        mode = entry.lstat().st_mode
+    except FileNotFoundError:
+        target = root  # bare repository
+    else:
+        target = entry if stat.S_ISDIR(mode) else _git_locator_target(entry, "gitdir: ")
+    if _path_key(target) != _path_key(private):
+        raise OSError(f"Aliased Git directory for workspace {root}")
+    pointer = private / "commondir"
+    try:
+        pointer.lstat()
+    except FileNotFoundError:
+        target = private
+    else:
+        target = _git_locator_target(pointer)
+    if _path_key(target) != _path_key(common):
+        raise OSError(f"Aliased common Git directory for workspace {root}")
+
+
+def _has_git_entry(directory: Path) -> bool:
+    """Use lstat so broken Git links remain unknown, not absent."""
+    for name in (".git", "HEAD"):
+        try:
+            (directory / name).lstat()
+        except FileNotFoundError:
+            continue
+        return True
+    return False
+
+
+def _git_storage_overlaps(stored: str, key: str) -> bool:
+    # Removing a directory *inside* the Git store can destroy history too.
+    return any(
+        _path_is_within(_path_key(path), key) or _path_is_within(key, _path_key(path))
+        for path in _workspace_git_dirs(stored)
+    )
 
 
 def _finished_workspace_is_retained(
@@ -167,7 +285,7 @@ def _conn_uses_path(
     conn: sqlite3.Connection, task_id: str, key: str, *, exclude_task_id: bool = True,
     worktree_cleanup: bool = False,
 ) -> bool:
-    """Whether a task that still needs its directory sits at *key* or below it.
+    """Whether removal of *key* would destroy another task's workspace or Git storage.
 
     A task needs its directory while it is unfinished, and while it has an
     unfinished child (a finished card keeps its handoff files for that child).
@@ -183,12 +301,17 @@ def _conn_uses_path(
     else:
         live_sql, finished_sql, params = _ANY_LIVE_PATHS_SQL, _ANY_FINISHED_PATHS_SQL, ()
     for row in conn.execute(live_sql, params).fetchall():
-        if _stored_path_within(row["workspace_path"], key):
+        if _stored_path_within(row["workspace_path"], key) or _git_storage_overlaps(row["workspace_path"], key):
             return True
     for row in conn.execute(finished_sql, params).fetchall():
-        if _stored_path_within(row["workspace_path"], key) and (
+        # The checkout can be outside the removal subtree while its private or
+        # common Git directory is inside it. Do not filter by checkout first.
+        storage_overlaps = _git_storage_overlaps(row["workspace_path"], key)
+        if (storage_overlaps or _stored_path_within(row["workspace_path"], key)) and (
             _has_active_children(conn, row["id"])
-            or _finished_workspace_is_retained(conn, row, key, worktree_cleanup=worktree_cleanup)
+            or _finished_workspace_is_retained(
+                conn, row, key, worktree_cleanup=worktree_cleanup and not storage_overlaps,
+            )
         ):
             return True
     return False
@@ -255,6 +378,8 @@ def _workspace_in_use_by_other(
     its enclosing directory: the sweep must not override its retention checks.
     Only normal worktree cleanup may treat terminal equal-path worktree sharers
     as free, since Git's own safety checks still guard that removal.
+    Private/common Git directories resolved from managed workspaces count too:
+    a checkout outside *path* can still lose its history when *path* is removed.
 
     The connection covers one board. A task on a named board can point
     at the same directory, and the same lifetime rule applies there. If that set
