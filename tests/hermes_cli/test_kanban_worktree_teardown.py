@@ -40,7 +40,7 @@ def _git(*args: str, cwd: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -99,12 +99,12 @@ def test_cleanup_leaves_a_worktree_cwd_before_removal(
     wt = _make_worktree(repo, "t_cwd112425")
     real_git = kbw._git
 
-    def windows_git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
+    def windows_git(repo_root: Path, *args: str, timeout: int, **kwargs) -> subprocess.CompletedProcess:
         if args[:2] == ("worktree", "remove") and Path.cwd().is_relative_to(wt):
             return subprocess.CompletedProcess(
                 ["git", *args], 1, stderr="Permission denied: current directory"
             )
-        return real_git(repo_root, *args, timeout=timeout)
+        return real_git(repo_root, *args, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(kbw, "_git", windows_git)
     monkeypatch.chdir(wt)
@@ -139,7 +139,7 @@ def test_cleanup_retries_worktree_removal_once(
     real_git = kbw._git
     attempts = 0
 
-    def delayed_remove(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
+    def delayed_remove(repo_root: Path, *args: str, timeout: int, **kwargs) -> subprocess.CompletedProcess:
         nonlocal attempts
         if args[:2] == ("worktree", "remove"):
             attempts += 1
@@ -147,7 +147,7 @@ def test_cleanup_retries_worktree_removal_once(
                 return subprocess.CompletedProcess(
                     ["git", *args], 1, stderr="Permission denied: handle pending"
                 )
-        return real_git(repo_root, *args, timeout=timeout)
+        return real_git(repo_root, *args, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(kbw, "_git", delayed_remove)
     monkeypatch.setattr(kbw.time, "sleep", lambda _delay: None)

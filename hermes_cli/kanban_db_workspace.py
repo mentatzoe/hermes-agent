@@ -23,6 +23,7 @@ from hermes_cli.worktree_ops import release_lsp_clients
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+    from hermes_cli.kanban_worktree_removal import WorktreeRemoval
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
@@ -53,14 +54,17 @@ _ACTIVE_CHILDREN_SQL = (
 _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
 
-def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
+def _git(
+    repo_root: Path, *args: str, timeout: int, env: Optional[dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
     """``git -C repo_root args``; never raises on a non-zero exit.
 
     :func:`noninteractive_repo_git_env` (GHSA-7x36-8jrh-v4pw): the dispatcher runs ``worktree add``
     unattended, which executes the repo's hooks, ``core.fsmonitor`` and smudge filters.
     """
     from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
-    env = noninteractive_repo_git_env(repo_root)
+    if env is None:
+        env = noninteractive_repo_git_env(repo_root)
     if env is None:
         return subprocess.CompletedProcess(["git", "-C", str(repo_root), *args], 1, "", FILTER_DISCOVERY_FAILED)
     return subprocess.run(
@@ -134,7 +138,7 @@ def _stored_path_within(stored: Optional[str], key: str) -> bool:
     return _path_is_within(stored_key, key)
 
 
-def _workspace_git_dirs(stored: str) -> tuple[Path, ...]:
+def _workspace_git_dirs(stored: str, *, env: Optional[dict[str, str]] = None) -> tuple[Path, ...]:
     """Private/common Git storage of an existing managed workspace.
 
     An absent checkout or an ancestry with no Git entry has no dependency.
@@ -157,7 +161,7 @@ def _workspace_git_dirs(stored: str) -> tuple[Path, ...]:
 
     from hermes_cli._subprocess_compat import bounded_probe_run, noninteractive_git_env
 
-    env = noninteractive_git_env()
+    env = dict(env) if env is not None else noninteractive_git_env()
     # Discovery describes this workspace, never an ambient repository selected
     # by the worker's environment. rev-parse executes no checkout filters.
     for name in (
@@ -284,6 +288,7 @@ def _finished_workspace_is_retained(
 def _conn_uses_path(
     conn: sqlite3.Connection, task_id: str, key: str, *, exclude_task_id: bool = True,
     worktree_cleanup: bool = False,
+    removal: Optional[WorktreeRemoval] = None,
 ) -> bool:
     """Whether removal of *key* would destroy another task's workspace or Git storage.
 
@@ -301,16 +306,22 @@ def _conn_uses_path(
     else:
         live_sql, finished_sql, params = _ANY_LIVE_PATHS_SQL, _ANY_FINISHED_PATHS_SQL, ()
     for row in conn.execute(live_sql, params).fetchall():
-        if _stored_path_within(row["workspace_path"], key) or _git_storage_overlaps(row["workspace_path"], key):
+        if removal is not None:
+            overlaps = removal.overlaps(row["workspace_path"])
+        else:
+            overlaps = _stored_path_within(row["workspace_path"], key) or _git_storage_overlaps(row["workspace_path"], key)
+        if overlaps:
             return True
     for row in conn.execute(finished_sql, params).fetchall():
         # The checkout can be outside the removal subtree while its private or
         # common Git directory is inside it. Do not filter by checkout first.
-        storage_overlaps = _git_storage_overlaps(row["workspace_path"], key)
+        storage_overlaps = (removal.overlaps(row["workspace_path"]) if removal is not None
+                            else _git_storage_overlaps(row["workspace_path"], key))
         if (storage_overlaps or _stored_path_within(row["workspace_path"], key)) and (
             _has_active_children(conn, row["id"])
             or _finished_workspace_is_retained(
-                conn, row, key, worktree_cleanup=worktree_cleanup and not storage_overlaps,
+                conn, row, key,
+                worktree_cleanup=worktree_cleanup and (removal is not None or not storage_overlaps),
             )
         ):
             return True
@@ -351,21 +362,23 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
 
 
 def _other_board_uses_path(
-    db_file: Path, task_id: str, key: str, *, worktree_cleanup: bool = False
+    db_file: Path, task_id: str, key: str, *, worktree_cleanup: bool = False,
+    removal: Optional[WorktreeRemoval] = None,
 ) -> bool:
     uri = db_file.as_uri() + "?mode=ro"
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
         return _conn_uses_path(
-            other, task_id, key, exclude_task_id=False, worktree_cleanup=worktree_cleanup,
+            other, task_id, key, exclude_task_id=False, worktree_cleanup=worktree_cleanup, removal=removal,
         )
     finally:
         other.close()
 
 
 def _workspace_in_use_by_other(
-    conn: sqlite3.Connection, task_id: str, path: Path | str, *, worktree_cleanup: bool = False
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, worktree_cleanup: bool = False,
+    removal: Optional[WorktreeRemoval] = None,
 ) -> Optional[str]:
     """Why *path* must be kept: ``"shared"``, ``"unknown"``, or None when free.
 
@@ -395,7 +408,7 @@ def _workspace_in_use_by_other(
     if not key:
         return None
     try:
-        if _conn_uses_path(conn, task_id, key, worktree_cleanup=worktree_cleanup):
+        if _conn_uses_path(conn, task_id, key, worktree_cleanup=worktree_cleanup, removal=removal):
             return "shared"
     except (OSError, sqlite3.Error) as exc:
         _kb._log.warning("Cannot read live workspaces for task %s: %s", task_id, exc)
@@ -407,7 +420,7 @@ def _workspace_in_use_by_other(
         return "unknown"
     for db_file in siblings:
         try:
-            if _other_board_uses_path(db_file, task_id, key, worktree_cleanup=worktree_cleanup):
+            if _other_board_uses_path(db_file, task_id, key, worktree_cleanup=worktree_cleanup, removal=removal):
                 return "shared"
         except (OSError, sqlite3.Error) as exc:
             _kb._log.warning(
@@ -418,10 +431,11 @@ def _workspace_in_use_by_other(
 
 
 def _defer_shared_workspace_cleanup(
-    conn: sqlite3.Connection, task_id: str, path: Path | str, *, worktree_cleanup: bool = False
+    conn: sqlite3.Connection, task_id: str, path: Path | str, *, worktree_cleanup: bool = False,
+    removal: Optional[WorktreeRemoval] = None,
 ) -> bool:
     """Skip removal when another task needs or intentionally retains *path*."""
-    reason = _workspace_in_use_by_other(conn, task_id, path, worktree_cleanup=worktree_cleanup)
+    reason = _workspace_in_use_by_other(conn, task_id, path, worktree_cleanup=worktree_cleanup, removal=removal)
     if reason is None:
         return False
     if reason == "shared":
@@ -445,21 +459,6 @@ def _defer_shared_workspace_cleanup(
         pass
     return True
 
-
-def _defer_shared_worktree_cleanup(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> bool:
-    """Defer removing a linked worktree another live task may still use.
-
-    Only a real linked worktree is ever removed, so the sharing scan runs just
-    for those.
-    """
-    wt = Path(path).expanduser()
-    return (
-        wt.is_dir()
-        and _is_linked_worktree_checkout(wt)
-        and _defer_shared_workspace_cleanup(conn, task_id, path, worktree_cleanup=True)
-    )
 
 
 def _lexical_path(path: Path | str) -> Path:
@@ -603,8 +602,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":
             _cleanup_worker_tmux(conn, task_id)
-            if not _defer_shared_worktree_cleanup(conn, task_id, path):
-                _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _cleanup_worktree_workspace(task_id, path, row["branch_name"], conn=conn)
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
@@ -637,76 +635,74 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None
+    task_id: str, path: str, branch_name: Optional[str] = None, *,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    """Remove a finished task's linked git worktree when it holds no work.
-    Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
-    requires a clean tree AND every commit reachable from a remote-tracking
-    ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    """Admit the entire native removal, then use Git's non-force safeguards.
+
+    Completion, archive, ancestor retries and GC all enter here. The two
+    recursive roots are checkout W and private slot A, not common store K.
+    A failed/partial operation is not rollback and never permits escalation.
+    """
     try:
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli.kanban_worktree_removal import discover_removal
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
-        return  # CLI safety predicates unavailable — preserve
-    try:
-        wp = Path(path).expanduser()
-        if not wp.is_dir():
+
+        if conn is None:
+            # Direct internal callers use the same board guard, never an
+            # unguarded standalone executor. An unreadable board keeps W.
+            with connect_closing() as current:
+                _cleanup_worktree_workspace(task_id, path, branch_name, conn=current)
             return
-        common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
-        if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
-            _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
-            )
+        if _has_active_children(conn, task_id) or not Path(path).expanduser().is_dir():
             return
-        # Windows cannot delete a directory while this process has its current
-        # directory inside it. Completed workers normally run from their own
-        # linked worktree, so move this process back to the main checkout
-        # before asking Git to remove the worktree.
-        worktree_path = wp.resolve(strict=False)
+        removal = discover_removal(path)
+        wp, repo_root = removal.checkout, removal.repo
+        if _defer_shared_workspace_cleanup(conn, task_id, wp, worktree_cleanup=True, removal=removal):
+            return
+        # Branch cleanup is optional. Conservatively admit its native metadata
+        # edits against all of K; unlike W/A removal it needs no shared-K exception.
+        branch = None
+        with contextlib.suppress(OSError, UnicodeError):
+            if _workspace_in_use_by_other(conn, task_id, removal.common) is None:
+                branch = removal.optional_branch(task_id, branch_name)
+        head = removal.output(wp, "rev-parse", "HEAD") if branch else None
         try:
             cwd = Path.cwd().resolve(strict=False)
         except OSError:
-            # cwd was already deleted (a scratch-kind child's own workspace is
-            # rmtree'd before this deferred parent cleanup runs, #33774). A
-            # dead cwd cannot hold the worktree open, so leaving it is safe.
             cwd = None
-        if cwd is None or cwd == worktree_path or cwd.is_relative_to(worktree_path):
-            try:
-                os.chdir(repo_root)
-            except OSError as exc:
-                _kb._log.warning(
-                    "Preserving worktree for task %s: cannot leave %s for %s: %s",
-                    task_id, cwd or "<deleted cwd>", repo_root, exc,
-                )
+        if cwd is None or cwd == wp or cwd.is_relative_to(wp):
+            os.chdir(repo_root)  # Windows cannot delete this process's cwd.
+        result = None
+        for attempt in range(2):
+            # A nonzero remove can already have deleted A. Revalidate the same
+            # admitted identity and holders, not a newly discovered empty set.
+            removal.validate()
+            if _defer_shared_workspace_cleanup(conn, task_id, wp, worktree_cleanup=True, removal=removal):
                 return
-        # No --force: git's own dirty guard re-verifies at removal time, so if
-        # the tree became dirty since our check (TOCTOU) removal fails safe.
-        release_lsp_clients(str(worktree_path))
-        result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
-        if result.returncode != 0:
-            # Windows can retain a directory handle briefly after cwd changes.
-            # Retry once without --force; Git still enforces its dirty guard.
-            time.sleep(0.1)
-            result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
-        if result.returncode != 0:
+            if (_worktree_is_dirty(str(wp), str(repo_root), env=removal.env)
+                    or _worktree_has_unpushed_commits(str(wp), env=removal.env)):
+                _kb._log.info("Preserving worktree for task %s: dirty or unpushed work at %s", task_id, wp)
+                return
+            if attempt == 0:
+                release_lsp_clients(str(wp))
+            result = removal.git(repo_root, "worktree", "remove", str(wp), timeout=60)
+            if result.returncode == 0:
+                break
+            if attempt == 0:
+                time.sleep(0.1)
+        if result is None or result.returncode != 0:
             _kb._log.warning(
                 "git worktree remove failed for task %s at %s: %s",
-                task_id, wp, (result.stderr or result.stdout or "").strip(),
+                task_id, wp, (result.stderr or result.stdout or "").strip() if result else "no attempt",
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            _git(repo_root, "branch", "-D", branch, timeout=30)
-    except Exception:
-        pass  # best-effort — never block completion
+        if branch and removal.output(repo_root, "rev-parse", f"refs/heads/{branch}") == head:
+            removal.git(repo_root, "branch", "-D", branch, timeout=30)
+    except Exception as exc:  # health: allow BLE001 -- best-effort cleanup must preserve on unknown state
+        _kb._log.warning("Worktree cleanup stopped for task %s at %s: %s", task_id, path, exc)
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -756,8 +752,7 @@ def _remove_finished_parent_workspace(
     """Remove one finished, idle parent's workspace unless another task still needs it."""
     ws_path = row["workspace_path"]
     if row["workspace_kind"] == "worktree":
-        if not _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
-            _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
+        _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"], conn=conn)
         return
     wp = Path(ws_path)
     if not wp.is_dir() or not _is_managed_scratch_path(wp):

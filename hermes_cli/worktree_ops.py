@@ -474,17 +474,18 @@ _REMOTE_TRUNK_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")
 _LOCAL_TRUNK_CANDIDATES = ("main", "master")
 
 
-def _worktree_local_trunk(path: str, timeout: float = 5) -> Optional[str]:
+def _worktree_local_trunk(path: str, timeout: float = 5, *, env: Optional[dict[str, str]] = None) -> Optional[str]:
     """Local trunk of a repo with NO remote-tracking refs: ``main``/``master``, else the branch
     checked out in the main worktree. None = no baseline at all; callers must preserve.
 
     Nothing in such a repo was ever pushed, so "merged into the local trunk" is the only fact
     that can tell redundant scratch work from unique commits. May raise like ``_git``.
     """
+    git_env = {"env": env} if env is not None else {}
     for name in _LOCAL_TRUNK_CANDIDATES:
-        if _git_out(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], path, timeout=timeout):
+        if _git_out(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], path, timeout=timeout, **git_env):
             return name
-    porcelain = _git_out(["worktree", "list", "--porcelain"], path, timeout=timeout) or ""
+    porcelain = _git_out(["worktree", "list", "--porcelain"], path, timeout=timeout, **git_env) or ""
     for line in porcelain.split("\n\n", 1)[0].splitlines():  # first block = the main worktree
         if line.startswith("branch refs/heads/"):
             return line[len("branch refs/heads/"):].strip() or None
@@ -504,7 +505,9 @@ def _worktree_merge_base_ref(path: str, timeout: float = 5) -> Optional[str]:
     return None
 
 
-def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
+def _worktree_has_unpushed_commits(
+    worktree_path: str, timeout: int = 10, *, env: Optional[dict[str, str]] = None,
+) -> bool:
     """Whether a worktree has commits unreachable from any remote branch. Fails SAFE toward True.
 
     No remote-tracking refs = nothing was ever pushed, so the tree is compared against the local
@@ -513,18 +516,19 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
     ``_deepen_shallow_repo`` first if affordable.
     """
     try:
+        git_env = {"env": env} if env is not None else {}
         remote_refs = _git_out(["for-each-ref", "--format=%(refname)", "refs/remotes"], worktree_path,
-                               timeout=timeout)
+                               timeout=timeout, **git_env)
         if remote_refs is None:
             return True
         baseline = ["--remotes"]
         if not remote_refs:
-            trunk = _worktree_local_trunk(worktree_path, timeout=timeout)
+            trunk = _worktree_local_trunk(worktree_path, timeout=timeout, **git_env)
             if trunk is None:
                 return True
             baseline = [trunk]
         unpushed = _git_out(["log", "--oneline", "HEAD", "--not", *baseline], worktree_path,
-                            timeout=timeout)
+                            timeout=timeout, **git_env)
         return unpushed is None or bool(unpushed)
     except Exception:
         return True
@@ -549,7 +553,9 @@ def _include_symlink_paths(worktree_path: str, repo_root) -> set:
     return paths
 
 
-def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool:
+def _worktree_is_dirty(
+    worktree_path: str, repo_root, timeout: int = 10, *, env: Optional[dict[str, str]] = None,
+) -> bool:
     """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True.
 
     Untracked ``.worktreeinclude`` directory symlinks back to the main checkout *repo_root* are
@@ -559,7 +565,8 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool
     from hermes_cli._subprocess_compat import noninteractive_repo_git_env
     try:
         # Reclaimers run this unattended; status reads the index (core.fsmonitor, clean filters).
-        env = noninteractive_repo_git_env(worktree_path)
+        if env is None:
+            env = noninteractive_repo_git_env(worktree_path)
         if env is None:
             return True
         result = _git(["status", "--porcelain", "-z"], worktree_path, timeout=timeout,
