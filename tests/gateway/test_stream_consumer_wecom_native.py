@@ -1049,6 +1049,16 @@ class TestClarifyEagerReseed:
             consumer.finish()
             await task
 
+        # Readiness can precede another send across an await in the same reopen.
+        # Count again once the consumer can no longer emit a duplicate seed.
+        seeds_after = len(
+            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+        )
+        assert seeds_after == seeds_before_second_boundary + 1, (
+            "second eager seed must add exactly one seed after consumer completion "
+            f"(before={seeds_before_second_boundary}, after={seeds_after})"
+        )
+
 
 class TestNativeCommentaryPreservesAccumulated:
     """Regression lock for root cause #1 of the "Cla"/"ude" split-bubble bug.
