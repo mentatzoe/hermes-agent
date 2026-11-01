@@ -700,7 +700,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        if source.is_bot is True:
+        # A replacement adapter has no active-session guard for the old turn. Keep
+        # notices out of steering, interrupts and slash handling at this boundary too.
+        if event.internal or source.is_bot is True:
             self._queue_or_replace_pending_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
