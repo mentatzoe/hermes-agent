@@ -255,6 +255,9 @@ async def test_retry_preserves_eviction_and_command_cancellation(monkeypatch, tm
             keeper = adapter._session_tasks.get(key)
         if finish != "cancel-discard":
             await wait(delivered)
+            # The legacy retry loop hands off repeatedly; wait for the task that
+            # actually delivered, not an earlier keeper that has already returned.
+            keeper = adapter._session_tasks.get(key)
         if keeper is not None:
             await asyncio.wait_for(asyncio.shield(keeper), 15)
         assert handled == ([] if finish == "cancel-discard" else ["notice"])
