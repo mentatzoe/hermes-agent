@@ -2007,13 +2007,13 @@ class GatewayNotificationsMixin:
         return new_output
 
     async def _launching_turn_active(self, platform_name: str, watcher: dict) -> bool:
-        """Whether the process's launching session is inside an adapter turn."""
+        """Runner state survives reconnect; adapter state also covers delivery-only work."""
         session_key = str(watcher.get("session_key") or "").strip()
         if not session_key:
             return False
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
-        return session_key in (getattr(adapter, "_active_sessions", None) or {})
+        return self._is_session_running(session_key) or session_key in (getattr(adapter, "_active_sessions", None) or {})
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
         from gateway.run import _non_conversational_metadata
