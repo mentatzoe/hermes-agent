@@ -643,6 +643,7 @@ def _cleanup_worktree_workspace(
     Completion, archive, ancestor retries and GC all enter here. The two
     recursive roots are checkout W and private slot A, not common store K.
     A failed/partial operation is not rollback and never permits escalation.
+    Task branches are retained: deleting refs can remove a held directory in K.
     """
     try:
         from hermes_cli.kanban_db_connect import connect_closing
@@ -661,13 +662,6 @@ def _cleanup_worktree_workspace(
         wp, repo_root = removal.checkout, removal.repo
         if _defer_shared_workspace_cleanup(conn, task_id, wp, worktree_cleanup=True, removal=removal):
             return
-        # Branch cleanup is optional. Conservatively admit its native metadata
-        # edits against all of K; unlike W/A removal it needs no shared-K exception.
-        branch = None
-        with contextlib.suppress(OSError, UnicodeError):
-            if _workspace_in_use_by_other(conn, task_id, removal.common) is None:
-                branch = removal.optional_branch(task_id, branch_name)
-        head = removal.output(wp, "rev-parse", "HEAD") if branch else None
         try:
             cwd = Path.cwd().resolve(strict=False)
         except OSError:
@@ -699,8 +693,6 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        if branch and removal.output(repo_root, "rev-parse", f"refs/heads/{branch}") == head:
-            removal.git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception as exc:  # health: allow BLE001 -- best-effort cleanup must preserve on unknown state
         _kb._log.warning("Worktree cleanup stopped for task %s at %s: %s", task_id, path, exc)
 
@@ -913,7 +905,7 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target``, reusing a retained branch tip rather than resetting it."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):

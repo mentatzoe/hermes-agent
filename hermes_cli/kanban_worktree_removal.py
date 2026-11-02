@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-import stat
 
 
 # Removal effects inspected in upstream v2.39.5 / Apple Git-154 and v2.53.0.
@@ -106,35 +105,6 @@ class WorktreeRemoval:
             if directory.is_relative_to(self.private) or self.private.is_relative_to(directory):
                 return True
         return False
-
-    def optional_branch(self, task_id: str, branch_name: str | None) -> str | None:
-        """Only the actual, ordinary auto branch; unknown redirections keep it.
-
-        The caller separately admits optional edits to refs/reflogs/packed-refs
-        and config against managed holders. No branch deletion follows failure.
-        """
-        from hermes_cli import kanban_db_workspace as ws
-        branch = (branch_name or '').strip() or f'wt/{task_id}'
-        if not branch.startswith('wt/'):
-            return None
-        actual = self.git(self.checkout, 'symbolic-ref', '--quiet', 'HEAD')
-        if actual.returncode or actual.stdout.strip() != f'refs/heads/{branch}':
-            return None
-        # Validate only the native files this optional operation can mutate.
-        # Ref aliases, non-files backends and redirected metadata are not followed.
-        for relative in (f'refs/heads/{branch}', f'logs/refs/heads/{branch}', 'packed-refs', 'config'):
-            path = self.common / relative
-            if ws._path_key(path.resolve(strict=False)) != ws._path_key(path):
-                return None
-            try:
-                if not stat.S_ISREG(path.lstat().st_mode):
-                    return None
-            except FileNotFoundError:
-                continue
-        loose = self.common / f'refs/heads/{branch}'
-        if loose.exists() and loose.read_text(encoding='ascii').startswith('ref:'):
-            return None
-        return branch
 
 
 def discover_removal(path: str) -> WorktreeRemoval:
