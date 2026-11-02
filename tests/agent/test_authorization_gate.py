@@ -275,26 +275,39 @@ class TestApprovalPathsRecordHumanWait:
             "pattern_key": "k",
             "pattern_keys": ["k"],
         }
+        from contextlib import contextmanager
+
+        from hermes_cli.plugins import discover_plugins
+        from tests.agent.thread_sync_helpers import CheckedThread, join_checked
+
+        # Cold plugin discovery is setup, not part of the human's response time (#60).
+        discover_plugins()
         notified = threading.Event()
-        result_holder = {}
+        waiting = threading.Event()
+        original_window = approval_human_wait.human_wait_window
 
-        def _worker():
-            result_holder["result"] = approval_mod._await_gateway_decision(
+        @contextmanager
+        def observed_window(session_key):
+            with original_window(session_key):
+                waiting.set()
+                yield
+
+        monkeypatch.setattr("tools.approval_gateway_wait.human_wait_window", observed_window)
+        t = CheckedThread(
+            lambda: approval_mod._await_gateway_decision(
                 SESSION, lambda _data: notified.set(), approval_data
-            )
-
-        t = threading.Thread(target=_worker, daemon=True)
+            ), name="approval-human-wait",
+        )
         t.start()
-        assert notified.wait(timeout=5)
-        time.sleep(0.1)
         try:
+            assert notified.wait(timeout=5)
+            # Notification precedes the poll window; don't guess its entry with a sleep.
+            assert waiting.wait(timeout=5)
             assert approval_human_wait.human_wait_seconds(SESSION) > 0.0
         finally:
-            # Resolve the pending entry via the real production path.
             approval_mod.resolve_gateway_approval(SESSION, "deny", resolve_all=True)
-            t.join(timeout=5)
-        assert not t.is_alive()
-        # Window closed once the wait resolved.
+            join_checked(t)
+        assert t.value["resolved"] and t.value["choice"] == "deny"
         assert approval_human_wait._human_wait_states[SESSION].pending == 0
 
     def test_prompt_dangerous_approval_records_wait(self, monkeypatch):

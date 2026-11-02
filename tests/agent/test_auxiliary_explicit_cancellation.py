@@ -130,9 +130,27 @@ def _cancel_silent_request(
     client: Any,
     started: threading.Event,
     invoke: Callable[[Any], Any],
+    *, release: Callable[[], None],
 ) -> tuple[BaseException, float]:
+    from unittest.mock import patch
+
+    from agent.auxiliary_stream_watchdog import _stream_socket, chat_stream_windows
+    from agent.auxiliary_wire import prepare_chat_messages
+
+    # Cold wire/watchdog imports can exceed the entry wait on a busy runner (#60).
+    # Prepare those dependencies here; cancellation and the silent stream remain real.
+    prepare_chat_messages(client, {"model": "test", "messages": []})
+    chat_stream_windows(client, {"model": "test", "timeout": 30}, "compression")
+    _stream_socket(None)
     cancel_event = threading.Event()
     result: dict[str, BaseException] = {}
+    provider_threads = []
+    original_start = threading.Thread.start
+
+    def record_start(thread, *args, **kwargs):
+        if thread.name == "hermes-protected-aux-provider":
+            provider_threads.append(thread)
+        return original_start(thread, *args, **kwargs)
 
     def _worker() -> None:
         try:
@@ -142,15 +160,26 @@ def _cancel_silent_request(
             result["exc"] = exc
 
     worker = threading.Thread(target=_worker, daemon=True)
-    worker.start()
-    # Thread start-up on a loaded CI runner can exceed 1 s; the bound is only "eventually entered the transport".
-    assert started.wait(timeout=5), "request never entered its silent transport"
-    cancelled_at = time.monotonic()
-    cancel_event.set()
-    worker.join(timeout=5)
-    elapsed = time.monotonic() - cancelled_at
-    assert not worker.is_alive(), "explicit cancellation did not wake the silent request"
-    return result["exc"], elapsed
+    with patch.object(threading.Thread, "start", record_start):
+        worker.start()
+        try:
+            assert started.wait(timeout=5), "request never entered its silent transport"
+            cancelled_at = time.monotonic()
+            cancel_event.set()
+            worker.join(timeout=5)
+            elapsed = time.monotonic() - cancelled_at
+            assert not worker.is_alive(), "explicit cancellation did not wake the silent request"
+            return result["exc"], elapsed
+        finally:
+            # Release only this fake transport, never its process-shared client. Even an
+            # entry/assertion failure must retire the owner and isolated provider daemon.
+            cancel_event.set()
+            release()
+            worker.join(timeout=5)
+            for provider in provider_threads:
+                provider.join(timeout=5)
+            assert not worker.is_alive()
+            assert not any(provider.is_alive() for provider in provider_threads)
 
 
 def _invoke_generic(client: Any) -> Any:
@@ -168,7 +197,7 @@ def test_protected_silent_provider_is_isolated_and_raises_frozen_explicit_cancel
     stream = _BlockingStream(started)
     client = _GenericClient(stream)
 
-    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic, release=stream.close)
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert exc.cause == "explicit_host_cancel"
@@ -183,7 +212,7 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
     real_client = _CodexRealClient(stream)
     client = aux.CodexAuxiliaryClient(real_client, "gpt-test")
 
-    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic, release=stream.close)
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not real_client.closed.is_set()
@@ -406,7 +435,7 @@ def test_anthropic_silent_stream_is_isolated_without_closing_shared_client() -> 
         "https://api.anthropic.test",
     )
 
-    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic, release=stream.close)
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not real_client.closed.is_set()
@@ -498,7 +527,7 @@ def test_bedrock_silent_nonstream_request_is_isolated_without_close_wakeup() -> 
     _bedrock_runtime_client_cache["us-test-1"] = runtime_client
     client = aux.BedrockAuxiliaryClient("us-test-1", "bedrock-test")
     try:
-        exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+        exc, elapsed = _cancel_silent_request(client, started, _invoke_generic, release=release.set)
     finally:
         release.set()
         reset_client_cache()

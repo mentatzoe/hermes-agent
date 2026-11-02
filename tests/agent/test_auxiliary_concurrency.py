@@ -82,64 +82,93 @@ class TestSemaphoreCache:
 
 class TestSyncCallEnforcesLimit:
     def test_call_llm_caps_concurrent_inflight(self):
-        limit = 2
-        n_callers = 6
+        from tests.agent.thread_sync_helpers import CheckedThread, join_checked
 
-        active = 0
-        max_active = 0
+        limit, n_callers = 2, 6
+        active = max_active = 0
         lock = threading.Lock()
+        ready = threading.Barrier(n_callers + 1)
+        saturated = threading.Event()
+        release = threading.Event()
+        response = object()
 
         def fake_create(**kwargs):
             nonlocal active, max_active
             with lock:
                 active += 1
-                if active > max_active:
-                    max_active = active
+                max_active = max(max_active, active)
+                if active == limit:
+                    saturated.set()
             try:
-                time.sleep(0.05)
+                assert release.wait(timeout=5), "provider fixture was not released"
+                return response
             finally:
                 with lock:
                     active -= 1
-            return MagicMock()
 
         client = MagicMock()
         client.base_url = "https://example.test/v1"
-        client.chat.completions.create.side_effect = fake_create
+        client.chat.completions.create.return_value = response
+
+        def call():
+            return call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+
+        def caller():
+            ready.wait(timeout=5)
+            return call()
 
         with (
             patch(
                 "agent.auxiliary_client._resolve_task_provider_model",
                 return_value=("openrouter", "test-model", None, None, None),
             ),
-            patch(
-                "agent.auxiliary_client._get_cached_client",
-                return_value=(client, "test-model"),
-            ),
-            patch(
-                "agent.auxiliary_client._validate_llm_response",
-                side_effect=lambda resp, _task, **_kwargs: resp,
-            ),
-            patch(
-                "agent.auxiliary_client._get_auxiliary_task_config",
-                return_value={"max_concurrency": limit},
-            ),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "test-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, *_a, **_kw: resp),
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"max_concurrency": limit}),
         ):
-            threads = [
-                threading.Thread(
-                    target=lambda: call_llm(
-                        task="title_generation",
-                        messages=[{"role": "user", "content": "hi"}],
-                    )
-                )
-                for _ in range(n_callers)
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=5)
+            # Exercise the real preparation once before measuring contention. Otherwise
+            # one caller spends its join budget discovering plugins while others queue (#60).
+            assert call() is response
+            client.chat.completions.create.reset_mock()
+            client.chat.completions.create.side_effect = fake_create
+            semaphore = _acquire_sync_aux_semaphore("title_generation")
+            assert semaphore is not None
+            original_acquire = semaphore.acquire
+            all_attempted = threading.Event()
+            attempts = []
 
-        assert max_active <= limit, f"observed {max_active} > limit {limit}"
+            def observed_acquire():
+                # Probe the REAL permit first, then take the normal blocking path.
+                # Knowing all six reached acquire prevents a late-scheduled caller
+                # from hiding an excess permit behind the provider release signal.
+                immediate = original_acquire(blocking=False)
+                with lock:
+                    attempts.append(immediate)
+                    if len(attempts) == n_callers:
+                        all_attempted.set()
+                return immediate or original_acquire()
+
+            threads = [CheckedThread(caller, name=f"aux-caller-{i}") for i in range(n_callers)]
+            with patch.object(semaphore, "acquire", observed_acquire):
+                for t in threads:
+                    t.start()
+                try:
+                    ready.wait(timeout=5)
+                    assert all_attempted.wait(timeout=5), "not every caller attempted its permit"
+                    assert saturated.wait(timeout=5), "two calls never overlapped"
+                    assert sum(attempts) == limit
+                except BaseException:
+                    ready.abort()
+                    raise
+                finally:
+                    release.set()
+                    # Finish every caller before unpatching the semaphore/provider.
+                    join_checked(*threads)
+
+        assert max_active == limit, f"observed peak {max_active}, expected {limit}"
+        assert active == 0
         assert client.chat.completions.create.call_count == n_callers
+        assert all(t.value is response for t in threads)
 
 
     def test_semaphore_released_on_exception(self):
