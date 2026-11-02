@@ -1033,6 +1033,8 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[Dict[str, Any]]=None, turn_author: Optional[Dict[str, Any]]=None,
+    typed_user_message: Optional[str]=None,
+    recoverable_audio_paths: Optional[List[str]]=None,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -1052,6 +1054,16 @@ def build_turn_context(
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
+    # The gateway supplies the sender's exact words separately from its model-facing framing. Reset
+    # every turn for the same reason as the author; None preserves the legacy whole-message contract.
+    agent._turn_typed_user_message = typed_user_message
+    agent._turn_recoverable_audio_paths = list(recoverable_audio_paths or ())
+    # The turn-wide tool pool may grow as other people add recordings. It is
+    # not evidence that those recordings belong to the original sender.
+    followup_entries = (persist_user_display_metadata or {}).get("steer_entries")
+    agent._turn_opener_recoverable_audio_paths = (
+        [] if followup_entries is not None else list(recoverable_audio_paths or ())
+    )
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.

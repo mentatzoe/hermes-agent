@@ -223,6 +223,34 @@ already in flight may still finish; this is not transactional cancellation. The
 captured binding can remain queued for a later retry, but each fork receives its
 own revocable dispatch wrapper. Native-only review behavior is unchanged.
 
+## Optional read-only memory for delegated helpers
+
+A provider may implement `fork_read_only(*, session_id)` and return a distinct,
+already-initialized provider for a new helper, or `None` to leave it without
+memory. This opt-in is separate from `memory_review_binding`: a helper is doing
+a task, not reviewing a human conversation. The parent must already expose
+memory tools. The builtin writer and providers without this method remain absent.
+
+Capture the parent's authorized configuration and identity when creating the
+reader, rather than resolving another profile's current global configuration.
+Do not return `self`. The helper owns the returned provider's prompt, recall,
+tool dispatch and shutdown, but must never mutate or close the parent's provider.
+The provider is responsible for exposing only read tools and disabling all write
+lifecycle hooks, memory reviews and queue replay. The host does not inspect a
+provider's implementation to prove it is read-only.
+
+Install the child's static declarations before its first prompt. Keep them stable
+for that conversation, with any file edits taking effect in the next helper.
+Failure to create or register a reader does not fall back to writable memory.
+The host retains the child's builtin-memory exclusion while admitting the opted-in
+reader's tool schemas.
+
+Cron, Kanban and webhook jobs use their existing provider initialization path;
+a provider may separately opt a configured identity into read-only use there.
+Other providers' job policy is unchanged. The skill curator is separate: its
+optional consolidation agent still uses `skip_memory=True`; this helper capability
+does not change that constructor.
+
 ## Pre-Compress Checkpoints (fail-closed)
 
 `on_pre_compress()` is best-effort by default: if your provider raises, the

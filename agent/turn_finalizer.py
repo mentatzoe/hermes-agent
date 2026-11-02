@@ -524,9 +524,14 @@ def finalize_turn(
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
     _turn_exit_reason, _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    current_turn_user_idx=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
+    # The loop's maintained index addresses this completed-turn snapshot (including any
+    # in-turn compression). Later scaffold removal / post-turn micro-compaction must not
+    # change its row addresses or discard successful tool results before memory sees them.
+    memory_messages = list(messages)
 
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
@@ -741,9 +746,8 @@ def finalize_turn(
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+    from agent.steer_facts import handoff_pending_steer
+    handoff_pending_steer(agent, result)
     agent._response_was_previewed = False
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:
@@ -768,7 +772,8 @@ def finalize_turn(
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
+        interrupted=interrupted, messages=memory_messages,
+        current_turn_user_idx=current_turn_user_idx,
     )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the

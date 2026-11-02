@@ -18,12 +18,18 @@ class _Bare:
 # ---------------------------------------------------------------- steer requeue
 
 
-def test_requeue_pending_steer_appends_to_existing_steer():
+def test_requeue_pending_steer_precedes_calls_arriving_after_the_drain():
     agent = _Bare()
     agent._pending_steer_lock = threading.Lock()
-    agent._pending_steer = "old"
-    _requeue_pending_steer(agent, "new")
-    assert agent._pending_steer == "old\nnew"
+    agent._pending_steer = None
+    InterruptControlMixin.steer(agent, "old", facts={"sender_id": "first"})
+    drained = InterruptControlMixin._drain_pending_steer(agent, with_entries=True)
+    InterruptControlMixin.steer(agent, "new", facts={"sender_id": "second"})
+    _requeue_pending_steer(agent, drained)
+    assert InterruptControlMixin._drain_pending_steer(agent, with_entries=True) == [
+        {"text": "old", "facts": {"sender_id": "first"}},
+        {"text": "new", "facts": {"sender_id": "second"}},
+    ]
 
 
 # ------------------------------------------------------- interrupt_control slots

@@ -889,7 +889,7 @@ class AIAgent(
         _notify_context_engine_session_end(self, messages)
 
     def _sync_external_memory_for_turn(self, *, original_user_message: Any, final_response: Any, interrupted: bool,
-                                       messages: list | None = None) -> None:
+                                       messages: list | None = None, current_turn_user_idx: int | None = None) -> None:
         """Mirror a completed turn into external memory providers (``sync_all`` + ``queue_prefetch_all``).
 
         Uses ``original_user_message`` (``user_message`` may carry injected skill content). Interrupted turns
@@ -910,10 +910,24 @@ class AIAgent(
             return
         try:
             sync_kwargs = {"session_id": self.session_id or "", **({"messages": messages} if messages is not None else {})}
-            # Stashed by build_turn_context() for this turn, None on a human turn.
+            # Stashed by build_turn_context() for this turn. With no declared author, an unattended
+            # prompt (API-server/script/cron/worker) contains no words a person typed; attended CLI/TUI/
+            # desktop turns retain the legacy whole-message provider contract.
             turn_author = getattr(self, "_turn_author", None)
             if turn_author is not None:
                 sync_kwargs["turn_author"] = turn_author
+            typed_user_content = getattr(self, "_turn_typed_user_message", None)
+            if typed_user_content is None and turn_author is None:
+                from agent.session_source import is_attended
+                if not is_attended(self):
+                    typed_user_content = ""
+            if typed_user_content is not None:
+                sync_kwargs["typed_user_content"] = typed_user_content
+            if current_turn_user_idx is not None:
+                sync_kwargs["current_turn_user_idx"] = current_turn_user_idx
+            recoverable_audio_paths = getattr(self, "_turn_opener_recoverable_audio_paths", None)
+            if recoverable_audio_paths is not None:
+                sync_kwargs["recoverable_audio_paths"] = list(recoverable_audio_paths)
             self._memory_manager.sync_all(user_text, response_text, **sync_kwargs)
             # Sibling of the build_turn_context() prefetch gate: don't key recall on zero-signal prompts.
             if not is_trivial_prompt(user_text):

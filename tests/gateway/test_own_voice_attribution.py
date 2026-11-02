@@ -46,6 +46,19 @@ async def test_forwarded_tts_attribution_keeps_raw_transcript(tmp_path, monkeypa
     assert enriched.endswith("a caption")
 
 
+@pytest.mark.asyncio
+async def test_transcription_can_collect_only_sender_authored_words(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    make_db(tmp_path)
+    typed = []
+    with patch("tools.transcription_tools.transcribe_audio", return_value={"success": True, "transcript": SAID}):
+        _, transcripts = await runner()._enrich_message_with_transcription(
+            "a caption", ["/tmp/voice.ogg"], typed_transcripts=typed,
+        )
+    assert transcripts == [SAID]  # the visible transcription still includes the forwarded recording
+    assert typed == []  # Aleph's own earlier reply is not the sender's typed/spoken statement
+
+
 def test_own_voice_scan_stays_within_recent_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     make_db(tmp_path, filler=50)

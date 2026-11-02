@@ -65,3 +65,41 @@ class TestSyncExternalMemoryForTurn:
         kwargs = agent._memory_manager.sync_all.call_args.kwargs
         assert kwargs["turn_author"] == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
         assert kwargs["session_id"] == "test_session_001"
+
+    def test_host_supplied_typed_text_reaches_sync_all(self):
+        agent = _bare_agent()
+        agent._turn_author = {"id": "human-1", "name": "Alex", "is_bot": False}
+        agent._turn_typed_user_message = "only these words"
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="[Alex] only these words\n\n[Host notice]",
+            final_response="Done.", interrupted=False,
+        )
+
+        assert agent._memory_manager.sync_all.call_args.kwargs["typed_user_content"] == "only these words"
+
+    def test_unattended_unauthored_turn_has_no_human_typed_text(self):
+        agent = _bare_agent()
+        agent.platform = "api_server"
+        agent._turn_author = None
+        agent._turn_typed_user_message = None
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="A script wrote this prompt", final_response="Done.", interrupted=False,
+        )
+
+        assert agent._memory_manager.sync_all.call_args.kwargs["typed_user_content"] == ""
+
+    def test_attended_unauthored_turn_keeps_legacy_provider_contract(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+        agent = _bare_agent()
+        agent.platform = "cli"
+        agent._turn_author = None
+        agent._turn_typed_user_message = None
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="A person typed this prompt", final_response="Done.", interrupted=False,
+        )
+
+        assert "typed_user_content" not in agent._memory_manager.sync_all.call_args.kwargs

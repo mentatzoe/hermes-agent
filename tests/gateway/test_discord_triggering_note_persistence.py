@@ -12,6 +12,7 @@ from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.run_inbound import discord_triggering_note
 from gateway.session import SessionSource
+from gateway.typed_text import apply_message_timestamp
 
 
 def _runner() -> GatewayRunner:
@@ -40,7 +41,7 @@ async def test_discord_note_rides_model_text_but_not_persisted_content(monkeypat
     )
 
     model_text = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
-    message_text, persist_user_message, _ts = runner._hmwa_apply_message_timestamp(event, model_text)
+    message_text, persist_user_message, _ts = apply_message_timestamp(event, model_text)
 
     note = discord_triggering_note("1550380365858865157")
     assert message_text.startswith(f"{note}\n\n[Replying to: \"Create a project plan for Q4\"]")
@@ -49,7 +50,7 @@ async def test_discord_note_rides_model_text_but_not_persisted_content(monkeypat
     # Control: a turn without a platform message id (desktop relay) persists byte-identical text.
     relay = MessageEvent(text="plain relay turn", source=source, message_id=None)
     relay_text = await runner._prepare_inbound_message_text(event=relay, source=source, history=[])
-    _, relay_persist, _ = runner._hmwa_apply_message_timestamp(relay, relay_text)
+    _, relay_persist, _ = apply_message_timestamp(relay, relay_text)
     assert relay_persist == "plain relay turn" == relay_text
 
 
