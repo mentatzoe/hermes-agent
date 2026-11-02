@@ -10,8 +10,6 @@ which gateway each profile home runs (``get_running_pid``), so no process is spa
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from gateway import status
@@ -19,41 +17,76 @@ from hermes_cli import gateway_windows, update_cmd_windows
 from hermes_cli.update_cmd_windows import _READY_CONFIRM_S, _verify_relaunched_gateways_alive
 
 
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    # Measure logical polling work, not host scheduling or profile-lookup latency.
+    # Keep the real time module (and the Linux real-child case) untouched.
+    clock = _Clock()
+    monkeypatch.setattr(update_cmd_windows, "_time", clock)
+    return clock
+
+
 @pytest.fixture
 def running(monkeypatch):
-    """``{profile: callable -> pid or None}``: what each profile home's PID file names right now."""
+    """PID-file callables by profile, plus the time/name of every real poll's read."""
     table: dict = {}
-    monkeypatch.setattr(status, "get_running_pid",
-                        lambda path, cleanup_stale=False: (table.get(path.parent.name) or (lambda: None))())
+    probes = []
+
+    def get_pid(path, cleanup_stale=False):
+        name = path.parent.name
+        probes.append((update_cmd_windows._time.monotonic(), name))
+        return (table.get(name) or (lambda: None))()
+
+    monkeypatch.setattr(status, "get_running_pid", get_pid)
     monkeypatch.setattr(status, "_pid_exists", lambda pid: False)  # every old gateway is gone
     monkeypatch.setattr(gateway_windows, "_write_start_attestation", lambda *a, **k: None)
-    return table
+    return table, probes
 
 
-def test_many_ready_targets_cost_one_confirmation_window(running):
+def test_many_ready_targets_cost_one_confirmation_window(running, clock):
+    table, probes = running
     profiles = {f"p{i}": 40000 + i for i in range(6)}
     for i, name in enumerate(profiles):
-        running[name] = lambda pid=50000 + i: pid
+        table[name] = lambda pid=50000 + i: pid
     token = {"profiles": dict(profiles), "unmapped": []}
-    started = time.monotonic()
+    started = clock.monotonic()
     _verify_relaunched_gateways_alive(token, profiles, [])
-    elapsed = time.monotonic() - started
+    elapsed = clock.monotonic() - started
     assert token["relaunched_profiles"] == sorted(profiles) and token["profiles"] == {}
+    assert elapsed >= _READY_CONFIRM_S, "targets were credited before surviving the confirmation window"
     assert elapsed < 2 * _READY_CONFIRM_S, f"6 ready targets took {elapsed:.1f}s: verified one after another"
+    rounds = sorted({when for when, _ in probes})
+    assert rounds[0] == started
+    assert rounds[-1] - started >= _READY_CONFIRM_S
+    for when in rounds:
+        assert sorted(name for at, name in probes if at == when) == sorted(profiles)
 
 
-def test_each_target_is_credited_only_on_its_own_stable_gateway(running, monkeypatch):
+def test_each_target_is_credited_only_on_its_own_stable_gateway(running, monkeypatch, clock):
+    table, probes = running
     monkeypatch.setattr(update_cmd_windows, "_RELAUNCH_VERIFY_TIMEOUT_S", 3.0)
-    born = time.monotonic()
-    running["up"] = lambda: 50001
-    running["old"] = lambda: 40002  # only the process the relaunch replaces
-    running["flaps"] = lambda: 50003 if time.monotonic() - born < 1.0 else None  # died during confirmation
+    born = clock.monotonic()
+    table["up"] = lambda: 50001
+    table["old"] = lambda: 40002  # only the process the relaunch replaces
+    table["flaps"] = lambda: 50003 if clock.monotonic() - born < 1.0 else None  # died during confirmation
     profiles = {"up": 40001, "old": 40002, "flaps": 40003, "never": 40004}
     token = {"profiles": dict(profiles), "unmapped": []}
     with pytest.raises(RuntimeError, match="not verified alive: flaps, never, old"):
         _verify_relaunched_gateways_alive(token, profiles, [])
     assert token["relaunched_profiles"] == ["up"]
     assert sorted(token["profiles"]) == ["flaps", "never", "old"]
+    assert max(when for when, name in probes if name == "up") - born >= _READY_CONFIRM_S
 
 
 @pytest.mark.platforms("linux")
