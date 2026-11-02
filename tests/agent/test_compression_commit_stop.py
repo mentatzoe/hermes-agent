@@ -38,6 +38,11 @@ class _ObservedLock:
 
 def test_hard_stop_waits_for_commit_already_admitted(tmp_path, monkeypatch):
     """Stop must reach the held fence, and may return only after the real DB commit."""
+    from agent.context_compressor_restatement import note_skill_reload
+
+    # The prompt's process-wide toolchain probe is unrelated to commit fencing.
+    # Avoid leaving its background worker running past this fixture's lifetime.
+    monkeypatch.setattr("tools.env_probe.warm_environment_probe_async", lambda: None)
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "HARD_CANCEL_AFTER_COMMIT_ADMISSION"
     db.create_session(session_id, source="tui")
@@ -48,6 +53,10 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path, monkeypatch):
     # fence, not prompt contents; keep the real compression/SQLite path intact.
     monkeypatch.setattr(agent, "_build_system_prompt", MagicMock(return_value="sys"))
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    # Both helpers lazily import compression/turn support. Exercise them during
+    # setup, not inside the two-second wait for the worker's commit admission.
+    note_skill_reload(agent)
+    assert cc._is_real_user_message(messages[0])
     commit_started, allow_commit = threading.Event(), threading.Event()
     stop_waiting, stop_returned, committed = threading.Event(), threading.Event(), threading.Event()
     original_archive = db.archive_and_compact
