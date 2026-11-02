@@ -300,8 +300,12 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     try:
         get_mem_schemas = _schema_getter("_memory_manager", "get_all_tool_schemas")
         if get_mem_schemas is not None:
-            from agent.memory_manager import memory_provider_tools_enabled  # same gate inject_memory_provider_tools uses
-            if memory_provider_tools_enabled(
+            from agent.memory_manager import memory_provider_tools_enabled
+            # Delegated readers inherit permission at fork birth while the builtin
+            # writer stays disabled. Mirror memory_provider_tools_exposed's opt-in;
+            # use the staged writer presence for ordinary agents, not stale tools[].
+            read_only = getattr(agent._memory_manager, "read_only", False) is True
+            if read_only or memory_provider_tools_enabled(
                     enabled, getattr(agent, "disabled_toolsets", None), memory_tool_present="memory" in name_set):
                 for schema in get_mem_schemas():
                     _add(schema)

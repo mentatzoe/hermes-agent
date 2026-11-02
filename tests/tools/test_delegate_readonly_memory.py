@@ -57,7 +57,8 @@ def make_child(manager, tmp_path, *, disabled=None):
     return parent, child
 
 
-def test_delegate_build_installs_a_distinct_read_only_provider_before_first_prompt(tmp_path):
+@pytest.mark.parametrize('refresh_options', [{'preserve_prefix': True}, {'content_aware': True}])
+def test_delegate_build_installs_a_distinct_read_only_provider_before_first_prompt(tmp_path, refresh_options):
     manager = MemoryManager()
     provider = ReadMemory()
     manager.add_provider(provider)
@@ -71,6 +72,11 @@ def test_delegate_build_installs_a_distinct_read_only_provider_before_first_prom
         assert 'synthetic_memory_search' in names
         assert 'memory' not in names
         assert child._memory_store is None
+        from tools.mcp_tool_agent import refresh_agent_mcp_tools
+        with patch('model_tools.get_tool_definitions', return_value=[]):
+            refresh_agent_mcp_tools(child, **refresh_options)
+        assert child.valid_tool_names == {'synthetic_memory_search'}
+        assert {tool['function']['name'] for tool in child.tools} == {'synthetic_memory_search'}
         prompt = child._build_system_prompt()
         assert prompt.count('Declared-persona-once') == 1
         assert child._memory_manager.handle_tool_call('synthetic_memory_search', {}) == 'saved evidence'
