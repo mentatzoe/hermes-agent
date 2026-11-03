@@ -109,20 +109,6 @@ class Pruner:
         if len(commits) > keep_count:
             self._rewrite(ref, commits, commits[-keep_count:], gc=False)
 
-    def drop_one_round(self, cap_bytes: int) -> bool:
-        """Over the cap on the take path: drop the oldest snapshot of every project once and
-        defer the gc. One round per checkpoint converges over turns; the full loop measured
-        against an unchanging pack once flattened every project to a single snapshot."""
-        if cap_bytes <= 0 or self.dir_size(self.store) <= cap_bytes:
-            return False
-        changed = False
-        for ref in self._git(["for-each-ref", "--format=%(refname)", self.refs_prefix]).splitlines():
-            commits = self._commits(ref)
-            if len(commits) > 1:
-                self._rewrite(ref, commits, commits[1:], gc=False)
-                changed = True
-        return changed
-
     def enforce_size(self, cap_bytes: int) -> bool:
         """Periodic prune: gc per round (the measurement only moves after a repack) until the
         store fits. Returns whether it did; a failed Git step raises immediately."""
