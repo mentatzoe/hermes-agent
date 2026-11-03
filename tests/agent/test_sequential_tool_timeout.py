@@ -347,3 +347,115 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
     assert "timed out" not in messages[0]["content"]
     assert messages[1]["content"] == "second result"
     assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "patch"])
+@pytest.mark.parametrize("release_during_timeout_log", [False, True])
+def test_timeout_during_checkpoint_never_dispatches_late_write(tmp_path, monkeypatch, tool_name, release_during_timeout_log):
+    """Checkpointing is preflight, not the mutation. A timeout there must revoke dispatch."""
+    from contextlib import contextmanager
+    import agent.tool_executor as te
+
+    agent = _make_agent(tmp_path)
+    agent._checkpoint_mgr.enabled = True
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    target = tmp_path / "target.md"
+    target.write_text("before")
+    events = []
+    real_worker = te._registered_tool_worker
+
+    @contextmanager
+    def tracked_worker(owner):
+        try:
+            with real_worker(owner) as tid:
+                yield tid
+        finally:
+            finished.set()
+
+    def checkpoint(*_args):
+        entered.set()
+        assert release.wait(10)
+
+    def timeout_after_checkpoint_started(*_args):
+        assert entered.wait(10), "test never reached checkpoint preflight"
+        return "timeout", None
+
+    def mutation(*_args, **_kwargs):
+        target.write_text("after")
+        return '{"bytes_written": 5}'
+
+    call = _tool_call("checkpoint-timeout")
+    call.function.name = tool_name
+    call.function.arguments = json.dumps({"path": str(target), "content": "after"})
+    monkeypatch.setattr(te, "_ensure_file_checkpoint", checkpoint)
+    monkeypatch.setattr(te, "_registered_tool_worker", tracked_worker)
+    monkeypatch.setattr(te, "_poll_sequential_future", timeout_after_checkpoint_started)
+    monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: 1.0)
+    monkeypatch.setattr(te, "_emit_terminal_post_tool_call", lambda *_a, **kw: events.append(kw))
+    monkeypatch.setattr("model_tools.handle_function_call", mutation)
+    real_warning = te.logger.warning
+
+    def release_at_timeout_log(message, *args, **kwargs):
+        if "sequential tool %s timed out" in message:
+            release.set()
+            assert finished.wait(10)
+        real_warning(message, *args, **kwargs)
+
+    if release_during_timeout_log:
+        monkeypatch.setattr(te.logger, "warning", release_at_timeout_log)
+    messages = []
+    try:
+        execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=[call]), messages, "task")
+        assert "timed out" in messages[0]["content"]
+        assert target.read_text() == "before"
+    finally:
+        release.set()
+        assert finished.wait(10), "abandoned worker did not finish"
+    assert target.read_text() == "before", "write landed after the timeout result"
+    assert [(e["tool_call_id"], e.get("error_type")) for e in events] == [
+        ("checkpoint-timeout", "tool_timeout")]
+
+
+def test_running_tool_timeout_warns_and_logs_late_completion(tmp_path, monkeypatch, caplog):
+    import agent.tool_executor as te
+
+    agent = _make_agent(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    logged = threading.Event()
+    target = tmp_path / "target.md"
+    real_warning = te.logger.warning
+
+    def mutation(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(10)
+        target.write_text("late side effect")
+        return "completed"
+
+    def timeout_after_body_started(*_args):
+        assert entered.wait(10)
+        return "timeout", None
+
+    def warning(message, *args, **kwargs):
+        real_warning(message, *args, **kwargs)
+        if "late outcome=" in message:
+            logged.set()
+
+    monkeypatch.setattr("model_tools.handle_function_call", mutation)
+    monkeypatch.setattr(te, "_poll_sequential_future", timeout_after_body_started)
+    monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: 1.0)
+    monkeypatch.setattr(te.logger, "warning", warning)
+    messages = []
+    try:
+        execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=[_tool_call("running-timeout")]), messages, "task")
+        assert "effects are unconfirmed" in messages[0]["content"]
+        assert "Check the target state before retrying" in messages[0]["content"]
+    finally:
+        release.set()
+        assert logged.wait(10)
+    assert target.read_text() == "late side effect"
+    assert "late outcome=finished_after_abandonment" in caplog.text
+    assert "tool_call_id=running-timeout" in caplog.text
+    assert len(messages) == 1

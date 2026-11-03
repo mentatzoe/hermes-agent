@@ -39,39 +39,52 @@ def test_maintenance_size_cap_retains_every_snapshot_after_the_only_large_one(hi
     assert (project / "small.txt").read_text(encoding="utf-8") == "4"
 
 
-def test_snapshot_over_cap_drops_one_round_and_leaves_the_gc_to_the_prune(history):
-    """A checkpoint never waits on ``git gc``: over the cap it rewrites the ref once and marks
-    the store gc-pending; the periodic prune reclaims the objects and clears the marker."""
-    from tools.checkpoint_pruning import GC_PENDING_NAME
-
+def test_snapshot_over_cap_defers_store_wide_work_to_maintenance(history, monkeypatch):
+    """Taking one checkpoint must not scan/rewrite other projects or measure the whole store.
+    Maintenance still enforces the cap, reclaiming before deciding what history to discard."""
     base, project, manager = history
     store = checkpoints._store_path(base)
     manager.max_total_size_mb = 1
-    gc_calls = []
+    other = project.parent / "unrelated"
+    other.mkdir()
+    # Seed another project's history with the cap disabled.
+    other_manager = checkpoints.CheckpointManager(enabled=True, max_total_size_mb=0)
+    for index in range(3):
+        (other / "small.txt").write_text(str(index), encoding="utf-8")
+        other_manager.new_turn()
+        assert other_manager.ensure_checkpoint(str(other), f"other-{index}")
+    before = manager.list_checkpoints(str(other))
     original = checkpoints._run_git
+    calls = []
+    scans = []
 
-    def count_gc(args, *rest, **kwargs):
-        if args[0] == "gc":
-            gc_calls.append(args)
+    def record_git(args, *rest, **kwargs):
+        calls.append(args)
         return original(args, *rest, **kwargs)
+
+    def record_size(path):
+        scans.append(path)
+        return 2 * 1024 * 1024
 
     (project / "new.txt").write_text("new snapshot", encoding="utf-8")
     manager.new_turn()
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(checkpoints, "_run_git", count_gc)
+    with monkeypatch.context() as mp:
+        mp.setattr(checkpoints, "_run_git", record_git)
+        mp.setattr(checkpoints, "_dir_size_bytes", record_size)
         assert manager.ensure_checkpoint(str(project), "newest")
-    assert gc_calls == []
-    assert (store / GC_PENDING_NAME).exists()
+    assert scans == [], "a user write measured the entire checkpoint store"
+    assert not any(c[0] in {"gc", "for-each-ref"} for c in calls)
+    assert manager.list_checkpoints(str(other)) == before
     assert [row["reason"] for row in manager.list_checkpoints(str(project))] == \
-        ["newest"] + [f"small-{i}" for i in reversed(range(5))]
-    # Objects are still in the pack until the prune runs.
-    assert checkpoints._dir_size_bytes(store) > 1024 * 1024
+        ["newest"] + [f"small-{i}" for i in reversed(range(5))] + ["large-oldest"]
 
-    result = checkpoint_maintenance.prune_checkpoints(retention_days=0, checkpoint_base=base, max_total_size_mb=1)
+    result = checkpoint_maintenance.prune_checkpoints(
+        retention_days=0, checkpoint_base=base, max_total_size_mb=1)
     assert result["errors"] == 0
-    assert not (store / GC_PENDING_NAME).exists()
     assert checkpoints._dir_size_bytes(store) <= 1024 * 1024
     assert (project / "small.txt").read_text(encoding="utf-8") == "4"
+    assert [row["reason"] for row in manager.list_checkpoints(str(project))] == \
+        ["newest"] + [f"small-{i}" for i in reversed(range(5))]
 
 
 def test_reclaim_stops_before_touching_another_projects_history(history):

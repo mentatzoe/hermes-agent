@@ -925,7 +925,29 @@ def _run_sequential_tool_execution_middleware(
     they need no ``_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS`` entry."""
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
-    kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
+    dispatch_lock = threading.Lock()
+    dispatch_phase = "preflight"
+    skipped_dispatch = threading.Event()
+
+    def revoke_dispatch():
+        nonlocal dispatch_phase
+        with dispatch_lock:
+            if dispatch_phase == "preflight":
+                dispatch_phase = "abandoned"
+
+    def execute_if_active(final_args):
+        nonlocal dispatch_phase
+        # Admission and abandonment are one atomic decision, scoped to this
+        # CALL rather than a reusable thread id. Once admitted, a tool body is
+        # running for cancellation purposes; Python cannot safely kill it.
+        with dispatch_lock:
+            if dispatch_phase == "abandoned":
+                skipped_dispatch.set()
+                return _ToolCancelledResult("Tool dispatch cancelled after executor abandoned the call")
+            dispatch_phase = "dispatched"
+        return execute(final_args)
+
+    kwargs = dict(ref.middleware_kwargs(), execute=execute_if_active, scope_block=scope_block, display_index=display_index)
     from agent.terminal_approval_batch import take_prepared_call
     prepared = take_prepared_call(tool_call_id)
     if prepared is not None:
@@ -961,6 +983,10 @@ def _run_sequential_tool_execution_middleware(
         state, result = _poll_sequential_future(agent, future, function_name, deadline, started, authorization_gate)
         if state == "done":
             return result
+        if state == "timeout":
+            # Revoke before any logging or cleanup can block and let preflight
+            # finish. Admission that won the lock first is already in flight.
+            revoke_dispatch()
         if state == "interrupted":
             # interrupt() already fanned out to tracked tids, but this worker may have
             # registered after that ran; then 3s grace (mirrors the concurrent path).
@@ -980,12 +1006,23 @@ def _run_sequential_tool_execution_middleware(
             )
         else:
             assert timeout_s is not None  # only reachable when a deadline exists
-            message = f"Error executing tool '{function_name}': timed out after {timeout_s:.1f}s"
+            message = (
+                f"Error executing tool '{function_name}': timed out after {timeout_s:.1f}s. "
+                "If the tool body already started, it may still finish; its effects are unconfirmed. "
+                "Check the target state before retrying."
+            )
             logger.warning("sequential tool %s timed out after %.1fs", function_name, timeout_s)
             result_cls, outcome = _ToolTimeoutResult, dict(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
             )
         abandoned = True
+        revoke_dispatch()
+
+        from agent.tool_executor_lifetime import log_abandoned_tool_completion
+        future.add_done_callback(lambda done: log_abandoned_tool_completion(
+            done, ref=ref, session_id=getattr(agent, "session_id", ""), started=started,
+            skipped_dispatch=skipped_dispatch, logger=logger,
+        ))
         if prepared is not None:
             # A timed-out shell may still be unwinding. Never release a later
             # prepared command into overlapping execution.
