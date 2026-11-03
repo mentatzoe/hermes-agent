@@ -994,6 +994,9 @@ def _run_sequential_tool_execution_middleware(
             concurrent.futures.wait([future], timeout=3.0)
             if future.done() and not future.cancelled():
                 return future.result()
+            # As with timeout, revoke before logging can yield to preflight.
+            # The grace period still permits already-admitted bodies to finish.
+            revoke_dispatch()
             interrupt_reason = getattr(agent, "_tool_interrupt_reason", None) or "interrupt requested"
             message = f"[Tool execution cancelled — {function_name} was abandoned: {interrupt_reason}]"
             logger.info(
