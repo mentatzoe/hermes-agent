@@ -34,7 +34,7 @@ class StreamFallbackMixin:
             self._track_preview_ids_from_result(result)
             self._already_sent = True
             self._last_sent_text = text
-            self._record_durable_stream_text(text)
+            self._record_durable_stream_text(text, result=result)
             self._notify_new_message()
             return str(result.message_id)
         except Exception as e:
@@ -142,7 +142,7 @@ class StreamFallbackMixin:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
-            self._record_durable_stream_text(chunk)
+            self._record_durable_stream_text(chunk, result=result)
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             self._notify_new_message()
@@ -277,7 +277,7 @@ class StreamFallbackMixin:
         # delivery for text this path removed.
         self._delivered_final_text = self._display_payload(final_text)
         self._last_sent_text = final_text
-        self._record_durable_stream_text(final_text)
+        self._record_durable_stream_text(final_text, result=result)
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
         self._notify_new_message()
@@ -332,7 +332,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
             if result.success:
                 self._already_sent = True
-                self._record_durable_stream_text(tail)
+                self._record_durable_stream_text(tail, result=result)
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
 
@@ -374,6 +374,7 @@ class StreamFallbackMixin:
                 # actually carried the final response, vs. unrelated commentary delivered during a session
                 # split (#14238).
                 self._delivered_commentary_texts.append(text)
+                self.record_durable_text_delivery(text, result=result)
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)

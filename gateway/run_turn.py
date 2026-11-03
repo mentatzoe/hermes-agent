@@ -1502,6 +1502,9 @@ class GatewayTurnMixin:
                 _platform_name, source.chat_id or "unknown",
             )
             _intentional_silence = False
+            # The replacement warning is new text. An earlier answer delivered
+            # outside the origin must not suppress it through duplicate handling.
+            agent_result["already_sent"] = False
             response = _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
@@ -3716,7 +3719,7 @@ class GatewayTurnMixin:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
-        from gateway.turn_delivery import record_visible_text_delivery
+        from gateway.turn_delivery import queued_text_delivery_callback, record_visible_text_delivery
         await record_visible_text_delivery(_delivery_result, turn_ctx)
         if isinstance(result, dict) and _delivery_result.get("visible_text_delivered") is True:
             result["visible_text_delivered"] = True
@@ -3756,7 +3759,7 @@ class GatewayTurnMixin:
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
-                    on_text_delivered=lambda: result.update(visible_text_delivered=True),
+                    on_text_delivered=queued_text_delivery_callback(result, first_response, _sc),
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).

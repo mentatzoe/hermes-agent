@@ -478,7 +478,7 @@ class GatewayNotificationsMixin:
                         return False
         # Only an acknowledged text send/edit counts, not media-only or an egress decline.
         if text_content and on_text_delivered is not None:
-            on_text_delivered()
+            on_text_delivered(None if text_already_delivered else (_edit_res if _reconciled else _sent))
         # Failed turns never upload attachments as if they succeeded.
         if not deliver_media:
             return True

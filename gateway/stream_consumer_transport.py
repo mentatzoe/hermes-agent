@@ -73,7 +73,7 @@ class StreamTransportMixin:
             text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
             turn_id=self._turn_id, **kwargs)
         if result is True and finalize and (not explicit or receipt.get("confirmed") is True):
-            self._record_durable_stream_text(text)
+            self._record_durable_stream_text(text, result=result)
         return result
 
     def _close_native_state(self) -> None:
@@ -300,7 +300,7 @@ class StreamTransportMixin:
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
-        self._record_durable_stream_text(text)
+        self._record_durable_stream_text(text, result=result)
         self._already_sent = True
         self._last_sent_text = text
         if is_turn_final:
@@ -473,7 +473,7 @@ class StreamTransportMixin:
             return False
         self._already_sent = True
         self._last_sent_text = text
-        self._record_durable_stream_text(text)
+        self._record_durable_stream_text(text, result=result)
         if result.message_id:
             self._adopt_message_id(result.message_id)
             self._track_preview_ids_from_result(result)
@@ -515,7 +515,7 @@ class StreamTransportMixin:
             # next tick retries with the newer text.
             return True
         self._already_sent = True
-        self._record_durable_stream_text(text)
+        self._record_durable_stream_text(text, result=result)
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset
@@ -580,7 +580,7 @@ class StreamTransportMixin:
             delivered_prefix = raw_response.get("delivered_prefix")
             if isinstance(delivered_prefix, str) and delivered_prefix:
                 self._last_sent_text = delivered_prefix
-                self._record_durable_stream_text(delivered_prefix)
+                self._record_durable_stream_text(delivered_prefix, result=result)
                 self._fallback_preserve_partial_messages = text.startswith(delivered_prefix)
                 self._enter_fallback_mode(delivered_prefix)
             else:
