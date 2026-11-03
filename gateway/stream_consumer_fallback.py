@@ -34,6 +34,7 @@ class StreamFallbackMixin:
             self._track_preview_ids_from_result(result)
             self._already_sent = True
             self._last_sent_text = text
+            self._record_durable_stream_text(text)
             self._notify_new_message()
             return str(result.message_id)
         except Exception as e:
@@ -141,6 +142,7 @@ class StreamFallbackMixin:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
+            self._record_durable_stream_text(chunk)
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             self._notify_new_message()
@@ -275,6 +277,7 @@ class StreamFallbackMixin:
         # delivery for text this path removed.
         self._delivered_final_text = self._display_payload(final_text)
         self._last_sent_text = final_text
+        self._record_durable_stream_text(final_text)
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
         self._notify_new_message()
@@ -329,6 +332,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
             if result.success:
                 self._already_sent = True
+                self._record_durable_stream_text(tail)
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
 
@@ -398,18 +402,21 @@ class StreamFallbackMixin:
     # Fresh send carried exactly ``text`` — record it so the gateway can reconcile the flag against the
     # completed response (#71643/#95382 content-vs-flag contract).
     async def _suppress_silence_marker(self) -> None:
-        """Retract any streamed preview when the final reply is a bare silence marker.  Flags
-        stay False so the gateway's whole-response filter owns what goes out next: "" for a
-        machinery turn, the visible fallback for a human one."""
+        """Retract the active silence preview, preserving earlier delivered prose.
+        Flags stay False so the gateway's whole-response filter owns the final
+        decision, including whether the human turn already received a reply."""
         # A native-stream bubble isn't a deletable message — close an open one
         # (e.g. from an eager re-seed) with an empty finalize so it doesn't hang.
         if self._native_stream_opened:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
 
-        await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
+        await self._delete_previews(self._stale_preview_ids(segment_only=True), label="Silence-marker")
         self._preview_message_ids = set()
+        if self._message_id == "__no_edit__" and self._durable_stream_text:
+            self._delivered_segment_texts.append(self._durable_stream_text)
         self._message_id = None
         self._accumulated = self._stream_ledger = self._last_sent_text = ""
+        self._durable_stream_text = ""
         self._already_sent = False
         self._clear_turn_final_flags()
         logger.info("Suppressed streamed intentional-silence marker (chat=%s)", self.chat_id)

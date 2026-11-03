@@ -184,7 +184,7 @@ async def test_an_adapter_without_the_base_contract_keeps_the_plain_send():
 
     await _deliver(adapter, metadata={"thread_id": "t"})
 
-    adapter.send.assert_awaited_once_with(CHAT, TEXT, metadata={"thread_id": "t"})
+    adapter.send.assert_awaited_once_with(CHAT, TEXT, metadata={"thread_id": "t", "_interim_send": True})
     assert _rows() == []
 
 

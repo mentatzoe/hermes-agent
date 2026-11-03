@@ -65,9 +65,16 @@ class StreamTransportMixin:
 
     async def _send_frame(self, text: str, *, finalize: bool):
         """One native-stream frame; every frame carries the same chat/reply/turn routing."""
-        return await self.adapter.send_stream_frame(
+        # Opt-in adapters separate a durable ACK from optimistic duplicate suppression.
+        explicit = getattr(type(self.adapter), "NATIVE_STREAM_DELIVERY_RECEIPTS", False) is True
+        receipt = {}
+        kwargs = {"delivery_receipt": receipt} if explicit else {}
+        result = await self.adapter.send_stream_frame(
             text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
-            turn_id=self._turn_id)
+            turn_id=self._turn_id, **kwargs)
+        if result is True and finalize and (not explicit or receipt.get("confirmed") is True):
+            self._record_durable_stream_text(text)
+        return result
 
     def _close_native_state(self) -> None:
         """Mark the native stream closed (next content re-seeds or falls back)."""
@@ -282,7 +289,7 @@ class StreamTransportMixin:
         stale_ids = self._stale_preview_ids()
         try:
             result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=is_turn_final))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
@@ -293,6 +300,7 @@ class StreamTransportMixin:
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
+        self._record_durable_stream_text(text)
         self._already_sent = True
         self._last_sent_text = text
         if is_turn_final:
@@ -362,7 +370,7 @@ class StreamTransportMixin:
                     # A failed send disabled edits: a preview sent now could never be updated and
                     # would stay on screen truncated next to the final reply. Send only the final.
                     return False
-                return await self._first_send(text, finalize=finalize)
+                return await self._first_send(text, finalize=finalize, is_turn_final=is_turn_final)
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -446,7 +454,7 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _first_send(self, text: str, *, finalize: bool) -> bool:
+    async def _first_send(self, text: str, *, finalize: bool, is_turn_final: bool = True) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
@@ -459,12 +467,13 @@ class StreamTransportMixin:
             return False
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+            metadata=self._metadata_for_send(final=finalize and is_turn_final, expect_edits=not finalize))
         if not result.success:
             self._edit_supported = False
             return False
         self._already_sent = True
         self._last_sent_text = text
+        self._record_durable_stream_text(text)
         if result.message_id:
             self._adopt_message_id(result.message_id)
             self._track_preview_ids_from_result(result)
@@ -506,6 +515,7 @@ class StreamTransportMixin:
             # next tick retries with the newer text.
             return True
         self._already_sent = True
+        self._record_durable_stream_text(text)
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset
@@ -570,6 +580,7 @@ class StreamTransportMixin:
             delivered_prefix = raw_response.get("delivered_prefix")
             if isinstance(delivered_prefix, str) and delivered_prefix:
                 self._last_sent_text = delivered_prefix
+                self._record_durable_stream_text(delivered_prefix)
                 self._fallback_preserve_partial_messages = text.startswith(delivered_prefix)
                 self._enter_fallback_mode(delivered_prefix)
             else:
