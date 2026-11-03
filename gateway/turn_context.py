@@ -94,6 +94,8 @@ class TurnContext:
     result_holder: list = field(default_factory=lambda: [None])
     tools_holder: list = field(default_factory=lambda: [None])
     stream_consumer_holder: list = field(default_factory=lambda: [None])
+    # Fallback commentary sends when no stream consumer could be created.
+    interim_delivery_futures: list = field(default_factory=list)
     streaming_tts_consumer_holder: list = field(default_factory=lambda: [None])
     # voice-ack wiring
     _voice_ack_fired: list = field(default_factory=lambda: [False])
