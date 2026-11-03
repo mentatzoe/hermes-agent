@@ -476,9 +476,9 @@ class GatewayNotificationsMixin:
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
-        # Only an acknowledged text send/edit counts, not media-only or an egress decline.
-        if text_content and on_text_delivered is not None:
-            on_text_delivered(None if text_already_delivered else (_edit_res if _reconciled else _sent))
+            # Only actual send/edit receipts count; duplicate suppression reuses earlier evidence.
+            if text_content and on_text_delivered is not None:
+                on_text_delivered(_edit_res if _reconciled else _sent)
         # Failed turns never upload attachments as if they succeeded.
         if not deliver_media:
             return True

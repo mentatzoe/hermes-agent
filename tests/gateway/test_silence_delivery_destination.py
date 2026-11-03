@@ -160,3 +160,43 @@ async def test_queued_reply_destination_controls_later_silence(
         assert response in ("", None)
     else:
         assert response == _unexpected_silence_reply()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["completion", "queued"])
+@pytest.mark.parametrize("delivery", ["commentary", "stream-segment"])
+@pytest.mark.parametrize("topic_exists", [True, False], ids=["same-topic", "root-fallback"])
+async def test_queued_dedupe_preserves_original_destination_after_reset(
+    monkeypatch, tmp_path, lane, delivery, topic_exists,
+):
+    runner, ctx, result, adapter, attempts, delivered, edits, _ = await _telegram_turn(
+        monkeypatch, tmp_path, topic_exists,
+    )
+    runner._deliver_media_from_response = AsyncMock()
+    consumer = _consumer(ctx, adapter)
+    if delivery == "commentary":
+        consumer.on_commentary(ANSWER)
+    else:
+        consumer.on_delta(ANSWER)
+        consumer.on_delta(None)
+    consumer.finish("[SILENT]")
+    await consumer.run()
+    assert consumer.has_durably_delivered_text(ANSWER) is True
+    assert consumer.has_durably_delivered_text() is topic_exists
+    assert len(delivered) == 1
+    assert delivered[0].get("message_thread_id") == (777 if topic_exists else None)
+
+    result["final_response"] = ANSWER
+    await runner._run_agent_deliver_first_response(ctx, adapter, result, result, None)
+    assert len(delivered) == 1, (attempts, delivered)
+    assert not edits
+    receipt_after_dedupe = result.get("visible_text_delivered", False)
+
+    result["final_response"] = "[SILENT]"
+    response = await _silence_response(runner, ctx, result, adapter, lane)
+    if topic_exists:
+        assert receipt_after_dedupe is True
+        assert response in ("", None)
+    else:
+        assert receipt_after_dedupe is False
+        assert response == _unexpected_silence_reply()
