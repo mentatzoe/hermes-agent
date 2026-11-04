@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_assignment_policy import _canonical_assignee, assignment_allowed, assignment_assignee
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 
@@ -1044,14 +1045,6 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
     return model, provider
 
 
-def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
-    if assignee is None:
-        return None
-    from hermes_cli.profiles import normalize_profile_name
-
-    return normalize_profile_name(assignee)
-
 
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
@@ -1215,7 +1208,7 @@ def create_task(
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
-    assignee = _canonical_assignee(assignee)
+    assignee = assignment_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1479,7 +1472,7 @@ def list_tasks(
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
-    profile = _canonical_assignee(profile)
+    profile = assignment_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -2532,6 +2525,7 @@ def reassign_task(
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
     ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    profile = assignment_assignee(profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -3315,7 +3309,7 @@ def request_review(
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
-            reviewer = _canonical_assignee(reviewer)
+            reviewer = assignment_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
@@ -3434,6 +3428,7 @@ def request_changes(
         implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
+        implementer = assignment_assignee(implementer)
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
@@ -3735,7 +3730,7 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
+    assignee = assignment_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -4294,6 +4289,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     return [
         {"name": name, "on_disk": name in on_disk, "counts": counts.get(name, {})}
         for name in sorted(on_disk | set(counts))
+        if assignment_allowed(name)
     ]
 
 

@@ -103,7 +103,11 @@ def _board_conn(board: Optional[str]) -> Iterator[tuple[Optional[str], sqlite3.C
     """Resolve the ``board`` query param, open a connection, close it on exit."""
     board = _resolve_board(board)
     with closing(_conn(board=board)) as conn:
-        yield board, conn
+        from hermes_cli.kanban_assignment_policy import AssignmentPolicyError
+        try:
+            yield board, conn
+        except AssignmentPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _with_board_pinned(board: Optional[str], fn: Callable[[], Any]) -> Any:

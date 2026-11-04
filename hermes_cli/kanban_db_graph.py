@@ -100,14 +100,15 @@ def decompose_triage_task(
     in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
     """
     from hermes_cli.kanban_db import (
-        _canonical_assignee, _link, _append_event, _insert_comment,
+        _link, _append_event, _insert_comment,
         write_txn, recompute_ready,
     )
+    from hermes_cli.kanban_assignment_policy import assignment_assignee
 
     if not children:
         return None
     if root_assignee is not None:
-        root_assignee = _canonical_assignee(root_assignee)
+        root_assignee = assignment_assignee(root_assignee)
     _validate_children_graph(children)
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
@@ -181,8 +182,9 @@ def _insert_decomposed_child(
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _append_event,
     )
+    from hermes_cli.kanban_assignment_policy import assignment_assignee
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
@@ -203,7 +205,7 @@ def _insert_decomposed_child(
         "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
+            assignment_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
         ),
     )
