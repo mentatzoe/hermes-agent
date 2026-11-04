@@ -4570,26 +4570,17 @@ class BasePlatformAdapter(ABC):
                     await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
-        drop: re-queue it if another task already owns the session (drain handoff), else spawn the
-        drain task and leave it the guard. Nothing pending: release the guard only if we still own
-        it."""
-        late_pending = self._pending_messages.pop(session_key, None)
+        """End-of-task ownership reconciliation: leave pending work for an existing
+        drain owner, or spawn one. Release an empty guard only if we still own it."""
         current_task = asyncio.current_task()
-        if late_pending is not None:
+        if session_key in self._pending_messages:
             existing_task = self._session_tasks.get(session_key)
-            if existing_task is not None and existing_task is not current_task:
-                # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
-                # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
-                # spawning two concurrent _process_message_background tasks for the same key (#17758
-                # follow-up: prevents the create_task path from racing with itself across the
-                # in-band/finally boundary).
-                self._pending_messages[session_key] = late_pending
-            else:
+            if existing_task is None or existing_task is current_task:
                 logger.debug(
                     "[%s] Late-arrival pending message during cleanup — spawning drain task",
                     self.name)
-                self._spawn_drain_task(late_pending, session_key)
+                self._spawn_drain_task(session_key)
+            # Otherwise the in-band drain owns the slot; leave it visible (#17758).
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
@@ -4684,12 +4675,10 @@ class BasePlatformAdapter(ABC):
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages[session_key]
                 delay = self._requeue_backoff_delay(session_key, pending_event, event)
-                if not delay:  # a backed-off event stays queued until the drain task wakes
-                    self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-                self._spawn_drain_task(pending_event, session_key, delay=delay)
+                self._spawn_drain_task(session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
             expected = asyncio.current_task() in self._expected_cancelled_tasks
@@ -4730,8 +4719,9 @@ class BasePlatformAdapter(ABC):
         Only the event this task just dispatched coming straight back backs off: the same
         ``message_id``, or for an id-less event the same ``timestamp`` (rewrite-hook
         ``dataclasses.replace`` copies keep both; a genuine new message gets a fresh timestamp).
-        The handler put it back because the session is busy elsewhere, and re-dispatching it at
-        once hot-loops for the whole busy window (#123229). Any other follow-up resets the counter
+        The handler put it back because the session is busy elsewhere; the retry keeper uses
+        this same identity check while waiting for that owner. Immediate re-dispatch would
+        hot-loop for the whole busy window (#123229). Any other follow-up resets the counter
         and runs immediately. The first bounce stays immediate (restart auto-resume relies on one
         self-bounce), then back off exponentially to a cap. Defers, never drops."""
         # The identical object always matches too: its id equals itself, and when empty the
@@ -4753,32 +4743,19 @@ class BasePlatformAdapter(ABC):
             "backing off %.2fs", self.name, session_key, delay)
         return delay
 
-    def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str,
-                          delay: float = 0.0) -> None:
-        """Hand the session to a fresh task for a queued follow-up — never recurse (chained
-        follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
-        live for concurrent inbound; ownership moves so stale-lock detection works. With ``delay``
-        the event stays in ``_pending_messages`` and the new owner task pops the slot only after
-        sleeping, so a cancel/discard during the back-off needs no put-back and can't drop a
-        newer message."""
+    def _spawn_drain_task(self, session_key: str, delay: float = 0.0) -> None:
+        """Hand off the slot to a fresh task — never recurse (C-stack overflow).
+
+        The event stays visible to the runner's post-model drain until the new
+        adapter task can claim it. Cancellation/discard needs no put-back.
+        """
+        from gateway.platforms.pending_drain import drain_pending
+
         self._clear_session_guard(session_key)
-        # Capture the guard this drain owns now: a /stop//new guard swapped in during the
-        # back-off must survive the slot-empty exit (#48300).
+        # A /stop//new guard swapped in during backoff must survive the empty-slot exit.
         guard = self._active_sessions.get(session_key)
         self._track_session_task(
-            session_key,
-            asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)))
-
-    async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
-                           guard: Optional[asyncio.Event]) -> None:
-        if delay > 0:
-            await asyncio.sleep(delay)
-            await self._flush_text_debounce_now(session_key)  # as every other task exit does
-            pending_event = self._pending_messages.pop(session_key, None)
-            if pending_event is None:  # consumed elsewhere during the back-off
-                self._cleanup_finished_session_task(session_key, guard)
-                return
-        await self._process_message_background(pending_event, session_key)
+            session_key, asyncio.create_task(drain_pending(self, session_key, delay, guard)))
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""
