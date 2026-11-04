@@ -86,6 +86,7 @@ class WeComStreamMixin:
     """Native streaming mixed into WeComAdapter (uses its ws transport, registries and ``_stream_*`` config)."""
 
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
+    NATIVE_STREAM_DELIVERY_RECEIPTS = True  # A True return can also mean an optimistic timeout.
     _REPLY_ACK_TIMEOUT = 15.0  # official REPLY_SEND_TIMEOUT_MS; shorter widened the double-send race
 
     async def _send_reply_queued(self, reply_req_id: str, body: Dict[str, Any], *, is_final: bool = False, skip_if_pending: bool = False) -> Dict[str, Any]:
@@ -269,7 +270,7 @@ class WeComStreamMixin:
         # Chat-level expiry only blocks NEW turn creation; a known turn_id may still finalize.
         if not turn_id and chat in self._stream_expired_chats:
             return False
-        inner = lambda: self._send_stream_frame_inner(text, chat=chat, reply_to=reply_to, finalize=finalize, turn_id=turn_id)  # noqa: E731
+        inner = lambda: self._send_stream_frame_inner(text, chat=chat, reply_to=reply_to, finalize=finalize, turn_id=turn_id, delivery_receipt=kwargs.get("delivery_receipt"))  # noqa: E731
         # Finalize counts toward 30/min → control lane; intermediates are unmetered (no queue).
         return await self._enqueue_chat_send(chat, inner, is_control=True) if finalize else await inner()
 
@@ -297,7 +298,7 @@ class WeComStreamMixin:
         logger.debug("[%s] send_stream_frame: created new turn %s (%s) for chat %s", self.name, turn.stream_id, f"turn_id={turn_id}, req_id={req_id}" if turn_id else f"req_id={req_id}", chat)
         return turn
 
-    async def _finalize_turn(self, turn: StreamTurn, text: str, chat: str, turn_id: Optional[str]) -> bool:
+    async def _finalize_turn(self, turn: StreamTurn, text: str, chat: str, turn_id: Optional[str], delivery_receipt: Optional[dict] = None) -> bool:
         """Send the finish=true frame (or decline via the Layer 2 clock fallback)."""
         # Layer 2: an old stream would hit 846604/846608 on finish=true, so decline up front and let
         # send() deliver once. Skipped with Layer 1 on: the heartbeat refreshed the window.
@@ -313,12 +314,16 @@ class WeComStreamMixin:
         self._cancel_keepalive(turn)
         # A final frame identical to the last intermediate is silently dropped — differ via ZWSP.
         final_text = text + "\u200b" if text and text == turn.last_sent_content else text
-        await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
+        response = await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
+        if delivery_receipt is not None:
+            delivery_receipt["confirmed"] = (
+                response.get("errcode", 0) == 0 and not response.get("ack_pending")
+                and not response.get("skipped"))
         turn.finalized = True
         self._stream_turns.pop(f"{chat}:{turn_id or turn.req_id}", None)
         return True
 
-    async def _send_stream_frame_inner(self, text: str, *, chat: str, reply_to: Optional[str] = None, finalize: bool = False, turn_id: Optional[str] = None) -> bool:
+    async def _send_stream_frame_inner(self, text: str, *, chat: str, reply_to: Optional[str] = None, finalize: bool = False, turn_id: Optional[str] = None, delivery_receipt: Optional[dict] = None) -> bool:
         turn: Optional[StreamTurn] = None
         try:
             turn = self._locate_turn(chat, reply_to, finalize, turn_id)
@@ -332,7 +337,7 @@ class WeComStreamMixin:
                 if not text and not finalize:
                     return True  # consumer's explicit seed call — nothing more to send
             if finalize:
-                return await self._finalize_turn(turn, text, chat, turn_id)
+                return await self._finalize_turn(turn, text, chat, turn_id, delivery_receipt)
             # Fire-and-forget: the gateway decides when to push (identity dedup in stream_consumer.py).
             turn.accumulated_text = text
             if turn._intermediate_frames_sent >= MAX_INTERMEDIATE_FRAMES or text == turn.last_sent_content:

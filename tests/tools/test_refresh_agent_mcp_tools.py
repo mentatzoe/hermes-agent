@@ -126,6 +126,40 @@ def test_refresh_does_not_reinject_disabled_memory_provider_tools(monkeypatch):
     assert all(t["function"]["name"] != "memory_search" for t in agent.tools)
 
 
+@pytest.mark.parametrize("preserve_prefix", [False, True])
+@pytest.mark.parametrize("read_only", [True, False, "true"])
+def test_refresh_keeps_opted_in_memory_readers_without_builtin_writer(monkeypatch, preserve_prefix, read_only):
+    """A child denies the builtin writer, not its distinct provider-owned reader."""
+    agent = _agent(["read_file", "honcho_search"], enabled=["file"], disabled=["memory"])
+    agent._memory_manager = types.SimpleNamespace(
+        read_only=read_only,
+        get_all_tool_schemas=lambda: [{"name": "honcho_search", "description": "", "parameters": {}}],
+    )
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [_tool("read_file")])
+
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=preserve_prefix)
+
+    expected = {"read_file", "honcho_search"} if read_only is True else {"read_file"}
+    assert agent.valid_tool_names == expected
+    assert {t["function"]["name"] for t in agent.tools} == expected
+    assert "memory" not in agent.valid_tool_names
+
+
+def test_refresh_ordinary_provider_uses_staged_not_stale_writer(monkeypatch):
+    """A stale builtin schema must not authorize ordinary provider re-injection."""
+    agent = _agent(["memory", "memory_search"], enabled=["file"])
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [{"name": "memory_search", "description": "", "parameters": {}}],
+    )
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [_tool("read_file")])
+
+    _mcp_agent.refresh_agent_mcp_tools(agent, content_aware=True)
+
+    assert agent.valid_tool_names == {"read_file"}
+
+
 def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
     """#5544: context-engine tools must NOT be re-injected on a restricted
     toolset. A platform with enabled_toolsets that excludes context_engine
