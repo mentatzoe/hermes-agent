@@ -1490,20 +1490,25 @@ class GatewayTurnMixin:
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
-        # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
-        # silent; any other human one must not.
+        # opened the chain. A human follow-up needs its own successful delivery receipt.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        if _intentional_silence and not silence_allowed(
+            _silence_kind, _silence_reply_expected,
+            visible_text_delivered=agent_result.get("visible_text_delivered", False),
+        ):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
             _intentional_silence = False
+            # The replacement warning is new text. An earlier answer delivered
+            # outside the origin must not suppress it through duplicate handling.
+            agent_result["already_sent"] = False
             response = _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
-                "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
+                "silence marker suppressed on an answered or unaddressed turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
 
@@ -3714,13 +3719,20 @@ class GatewayTurnMixin:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
+        from gateway.turn_delivery import queued_text_delivery_callback, record_visible_text_delivery
+        await record_visible_text_delivery(_delivery_result, turn_ctx)
+        if isinstance(result, dict) and _delivery_result.get("visible_text_delivered") is True:
+            result["visible_text_delivered"] = True
         first_response = _delivery_result.get("final_response", "")
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            if silence_allowed(
+                turn_ctx.persist_user_display_kind, turn_ctx.reply_expected,
+                visible_text_delivered=_delivery_result.get("visible_text_delivered", False),
+            ):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -3747,6 +3759,7 @@ class GatewayTurnMixin:
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
+                    on_text_delivered=queued_text_delivery_callback(result, first_response, _sc),
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
@@ -3996,26 +4009,6 @@ class GatewayTurnMixin:
                     # A background task that died of a real error must not abort the cleanup path.
                     logger.debug("background turn task failed during cleanup", exc_info=True)
 
-    async def _run_agent_edit_streamed_message(
-        self, _sc, source, response, content, *, _sk, ok, fail_result: str, fail_exc: str,
-    ) -> None:
-        """Edit the stream consumer's message in place with ``content``; on success mark
-        ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
-        ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
-        ``already_sent`` stays unset so the normal final send delivers the content."""
-        try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
-        except Exception as _edit_err:
-            logger.warning(fail_exc, _sk, _edit_err)
-            return
-        if not getattr(_res, "success", True):
-            logger.warning(fail_result, _sk, getattr(_res, "error", None))
-            return
-        response["already_sent"] = True
-        logger.info(*ok)
-
     async def _run_agent_mark_streamed_delivery(self, response: Any, turn_ctx: TurnContext) -> None:
         """Set ``response["already_sent"]`` when streaming already delivered the final reply.
 
@@ -4026,7 +4019,11 @@ class GatewayTurnMixin:
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
         if not isinstance(response, dict) or response.get("failed"):
             return
+        from gateway.turn_delivery import edit_streamed_message, record_visible_text_delivery
+        await record_visible_text_delivery(response, turn_ctx)
         _final = response.get("final_response") or ""
+        if self._is_intentional_silence(response, _final):
+            return  # A marker is not a replacement for the visible text already delivered.
         _is_empty_sentinel = not _final or _final == "(empty)"
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).
@@ -4071,7 +4068,7 @@ class GatewayTurnMixin:
                     _sk,
                 )
             elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
-                await self._run_agent_edit_streamed_message(
+                await edit_streamed_message(
                     _sc, source, response, _final, _sk=_sk,
                     ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
                     fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
@@ -4085,7 +4082,7 @@ class GatewayTurnMixin:
         elif _transformed and _sc is not None:
             # Transformed after streaming: edit the streamed message instead of sending a duplicate.
             if _sc.message_id:
-                await self._run_agent_edit_streamed_message(
+                await edit_streamed_message(
                     _sc, source, response, response["final_response"], _sk=_sk,
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",

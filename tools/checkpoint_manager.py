@@ -776,8 +776,9 @@ class CheckpointManager:
     max_snapshots : int
         Keep at most this many checkpoints per directory.
     max_total_size_mb : int
-        Hard ceiling on total store size.  Oldest checkpoints per project
-        are dropped when the store exceeds this after a commit.
+        Store-size budget for periodic maintenance, which reclaims unused
+        objects before dropping old checkpoints. Not enforced during writes;
+        the store can exceed it between maintenance runs.
     max_file_size_mb : int
         Skip adding any single file larger than this to a checkpoint.
         (Implemented via ``.gitignore`` excludes + a post-stage size check.)
@@ -1619,16 +1620,19 @@ class CheckpointManager:
             )
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
-        """Checkpoint-take path: snapshot-count budget plus one size round, gc deferred to the
-        periodic prune — a repack here held the tool call for the whole gc on a large store."""
+        """Enforce only this project's count budget on the checkpoint-take path.
+
+        Store-wide size enforcement belongs to periodic maintenance. Even a single
+        size round rebuilds every retained commit in every project's history, so
+        its work grows with the whole store, not this write. Rewritten objects also
+        keep occupying space until maintenance runs GC: doing another round on the
+        next write was both slow and needlessly destructive to rollback history.
+        """
         from tools.checkpoint_pruning import Pruner, PruneError
 
         pruner = Pruner(_run_git, store, working_dir, _GIT_TIMEOUT, _dir_size_bytes, _REFS_PREFIX)
         try:
             pruner.trim(ref, self.max_snapshots)
-            if pruner.drop_one_round(self.max_total_size_mb * 1024 * 1024):
-                logger.info("Checkpoint store exceeded %d MB — dropped the oldest snapshot per project; "
-                            "space is reclaimed by the next prune", self.max_total_size_mb)
         except (PruneError, OSError) as exc:
             logger.warning("Checkpoint pruning stopped: %s", exc)
 

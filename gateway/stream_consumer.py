@@ -34,6 +34,7 @@ from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
 from gateway.stream_consumer_think import StreamThinkFilterMixin
+from gateway.turn_delivery import delivery_destination_provenance
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -159,6 +160,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
+        # Silence evidence is separate from duplicate suppression: a root-chat
+        # fallback is still delivered text, but did not answer the origin topic.
+        self._silence_text_delivered = False
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
         self._before_finalize_notified = False
@@ -196,6 +200,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # overflow splits seal head chunks (reconcilable turn-final payload).
         self._accumulated = self._stream_ledger = ""
         self._last_sent_text = ""    # skip redundant edits
+        self._durable_stream_text = ""  # acknowledged prose, never draft/progress frames
+        self._segment_delivery_matches_origin = True
         self._fallback_final_send = False
         self._fallback_prefix = ""
         # Fallback sends only the missing tail after a partial overflow delivery.
@@ -264,6 +270,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+        else:
+            meta["_interim_send"] = True  # Prose must reach the chat, not a deferred-final cache.
         return meta or None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
@@ -364,16 +372,47 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 *self._delivered_segment_texts)
         return bool(target) and any(sent.strip() == target for sent in seen)
 
-    def has_durably_delivered_text(self, text: str) -> bool:
-        """``has_delivered_text`` restricted to deliveries that outlive the turn: commentary and
-        finalized segments always count; the visible prefix only once ``_already_sent`` (a draft frame
-        sets ``_last_sent_text`` but is ephemeral — a failed finalize send after it must still fall
-        back to the gateway's real final send, same gate as ``delivered_final_matches``)."""
-        target = self._clean_for_display(text or "").strip()
+    def has_durably_delivered_text(self, text: Optional[str] = None) -> bool:
+        """Match acknowledged text, or check for any when no target is supplied.
+
+        Drafts and drop-tolerant native intermediates are not durable receipts.
+        Actual send/edit/native-finalize acknowledgements survive segment resets.
+        Targeted matching retains the existing final-response deduplication semantics.
+        """
         seen = [*self._delivered_commentary_texts, *self._delivered_segment_texts]
+        if text is None:
+            return self._silence_text_delivered
         if self._already_sent:
             seen.append(self._visible_prefix())
+        target = self._clean_for_display(text).strip()
         return bool(target) and any(sent.strip() == target for sent in seen)
+
+    def record_durable_text_delivery(self, text: str, result=None) -> bool:
+        """Retain origin-destination evidence for the final-silence decision.
+
+        Explicit destination provenance updates the current segment. Edits that
+        omit it inherit the segment's prior classification instead of erasing a
+        known root-topic fallback. The turn-level receipt survives resets.
+        """
+        provenance = delivery_destination_provenance(result)
+        if provenance is not None:
+            self._segment_delivery_matches_origin = provenance
+        cleaned = self._clean_for_display(text or "").strip()
+        if (not self._segment_delivery_matches_origin or not cleaned
+                or _is_intentional_silence_response(cleaned)):
+            return False
+        self._silence_text_delivered = True
+        return True
+
+    def _record_durable_stream_text(self, text: str, result=None) -> None:
+        """Called only after an actual send/edit or native-finalize acknowledgement.
+
+        The ledger identifies assistant prose rather than a tool-progress overlay;
+        it is never itself evidence that the buffered text reached the user.
+        """
+        if self._stream_ledger:
+            self._durable_stream_text = self._clean_for_display(text).strip()
+            self.record_durable_text_delivery(text, result=result)
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -452,7 +491,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
         # Retain the segment's visible text so has_delivered_text still matches.
-        finalized = self._clean_for_display(self._last_sent_text).strip()
+        finalized = self._durable_stream_text
         if finalized:
             self._delivered_segment_texts.append(finalized)
         # Also clears the final flags: what we delivered was an interim preamble.  Safe:
@@ -515,7 +554,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            result = await self.adapter.send(self.chat_id, finalize_text)
+            if getattr(result, "success", False):
+                self._record_durable_stream_text(finalize_text, result=result)
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)
