@@ -158,7 +158,17 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
-        return _conn_uses_path(other, task_id, key, exclude_task_id=False)
+        # A damaged populated board can return no matching rows without an
+        # error. Check the whole database (including orphaned pages), in the
+        # ownership query's snapshot, before treating absence as permission
+        # to delete. A found owner already proves that the workspace stays.
+        other.execute("BEGIN")
+        if _conn_uses_path(other, task_id, key, exclude_task_id=False):
+            return True
+        checked = other.execute("PRAGMA quick_check(1)").fetchall()
+        if len(checked) != 1 or tuple(checked[0]) != ("ok",):
+            raise sqlite3.DatabaseError("Sibling board failed quick_check")
+        return False
     finally:
         other.close()
 
