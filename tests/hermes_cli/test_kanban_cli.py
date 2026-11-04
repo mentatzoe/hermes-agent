@@ -40,6 +40,20 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 
+def test_create_help_limits_pr_contract_to_required_checks(capsys):
+    parser = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(parser.add_subparsers(dest="command"))
+
+    with pytest.raises(SystemExit) as exited:
+        parser.parse_args(["kanban", "create", "--help"])
+    assert exited.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "only after verifying" in help_text
+    assert "target branch has repository-required checks" in help_text
+    assert "without required checks, keep PR cards local-only" in help_text
+    assert "verified merge commit and tree in the result" in help_text
+
+
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""

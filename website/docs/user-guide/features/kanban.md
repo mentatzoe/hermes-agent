@@ -47,14 +47,20 @@ The eight canonical collaboration patterns are catalogued in [Collaboration patt
 
 ## PR completion contracts
 
-Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
-`https://github.com/OWNER/REPO/pull/123` URL for existing work). `kanban_create`
-accepts the same `completion_contract`. Use `local-only` for intentionally local
-work; existing and undeclared cards retain that default. Prose URLs are not policy.
+Use `--completion-contract OWNER/REPO` (or an exact
+`https://github.com/OWNER/REPO/pull/123` URL for existing work) only after verifying
+that the PR's target branch has repository-required checks in branch protection
+or active rulesets. `kanban_create` accepts the same `completion_contract` at
+creation. Publishing a PR alone does not require a PR contract.
 
-After publishing, pass `metadata.published_pr` to completion. The first matching
-URL binds the card permanently; retries cannot substitute a green sibling PR.
-CLI `show --json` and `kanban_show` expose the persisted contract.
+For repositories without required checks, keep PR cards `local-only` and record
+the verified merge commit and tree in the result. `local-only` is also the default
+for local work and undeclared cards; it does not prohibit publishing or merging a
+PR. Optional CI checks are not repository-required checks. Prose URLs are not policy.
+
+For PR contracts, after publishing, pass `metadata.published_pr` to completion.
+The first matching URL binds the card permanently; retries cannot substitute a
+green sibling PR. CLI `show --json` and `kanban_show` expose the persisted contract.
 
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset

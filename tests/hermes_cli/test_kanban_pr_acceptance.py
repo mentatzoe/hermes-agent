@@ -13,7 +13,8 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [],
+             "required": True, "pr_state": "OPEN"}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -21,9 +22,9 @@ def github(tmp_path, monkeypatch):
             sha = state["head"]
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "headRefOid": sha, "baseRefName": "main", "state": state["pr_state"],
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                        {"context": "required", "app": {"databaseId": 1}}] if state["required"] else []}}}}}}
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
@@ -107,6 +108,36 @@ def test_pr_completion_requires_current_required_evidence(github):
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("pr_state", ["OPEN", "MERGED"])
+@pytest.mark.parametrize("contract", ["acme/repo", "https://github.com/acme/repo/pull/7"])
+def test_no_required_checks_still_refuses_pr_contract_and_explains_local_only(github, pr_state, contract):
+    github.update(required=False, pr_state=pr_state)
+    pr_url = "https://github.com/acme/repo/pull/7"
+    result = f"Merged {pr_url}: merge commit {'a' * 40}, tree {'c' * 40}"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Publish without required checks", completion_contract=contract)
+        assert not kb.complete_task(conn, tid, result=result, metadata={"published_pr": pr_url})
+        task = kb.get_task(conn, tid)
+        assert task.status != "done"
+        assert task.completion_contract == pr_url
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["ok"] is False
+        assert receipt["classification"] == "missing"
+        assert receipt["required"] == []
+        assert "local-only at creation for PR work without required checks" in receipt["detail"]
+        assert "verified merge commit and tree in the result" in receipt["detail"]
+        assert "ask the operator to correct this card's contract" in task.last_failure_error
+
+        before = list(github["requests"])
+        local = kb.create_task(conn, title="Publish without required checks", completion_contract="local-only")
+        assert kb.complete_task(conn, local, result=result, metadata={"published_pr": pr_url})
+        assert kb.get_task(conn, local).result == result
+        assert kb.get_task(conn, local).completion_contract == "local-only"
+        assert github["requests"] == before
 
 
 @pytest.mark.platforms("linux")

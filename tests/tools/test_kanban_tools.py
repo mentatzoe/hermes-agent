@@ -141,6 +141,19 @@ def test_kanban_task_id_descriptions_state_the_non_worker_case():
     assert "kanban_show" in seen
 
 
+def test_completion_contract_description_requires_configured_checks():
+    """Publishing alone must not steer no-check repositories into an unsatisfiable gate."""
+    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
+
+    description = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["completion_contract"]["description"]
+    assert "only after verifying" in description
+    assert "target branch has repository-required checks" in description
+    assert "without required checks, keep PR cards local-only" in description
+    assert "verified merge commit and tree in the result" in description
+    assert "repository-required exact-head CI passes" in description
+    assert "metadata.published_pr" in description
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
