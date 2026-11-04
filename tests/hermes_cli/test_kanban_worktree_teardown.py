@@ -40,7 +40,7 @@ def _git(*args: str, cwd: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -86,8 +86,8 @@ def test_clean_pushed_worktree_removed(repo: Path) -> None:
     wt = _make_worktree(repo, "t_aaaa1111")
     kbw._cleanup_worktree_workspace("t_aaaa1111", str(wt))
     assert not wt.exists()
-    # auto-generated task branch goes with it
-    assert not _branch_exists(repo, "wt/t_aaaa1111")
+    # Workspace cleanup deliberately retains task branches and their metadata.
+    assert _branch_exists(repo, "wt/t_aaaa1111")
     # main checkout untouched
     assert (repo / "README.md").exists()
 
@@ -99,12 +99,12 @@ def test_cleanup_leaves_a_worktree_cwd_before_removal(
     wt = _make_worktree(repo, "t_cwd112425")
     real_git = kbw._git
 
-    def windows_git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
+    def windows_git(repo_root: Path, *args: str, timeout: int, **kwargs) -> subprocess.CompletedProcess:
         if args[:2] == ("worktree", "remove") and Path.cwd().is_relative_to(wt):
             return subprocess.CompletedProcess(
                 ["git", *args], 1, stderr="Permission denied: current directory"
             )
-        return real_git(repo_root, *args, timeout=timeout)
+        return real_git(repo_root, *args, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(kbw, "_git", windows_git)
     monkeypatch.chdir(wt)
@@ -128,7 +128,7 @@ def test_cleanup_proceeds_when_cwd_was_deleted(
     kbw._cleanup_worktree_workspace("t_deadcwd113073", str(wt))
 
     assert not wt.exists()
-    assert not _branch_exists(repo, "wt/t_deadcwd113073")
+    assert _branch_exists(repo, "wt/t_deadcwd113073")
 
 
 def test_cleanup_retries_worktree_removal_once(
@@ -139,7 +139,7 @@ def test_cleanup_retries_worktree_removal_once(
     real_git = kbw._git
     attempts = 0
 
-    def delayed_remove(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
+    def delayed_remove(repo_root: Path, *args: str, timeout: int, **kwargs) -> subprocess.CompletedProcess:
         nonlocal attempts
         if args[:2] == ("worktree", "remove"):
             attempts += 1
@@ -147,7 +147,7 @@ def test_cleanup_retries_worktree_removal_once(
                 return subprocess.CompletedProcess(
                     ["git", *args], 1, stderr="Permission denied: handle pending"
                 )
-        return real_git(repo_root, *args, timeout=timeout)
+        return real_git(repo_root, *args, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(kbw, "_git", delayed_remove)
     monkeypatch.setattr(kbw.time, "sleep", lambda _delay: None)
@@ -178,7 +178,7 @@ def test_custom_branch_survives_worktree_removal(repo: Path) -> None:
     wt = _make_worktree(repo, "t_dddd4444", branch="feature/custom")
     kbw._cleanup_worktree_workspace("t_dddd4444", str(wt), "feature/custom")
     assert not wt.exists()
-    # only auto-generated wt/* branches are deleted
+    # Custom branches, like auto-generated task branches, are retained.
     assert _branch_exists(repo, "feature/custom")
 
 
@@ -244,7 +244,7 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.complete_task(conn, tid, summary="done")
     assert not wt.exists()
-    assert not _branch_exists(repo, f"wt/{tid}")
+    assert _branch_exists(repo, f"wt/{tid}")
 
 
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:
