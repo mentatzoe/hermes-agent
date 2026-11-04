@@ -114,7 +114,7 @@ def display_kind_for_event(event: Any) -> str | None:
 
 
 def is_machinery_display_kind(display_kind: Any) -> bool:
-    """Only a machinery turn may vanish on a bare silence marker; a human turn gets a visible fallback.
+    """Whether this display kind represents a self-injected machinery turn.
 
     The caller passes the current turn's persisted display kind instead of inferring it from the
     transcript: the inbound user row is not persisted yet, and a previous internal row must never
@@ -123,9 +123,11 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
     return display_kind in MACHINERY_DISPLAY_KINDS
 
 
-def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
-    """Whether a successful bare silence marker may remain silent for this turn."""
-    return is_machinery_display_kind(display_kind) or reply_expected is False
+def silence_allowed(
+    display_kind: Any, reply_expected: Optional[bool] = None, *, visible_text_delivered: bool = False,
+) -> bool:
+    """A successful bare marker may end an answered turn or an optional reply."""
+    return is_machinery_display_kind(display_kind) or reply_expected is False or visible_text_delivered is True
 
 
 def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:

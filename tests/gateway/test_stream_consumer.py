@@ -1459,12 +1459,15 @@ class TestHasDeliveredTextAfterSegmentBreak:
     """has_delivered_text must find a delivered segment after a segment break,
     but must not claim text from a failed delivery. (#65919 review)"""
 
-    def test_finds_delivered_segment_after_segment_break(self):
+    @pytest.mark.asyncio
+    async def test_finds_delivered_segment_after_segment_break(self):
         """A successfully delivered segment must still be found by
         has_delivered_text after _reset_segment_state runs."""
         c = _make_consumer()
-        # Simulate a successfully delivered segment
-        c._last_sent_text = "Here is the first segment"
+        # Exercise an acknowledged send: draft visibility alone is not durable.
+        c.adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="segment-1"))
+        c._append_accumulated("Here is the first segment")
+        assert await c._send_or_edit("Here is the first segment")
         c._reset_segment_state()
         # After the reset, has_delivered_text must still find it
         assert c.has_delivered_text("Here is the first segment") is True

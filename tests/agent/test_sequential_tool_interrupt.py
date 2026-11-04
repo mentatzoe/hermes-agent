@@ -127,3 +127,100 @@ def test_interrupt_prefers_real_result_from_cooperative_tool(
 
     assert managed.result == "real result"
     assert not isinstance(managed.result, _ToolCancelledResult)
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "patch"])
+def test_interrupt_abandonment_fences_file_dispatch_after_finalization(
+    tmp_path, monkeypatch, _fast_polls, tool_name
+):
+    """Preflight returning during abandonment logging must not admit a late edit."""
+    import json
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import model_tools
+    from tests.agent.test_sequential_tool_timeout import _make_agent
+    from tools.file_tools import read_file_tool
+
+    agent = _make_agent(tmp_path)
+    agent.valid_tool_names = {"read_file", "write_file", "patch"}
+    agent.enabled_toolsets = ["file"]
+    agent._checkpoint_mgr.enabled = True
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    target = tmp_path / "target.txt"
+    target.write_text("before\n")
+    task_id, call_id = "interrupt-preflight", "interrupted-file-call"
+    assert "error" not in json.loads(read_file_tool(str(target), task_id=task_id))
+    args = {"path": str(target)}
+    if tool_name == "write_file":
+        args["content"] = "after\n"
+    else:
+        args.update(old_string="before", new_string="after")
+    call = SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(
+        name=tool_name, arguments=json.dumps(args)))
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    boundary, allow_mutation = threading.Event(), threading.Event()
+    real_worker = tool_executor._registered_tool_worker
+    real_handler = model_tools.handle_function_call
+    admitted, outcomes = [], []
+
+    @contextmanager
+    def tracked_worker(owner):
+        try:
+            with real_worker(owner) as tid:
+                yield tid
+        finally:
+            finished.set()
+            boundary.set()
+
+    def checkpoint(*_args):
+        entered.set()
+        assert release.wait(10), "checkpoint preflight was not released"
+
+    def interrupt_after_preflight_started(*_args):
+        assert entered.wait(10), "worker never reached checkpoint preflight"
+        assert agent.interrupt(tool_reason="user interrupt")
+        return "interrupted", None
+
+    def held_handler(*args, **kwargs):
+        admitted.append(kwargs["tool_call_id"])
+        boundary.set()
+        assert allow_mutation.wait(10), "handler was not released after finalization"
+        result = real_handler(*args, **kwargs)
+        outcomes.append(result)
+        return result
+
+    info = tool_executor.logger.info
+
+    def release_in_abandonment_log(message, *args, **kwargs):
+        if "abandoned due to" in message:
+            # The actual three-second grace and completion check have ended.
+            # Let preflight finish before logging returns, then wait for either
+            # a rejected dispatch or the held real handler to reach the boundary.
+            release.set()
+            assert boundary.wait(10), "worker did not reach the dispatch boundary"
+        info(message, *args, **kwargs)
+
+    monkeypatch.setattr(tool_executor, "_ensure_file_checkpoint", checkpoint)
+    monkeypatch.setattr(tool_executor, "_registered_tool_worker", tracked_worker)
+    monkeypatch.setattr(tool_executor, "_poll_sequential_future", interrupt_after_preflight_started)
+    monkeypatch.setattr(tool_executor.logger, "info", release_in_abandonment_log)
+    monkeypatch.setattr(model_tools, "handle_function_call", held_handler)
+    messages = []
+    try:
+        tool_executor.execute_tool_calls_sequential(
+            agent, SimpleNamespace(tool_calls=[call]), messages, task_id)
+        assert len(messages) == 1 and "cancelled" in messages[0]["content"]
+        assert target.read_text() == "before\n"
+        # Turn finalization clears the worker's cooperative interrupt as well.
+        # A revoked call must stay revoked even after that shared signal clears.
+        assert agent.clear_interrupt()
+    finally:
+        release.set()
+        allow_mutation.set()
+        assert finished.wait(10), "abandoned worker did not finish"
+    assert target.read_text() == "before\n", ("edit landed after cancellation", admitted, outcomes)
+    assert admitted == [], ("body admitted during abandonment logging", outcomes)
+    assert [(e["tool_call_id"], e.get("error_type")) for e in _fast_polls] == [
+        (call_id, "tool_interrupted")]
