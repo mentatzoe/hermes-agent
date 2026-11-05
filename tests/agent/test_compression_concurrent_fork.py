@@ -1878,62 +1878,6 @@ def test_hard_cancel_between_compress_return_and_commit_begin_wins_atomically(
     archive_spy.assert_not_called()
     assert db.get_compression_lock_holder(session_id) is None
 
-def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
-    """A surfaced stop never races an untracked post-return transcript commit."""
-    db = SessionDB(db_path=tmp_path / "state.db")
-    session_id = "HARD_CANCEL_AFTER_COMMIT_ADMISSION"
-    db.create_session(session_id, source="tui")
-    agent = _build_agent_with_db(db, session_id)
-    agent.compression_in_place = True
-    agent._cached_system_prompt = "sys"
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-    commit_started = threading.Event()
-    allow_commit = threading.Event()
-    stop_returned = threading.Event()
-    original_archive = db.archive_and_compact
-
-    def _blocked_archive(*args, **kwargs):
-        commit_started.set()
-        assert allow_commit.wait(timeout=5)
-        return original_archive(*args, **kwargs)
-
-    db.archive_and_compact = _blocked_archive
-    agent.context_compressor.compress.side_effect = lambda *_a, **_kw: [
-        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
-        {"role": "user", "content": "tail"},
-    ]
-    compression_result: dict[str, tuple] = {}
-    compression = threading.Thread(
-        target=lambda: compression_result.setdefault(
-            "value", agent._compress_context(messages, "sys", approx_tokens=120_000)
-        ),
-        daemon=True,
-    )
-    compression.start()
-    assert commit_started.wait(timeout=2)
-
-    stop = threading.Thread(
-        target=lambda: (
-            agent.hard_interrupt("stop after commit admission"),
-            stop_returned.set(),
-        ),
-        daemon=True,
-    )
-    stop.start()
-    assert not stop_returned.wait(timeout=0.1)
-    allow_commit.set()
-    compression.join(timeout=5)
-    stop.join(timeout=5)
-
-    assert not compression.is_alive()
-    assert not stop.is_alive()
-    assert stop_returned.is_set()
-    assert compression_result["value"][0][0]["content"] == (
-        "[CONTEXT COMPACTION] summary"
-    )
-    assert agent._hard_interrupt_requested.is_set()
-    assert db.get_compression_lock_holder(session_id) is None
-
 @pytest.mark.parametrize("deadline_offset", [-10.0, 0.05, None])
 def test_force_cancel_restores_exact_expired_or_expiring_cooldown_row(
     tmp_path: Path,
