@@ -842,6 +842,7 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
             return _dispatch(function_args)
         from hermes_cli.middleware import run_tool_execution_middleware
         return run_tool_execution_middleware(function_name, function_args, _dispatch, original_args=original_args,
+                                             enabled_tools=tuple(enabled_tools) if enabled_tools is not None else (),
                                              **ids.hook_kwargs())
 
 

@@ -76,6 +76,7 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
                 return None
             return json.dumps({
                 "success": True, "status": "unchanged", "name": rec_name,
+                "_source_path": str(src),
                 "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
                 "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
     return None
