@@ -250,16 +250,18 @@ def _report_fault(agent, snapshot: dict) -> None:
         callback("lifecycle", DiagnosticText(message))
 
 
-def merge(previous: dict, following: dict) -> None:
+def merge(previous: dict, following: dict) -> bool:
     combined = {
         item["id"]: item
         for item in [*snapshots(previous), *snapshots(following)]
     }
-    if combined:
+    changed = list(combined.values()) != snapshots(previous)
+    if changed:
         previous["display_metadata"] = {
             **(previous.get("display_metadata") or {}),
             KEY: deepcopy(list(combined.values())),
         }
+    return changed
 
 
 def backfill(agent, row: dict, content, *, api_content=None) -> None:

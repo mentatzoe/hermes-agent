@@ -698,6 +698,9 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             else:
                 prev.pop(MERGED_DURABLE_ROWS, None)
             prev["content"] = merged_content
+            from agent import authored_turn_context as authored
+            if authored.merge(prev, msg):
+                prev.pop(_DB_PERSISTED_MARKER, None)
             if merge_mid_turn_entries(prev, msg):
                 prev.pop(_DB_PERSISTED_MARKER, None)
             # The clean-text persist override must replace only the absorbed turn, never the

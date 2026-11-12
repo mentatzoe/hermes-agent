@@ -5021,6 +5021,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         """
         if inflight is None or not compressed:
             return compressed
+        from agent import authored_turn_context as authored
 
         carrier_idx = -1
         for idx in range(len(compressed) - 1, -1, -1):
@@ -5043,6 +5044,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         if carrier_text.split(_SUMMARY_END_MARKER, 1)[1].strip():
             # The _force_user_leading layout keeps the live request on the
             # carrier itself, after the marker. Already actionable.
+            authored.merge(carrier, inflight)
             return compressed
 
         from agent.context_compressor_restatement import restated_task_text
@@ -5063,6 +5065,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             replay = {"role": "user", "content": task_text}
         else:
             replay = _fresh_compaction_message_copy(inflight)
+        authored.merge(replay, inflight)
         replay.pop(_COMPACTION_TAIL_MARKER, None)
         # A restated row is NEW at the compaction boundary: never persist the
         # in-flight turn's original timestamp, or timestamp-ordered views show
@@ -5138,6 +5141,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             drop_stale_api_content(carrier)
             # The carrier absorbed a durable user turn: record its uid (merge witness).
             record_absorbed_message(carrier, inflight)
+            authored.merge(carrier, inflight)
             return compressed
 
         compressed.append(replay)

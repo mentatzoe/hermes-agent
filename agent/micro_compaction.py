@@ -496,6 +496,8 @@ class MicroCompactionMixin:
         for msg in result:
             prev = merged[-1] if merged else None
             if _plain_user(msg) and _plain_user(prev):
+                from agent import authored_turn_context as authored
+                authored.merge(prev, msg)
                 prev["content"] = "\n\n".join(c for c in (prev["content"], msg["content"]) if c)
                 drop_stale_api_content(prev)  # merged content invalidates the api_content sidecar
                 # The originals stay in display history as compacted rows; showing the join too
