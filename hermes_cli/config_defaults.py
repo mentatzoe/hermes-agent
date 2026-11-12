@@ -73,6 +73,7 @@ DEFAULT_CONFIG = {
         "storage": "hermes-home",
     },
     "agent": {
+        "authored_turn_context": None,
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).
         "max_turns": None,

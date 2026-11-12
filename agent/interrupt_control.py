@@ -271,7 +271,7 @@ class InterruptControlMixin:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        entry = pending_human_input(cleaned, facts)
+        entry = pending_human_input(cleaned, facts, agent=self)
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing or []) + [entry]
@@ -325,7 +325,7 @@ class InterruptControlMixin:
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
                 return False
-            self._pending_redirect = (existing or []) + [pending_human_input(cleaned, facts)]
+            self._pending_redirect = (existing or []) + [pending_human_input(cleaned, facts, agent=self)]
             self._interrupt_requested = True
             self._interrupt_message = None
             self._turn_user_intervened = True

@@ -1,5 +1,6 @@
 """Route-independent human input facts, separate from model-facing text."""
 from copy import deepcopy
+from agent import authored_turn_context as authored
 from typing import NotRequired, TypedDict
 
 
@@ -8,11 +9,13 @@ class PendingHumanInput(TypedDict):
     facts: NotRequired[dict]
 
 
-def pending_human_input(text: str, facts: dict | None = None) -> PendingHumanInput:
+def pending_human_input(text: str, facts: dict | None = None, *, agent=None) -> PendingHumanInput:
     """Snapshot one caller's words and ownership before a surface can reuse them."""
     entry: PendingHumanInput = {"text": text.strip()}
     if facts is not None:
         entry["facts"] = deepcopy(facts)
+    if agent is not None:
+        authored.capture(agent, entry, expect=False)
     return entry
 
 
@@ -58,8 +61,12 @@ def mid_turn_human_row(agent, entries, *, content: str, **metadata) -> dict:
     """
     row = {"role": "user", "content": content, **metadata}
     if isinstance(entries, str):
+        authored.capture(agent, row)
         return row  # legacy caller has no per-human provenance
     retain_mid_turn_entries(row, entries)
+    for entry in entries:
+        authored.merge(row, entry)
+    authored.capture(agent, row)
     paths = [path for entry in entries for path in
              (entry.get("facts") or {}).get("recoverable_audio_paths", [])]
     if paths:

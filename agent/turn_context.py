@@ -8,6 +8,8 @@ returns a ``TurnContext`` with only the locals the loop reads back.
 
 from __future__ import annotations
 
+from agent import authored_turn_context as authored
+
 import logging
 import sys
 import threading
@@ -619,6 +621,7 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     """Reset retry counters, guardrails, iteration and run budgets at turn start."""
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
+    agent._authored_turn_expected = {}
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
     agent._tool_guardrails.reset_for_turn()
@@ -698,6 +701,7 @@ def _stage_turn_user_message(
     # recovery dedups via ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
+    authored.capture(agent, user_msg)
     return user_msg, pending_cli_message
 
 
@@ -943,7 +947,9 @@ def _stamp_api_content_sidecar(
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
     durable_content, _api_content = durable_user_row_content(
         agent, _turn_user_msg, live_content,
-        compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context),
+        authored.render(_turn_user_msg,
+            compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context)
+            or live_content or ""),
     )
     if _api_content is None or _api_content == durable_content:
         return
@@ -993,7 +999,13 @@ def _append_multimodal_context(
     ``_row_id``-under-lock protocol as the string sidecar backfill; the row keeps its writer's
     shape (compaction inserted the raw parts, a flush the text projection)."""
     _mm_ctx = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
-    if not append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx):
+    changed = append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx)
+    original = turn_user_msg.get("content")
+    rendered = authored.render(turn_user_msg, original)
+    if rendered != original:
+        turn_user_msg["content"] = rendered
+        changed = True
+    if not changed:
         return
     from agent.session_persistence import _durable_content, _persist_lock
 
@@ -1313,6 +1325,9 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+
+        if msg.get("role") == "user":
+            api_msg["content"] = authored.render(msg, api_msg.get("content", ""))
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
         # reasoning context is preserved.

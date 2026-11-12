@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 def inherit_read_only_memory(parent, child) -> None:
     """Attach only explicit read-only forks, before the child's first prompt."""
+    child._authored_turn_source = getattr(parent, "_authored_turn_source", None)
+    child._authored_turn_expected = {}
     source = getattr(parent, '_memory_manager', None)
     if not isinstance(source, MemoryManager) or not memory_provider_tools_exposed(parent):
         return

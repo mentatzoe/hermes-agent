@@ -210,7 +210,7 @@ def snapshots(row: dict) -> list:
     return (row.get("display_metadata") or {}).get(KEY, [])
 
 
-def capture(agent, row: dict) -> None:
+def capture(agent, row: dict, *, expect: bool = True) -> None:
     """Call only at actual input admission, never while replaying history."""
     source = getattr(agent, "_authored_turn_source", None)
     if source is None:
@@ -226,8 +226,9 @@ def capture(agent, row: dict) -> None:
     row["display_metadata"] = {
         **(row.get("display_metadata") or {}), KEY: [snapshot]
     }
-    pending = getattr(agent, "_authored_turn_expected", {})
-    agent._authored_turn_expected = {**pending, snapshot["id"]: block(snapshot)}
+    if expect:
+        pending = getattr(agent, "_authored_turn_expected", {})
+        agent._authored_turn_expected = {**pending, snapshot["id"]: block(snapshot)}
 
 
 def _report_fault(agent, snapshot: dict) -> None:
