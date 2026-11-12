@@ -55,6 +55,39 @@ def test_row_addressed_snapshot_guard_and_metadata_merge(tmp_path, content):
     db.close()
 
 
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+def test_early_multimodal_row_backfills_snapshot_without_relabeling(tmp_path, compacted):
+    from copy import deepcopy
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("s1", source="cli")
+    agent = configure(_RealPersistenceAgent(db), tmp_path)
+    content = [{"type": "text", "text": "caption"},
+               {"type": "image_url", "image_url": {"url": "data:image/png;base64,fixture"}}]
+    metadata = {"actor": "human", "typed_user_message": "caption", "source": "synthetic-client"}
+    from agent.session_persistence import _durable_content
+    db.append_message("s1", "user", content=content if compacted else _durable_content(content), display_metadata=metadata)
+    row_id = db.get_messages("s1")[0]["id"]
+    staged = {"role": "user", "content": deepcopy(content), "display_metadata": deepcopy(metadata),
+              "_db_persisted": True, "_row_id": row_id}
+    from agent.turn_context import _append_multimodal_context
+    agent._last_compaction_in_place = compacted
+    row = staged
+    capture(agent, row)
+    _append_multimodal_context(agent, row, "", "", preflight_compressed=compacted)
+    stored = db.get_messages("s1")[0]
+    assert snapshots(stored) == snapshots(row)
+    for key, value in metadata.items(): assert stored["display_metadata"][key] == value
+    from agent.authored_turn_context import text_of
+    assert block(snapshots(row)[0]) in text_of(stored["content"])
+    if compacted:
+        assert any(part.get("type") == "image_url" for part in stored["content"])
+    else:
+        assert isinstance(stored["content"], str)
+    db.close()
+
+
 def test_midturn_flush_persists_wire_body_without_altering_words(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("s1", source="cli")

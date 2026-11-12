@@ -7,6 +7,7 @@ from typing import NotRequired, TypedDict
 class PendingHumanInput(TypedDict):
     text: str
     facts: NotRequired[dict]
+    display_metadata: NotRequired[dict]  # authored admission snapshot, not human speech
 
 
 def pending_human_input(text: str, facts: dict | None = None, *, agent=None) -> PendingHumanInput:
