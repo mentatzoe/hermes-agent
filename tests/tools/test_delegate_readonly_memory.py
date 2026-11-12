@@ -39,13 +39,15 @@ class ReadMemory(MemoryProvider):
         self.closed = True
 
 
-def make_child(manager, tmp_path, *, disabled=None):
+def make_child(manager, tmp_path, *, disabled=None, authored_source=None):
     parent = SimpleNamespace(_delegate_depth=0, session_id='parent', _session_db=None,
         enabled_toolsets=['memory'], disabled_toolsets=disabled or [], tools=[],
         _memory_manager=manager, model='test-model', provider='openai',
         api_key='synthetic-test-key', base_url='https://isolated.invalid/v1',
         api_mode='chat_completions', _active_children=[], _credential_pool=None,
         prefill_messages=None, request_overrides={}, terminal_cwd=str(tmp_path))
+    parent._authored_turn_source = authored_source
+    parent._authored_turn_expected = {"parent-only": "not a child admission"}
     import threading
     parent._active_children_lock = threading.Lock()
     with (patch('model_tools.get_tool_definitions', return_value=[]),
@@ -104,6 +106,40 @@ def test_child_reader_does_not_inherit_an_unpermitted_or_shared_writer(mode):
     inherit_read_only_memory(parent, child)
     assert child._memory_manager is None
     assert not provider.closed
+
+
+
+
+@pytest.mark.parametrize('refresh_options', [{'preserve_prefix': True}, {'content_aware': True}])
+def test_authored_binding_survives_real_child_creation_and_refresh(tmp_path, refresh_options):
+    from agent.authored_turn_context import Source, capture, snapshots
+    from tests.agent.test_authored_turn_context import PROFILE, NAMES
+    from tools.mcp_tool_agent import refresh_agent_mcp_tools
+    path = tmp_path / 'profile.md'
+    path.write_bytes(PROFILE.encode())
+    source = Source.from_config({'file': str(path), 'sections': list(NAMES)}, tmp_path)
+    manager = MemoryManager()
+    manager.add_provider(ReadMemory())
+    parent, child = make_child(manager, tmp_path, authored_source=source)
+    try:
+        assert child._authored_turn_source is source
+        assert child._authored_turn_expected == {}
+        with patch('model_tools.get_tool_definitions', return_value=[]):
+            refresh_agent_mcp_tools(child, **refresh_options)
+        row = {'role': 'user', 'content': 'task'}
+        capture(child, row)
+        assert len(snapshots(row)) == 1
+        assert 'parent-only' not in child._authored_turn_expected
+        assert child.valid_tool_names == {'synthetic_memory_search'}
+        assert child._memory_manager.read_only
+        assert child._memory_store is None
+        other_parent, other_child = make_child(None, tmp_path / 'unconfigured')
+        try:
+            assert other_child._authored_turn_source is None
+        finally:
+            other_child.close()
+    finally:
+        child.close()
 
 
 def test_unusable_child_reader_is_closed_without_closing_the_parent():
