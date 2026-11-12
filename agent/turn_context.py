@@ -973,6 +973,9 @@ def _stamp_api_content_sidecar(
         _db = getattr(agent, "_session_db", None)
         if _db is None or not (isinstance(_row_id, int) or _in_place_compacted):
             return
+        if authored.snapshots(_turn_user_msg):
+            authored.backfill(agent, _turn_user_msg, durable_content, api_content=_api_content)
+            return
         try:
             if isinstance(_row_id, int):
                 _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
@@ -1020,6 +1023,8 @@ def _append_multimodal_context(
             _db.set_user_message_content(agent.session_id, _row_id, content)
         except Exception:
             logger.warning("multimodal context backfill failed for session=%s", agent.session_id or "none", exc_info=True)
+        if authored.snapshots(turn_user_msg):
+            authored.backfill(agent, turn_user_msg, content)
 
 
 def _persist_turn_start(

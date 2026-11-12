@@ -212,6 +212,10 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         content, api_content = durable_user_row_content(agent, msg, content, api_content)
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
+    if role == "user":
+        from agent.authored_turn_context import render, snapshots
+        if snapshots(msg) and isinstance(content, str):
+            api_content = render(msg, api_content if api_content is not None else content)
     if api_content == content:
         api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes

@@ -262,6 +262,25 @@ def merge(previous: dict, following: dict) -> None:
         }
 
 
+def backfill(agent, row: dict, content, *, api_content=None) -> None:
+    """Caller holds the persist lock. Never substitute a newest/text-only match."""
+    db, sid = agent._session_db, agent.session_id
+    row_id = row.get("_row_id")
+    try:
+        for attempt in range(2):
+            sidecar_ok = api_content is None or db.set_message_api_content(sid, row_id, content, api_content) == 1
+            if sidecar_ok and db.set_message_authored_snapshot(sid, row_id, content, snapshots(row)) == 1:
+                row["_row_id"] = row_id
+                return
+            if attempt == 0:
+                row_id = db.resolve_active_row_id(sid, row_id)
+                if row_id is None:
+                    break
+    except Exception as exc:
+        raise AuthoredContextUnavailable("Authored snapshot persistence failed") from exc
+    raise AuthoredContextUnavailable("Authored snapshot durable row could not be resolved")
+
+
 def text_of(content) -> str:
     if isinstance(content, str):
         return content
