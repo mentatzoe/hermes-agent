@@ -5022,6 +5022,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         if inflight is None or not compressed:
             return compressed
         from agent import authored_turn_context as authored
+        from agent.message_metadata import MESSAGE_UID, message_uid_or_none, record_absorbed_message
 
         carrier_idx = -1
         for idx in range(len(compressed) - 1, -1, -1):
@@ -5044,6 +5045,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         if carrier_text.split(_SUMMARY_END_MARKER, 1)[1].strip():
             # The _force_user_leading layout keeps the live request on the
             # carrier itself, after the marker. Already actionable.
+            record_absorbed_message(carrier, inflight)
             authored.merge(carrier, inflight)
             return compressed
 
@@ -5089,8 +5091,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         # occurrence of it. When the original survived in the protected head,
         # retaining it gives the durable transcript two active rows with the
         # same message_uid and renders the request twice after reload.
-        from agent.message_metadata import MESSAGE_UID, message_uid_or_none, record_absorbed_message
-
         if replay_uid := message_uid_or_none(replay):
             before = len(compressed)
             kept = list(compressed)

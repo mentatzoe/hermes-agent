@@ -30,14 +30,17 @@ def test_prologue_admits_independently_of_recall(tmp_path, mode, staged):
         from unittest.mock import MagicMock
         agent._memory_manager = MagicMock()
         agent._memory_manager.has_providers = True
-        agent._memory_manager.prefetch.return_value = ""
-        if mode == "error": agent._memory_manager.prefetch.side_effect = RuntimeError("offline")
+        agent._memory_manager.prefetch_all.return_value = ""
+        if mode == "error": agent._memory_manager.prefetch_all.side_effect = RuntimeError("offline")
+    query = "What did we decide about the fixture?"
     if staged:
-        agent._pending_cli_user_message = {"role": "user", "content": "hello", "display_metadata": {"actor": "human"}}
+        agent._pending_cli_user_message = {"role": "user", "content": query, "display_metadata": {"actor": "human"}}
     with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
-        ctx = _build(agent)
+        ctx = _build(agent, user_message=query)
+    if mode != "none":
+        agent._memory_manager.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
     row = ctx.messages[ctx.current_turn_user_idx]
-    assert row["content"] == "hello"
+    assert row["content"] == query
     assert len(snapshots(row)) == 1
     assert block(snapshots(row)[0]) in row["api_content"]
     if staged: assert row["display_metadata"]["actor"] == "human"

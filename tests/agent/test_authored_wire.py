@@ -91,9 +91,15 @@ def test_real_chat_turn_and_resume_persist_exact_request(tmp_path, monkeypatch):
     assert user["api_content"] == sent["content"]
     assert block(snapshots(user)[0]) in sent["content"]
     history = agent._session_db.get_messages_as_conversation(agent.session_id)
+    agent._authored_turn_source.path.unlink()
     result = agent.run_conversation("again", conversation_history=history)
     assert result["final_response"] == "done"
     assert next(row for row in calls[-1]["messages"] if row["role"] == "user")["content"] == sent["content"]
+    newer = [r for r in agent._session_db.get_messages(agent.session_id) if r["role"] == "user"][-1]
+    assert snapshots(newer)[0]["degraded"]
+    assert snapshots(newer)[0]["verified_at"] == snapshots(user)[0]["verified_at"]
+    assert snapshots(newer)[0]["id"] != snapshots(user)[0]["id"]
+    assert block(snapshots(newer)[0]) in calls[-1]["messages"][-1]["content"]
 
 
 def test_codex_opener_reaches_session_input(tmp_path, monkeypatch):
@@ -109,6 +115,25 @@ def test_codex_opener_reaches_session_input(tmp_path, monkeypatch):
     assert result["final_response"] == "done"
     user = next(row for row in result["messages"] if row["role"] == "user")
     assert block(snapshots(user)[0]) in captured[0]
+
+
+
+
+def test_codex_real_session_converts_authored_opener_to_turn_start(tmp_path, monkeypatch):
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+    from tests.agent.transports.test_codex_app_server_session import FakeClient
+    client = FakeClient()
+    client.queue_notification("item/completed", threadId="t", turnId="tu1",
+        item={"type": "agentMessage", "id": "m1", "text": "done"})
+    client.queue_notification("turn/completed", threadId="t",
+        turn={"id": "turn-fake-001", "status": "completed", "error": None})
+    agent = make_agent(tmp_path, monkeypatch, "codex_app_server")
+    agent._codex_session = CodexAppServerSession(cwd=str(tmp_path), client_factory=lambda **kw: client)
+    result = agent.run_conversation("hello")
+    assert result["final_response"] == "done"
+    user = next(row for row in result["messages"] if row["role"] == "user")
+    request = next(params for method, params in client.requests if method == "turn/start")
+    assert block(snapshots(user)[0]) in text_of(request["input"])
 
 
 def test_moa_holds_before_preparer_or_inner_model(tmp_path, monkeypatch):
