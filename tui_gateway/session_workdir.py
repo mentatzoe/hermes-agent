@@ -664,7 +664,16 @@ def _write_submit_user_row(session: dict, text: Any, display_kind: str | None,
     if display_kind:
         staged["display_kind"] = display_kind
     if accept_metadata:
-        staged["display_metadata"] = {**accept_metadata}
+        from copy import deepcopy
+        staged["display_metadata"] = deepcopy(accept_metadata)
+        # A queued authored admission is the same occurrence when re-placed at
+        # drain, not a new input with a new identity or source read.
+        from agent.authored_turn_context import snapshots
+        captured = snapshots(staged)
+        if len(captured) == 1:
+            origin = (captured[0].get("admission") or {}).get("message_uid")
+            if isinstance(origin, str) and origin:
+                staged["message_uid"] = origin
     with _session_db(session) as db:
         if db is None:
             return None

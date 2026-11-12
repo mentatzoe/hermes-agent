@@ -3037,6 +3037,8 @@ def _run_summary_dispatch(
                 # the candidate this run produces (#112482).
                 _mark_compressor_working_attempt(agent.context_compressor, attempt_generation)
                 compressed = compress_fn(messages, **compress_kwargs)
+                from agent.authored_turn_context import retain_required
+                retain_required(agent, messages, compressed)
                 # Freeze a hard stop that arrived after the last provider attempt but before session state rotates.
                 if hard_cancel_event is not None and hard_cancel_event.is_set():
                     raise AuxiliaryExplicitCancellation()

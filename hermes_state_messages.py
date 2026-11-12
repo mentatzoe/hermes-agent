@@ -271,7 +271,16 @@ class SessionMessagesMixin:
         ``message_id`` (yuanbao's message-dict convention)."""
         _str_or_none = lambda v: _scrub_surrogates(v) if isinstance(v, str) else None  # noqa: E731
         _reasoning = lambda key: msg.get(key) if keep_reasoning else None  # noqa: E731
-        encoded_content = self._encode_content(msg.get("content"))
+        content, api_content = msg.get("content"), msg.get("api_content")
+        if role == "user":
+            from agent import authored_turn_context as authored
+            authored_row = {"display_metadata": self._decode_display_metadata(msg.get("display_metadata"))}
+            if authored.snapshots(authored_row):
+                if isinstance(content, str):
+                    api_content = authored.render(authored_row, api_content if isinstance(api_content, str) else content)
+                elif isinstance(content, list):
+                    content = authored.render(authored_row, content)
+        encoded_content = self._encode_content(content)
         encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
         encoded_tool_name = _scrub_surrogates(msg.get("tool_name"))
         display_metadata = self._encode_display_metadata(msg.get("display_metadata"))
@@ -289,7 +298,7 @@ class SessionMessagesMixin:
               for k in ("reasoning_details", "codex_reasoning_items", "codex_message_items")),
             msg.get("platform_message_id") or msg.get("message_id"),
             1 if msg.get("observed") else 0, 1 if msg.get("_compressed_summary") else 0, 1,
-            _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
+            _str_or_none(api_content), _str_or_none(msg.get("display_kind")),
             display_metadata, self._display_identity(self._display_dedupe_key(identity_row)),
             message_uid_or_none(msg), _absorbed_uids_json(msg),
             _tool_call_uids_json(msg), _tool_call_uid_or_none(msg))
@@ -1126,12 +1135,15 @@ class SessionMessagesMixin:
             "AND role = 'user' AND active = 1 AND content IS ?",
             (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
 
-    def set_message_authored_snapshot(self, session_id, row_id, content, snapshots):
+    def set_message_authored_snapshot(self, session_id, row_id, content, snapshots, *, provenance=None):
         """Merge only authored admission metadata onto an exact active user row."""
         if (not session_id or isinstance(row_id, bool) or not isinstance(row_id, int)
                 or row_id <= 0 or not isinstance(snapshots, list) or not snapshots):
             return 0
-        patch = json.dumps({"authored_turn_context": snapshots}, ensure_ascii=False)
+        metadata = {"authored_turn_context": snapshots}
+        metadata.update({k: v for k, v in (provenance or {}).items()
+                         if k in {"turn_author", "input_provenance"}})
+        patch = json.dumps(metadata, ensure_ascii=False)
         return self._write_rowcount(
             "UPDATE messages SET display_metadata = json_patch("
             "COALESCE(display_metadata, '{}'), ?) WHERE id = ? AND session_id = ? "

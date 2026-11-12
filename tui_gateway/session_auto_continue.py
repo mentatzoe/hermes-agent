@@ -149,25 +149,37 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> dict | None:
+                    turn_author: dict | None = None, display_kind: str | None = None) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
     streams to its sender. Returns the envelope dict the text landed in (the merged head on a merge)
     so the caller can attach durable state to it; None when the text was dropped as a duplicate."""
     image_paths = list(image_paths or [])
+    authored_metadata = None
+    agent = session.get("agent")
+    if (getattr(agent, "_authored_turn_source", None) is not None
+            and isinstance(text, str) and not image_paths):
+        from agent import authored_turn_context as authored
+        meta = {"turn_author": dict(turn_author)} if turn_author is not None else (
+            {"input_provenance": "local_human"} if display_kind is None else {})
+        admission = {"role": "user", "content": text, "display_metadata": meta, "display_kind": display_kind}
+        authored.capture(agent, admission, expect=False)
+        authored_metadata = admission["display_metadata"]
     # Scrub live-turn self-duplicates first so the text merge below can't glue "{original}\n\n{later}" and re-fire the
     # original after a correction settles.
     # See #84417.
     _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
-    if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
+    if text_only and not turn_author and not authored_metadata and text.strip() == _ac_inflight_original(session) != "":
         return None
     queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
               **({"turn_author": turn_author} if turn_author else {})}
+    if authored_metadata is not None:
+        queued["_authored_metadata"] = authored_metadata
     existing = session.get("queued_prompt")
-    if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
+    if (existing and text_only and not turn_author and not authored_metadata and not existing.get("_authored_metadata") and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
             and not session.get("queued_prompts")):
         prev = existing["text"]
@@ -192,7 +204,7 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or entry.get("turn_author") or not isinstance(text, str):
+    if not original or entry.get("image_paths") or entry.get("turn_author") or entry.get("_authored_metadata") or not isinstance(text, str):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -247,12 +259,21 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
-def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str) -> dict | None:
+def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str,
+                       turn_author: dict | None = None, display_kind: str | None = None) -> dict | None:
     """Apply ``agent.<method>(plain_text)`` (steer/redirect); on acceptance record the correction, scrub stale
     self-duplicates so the live turn's original text is not re-fired after settle, and return the ``status`` reply.
     None → caller falls through to the queue path."""
     try:
-        if not getattr(agent, method)(plain_text):
+        from agent.interrupt_compat import _accepts_keyword
+        verb = getattr(agent, method)
+        author = turn_author or {}
+        facts = {"sender_id": author.get("id"), "is_bot": author.get("is_bot", False),
+                 "typed_user_content": plain_text, "display_kind": display_kind}
+        if turn_author is None and display_kind is None:
+            facts["input_provenance"] = "local_human"
+        kwargs = {"facts": facts} if _accepts_keyword(verb, "facts") else {}
+        if not verb(plain_text, **kwargs):
             return None
     except Exception:
         return None
@@ -344,7 +365,7 @@ def _persist_queued_user_row(session: dict, envelope: dict, display_kind: str | 
     from hermes_state_common import QUEUED_PROMPT_METADATA_KEY
     staged = _write_submit_user_row(
         session, envelope.get("text"), display_kind,
-        accept_metadata={QUEUED_PROMPT_METADATA_KEY: True})
+        accept_metadata={**(envelope.get("_authored_metadata") or {}), QUEUED_PROMPT_METADATA_KEY: True})
     if staged is not None:
         envelope["_submit_user_row"] = staged
         if display_kind:
@@ -371,11 +392,12 @@ def _replace_queued_user_row_for_turn(session: dict, queued: dict, is_dispatchin
     # still-queued envelopes keep the never-drained marker (#125577) so a restart between drains
     # retires the row rather than gluing the never-run prompt into the previous turn.
     if is_dispatching:
-        _persist_submit_user_row(session, queued.get("text"), queued.get("_queued_display_kind"))
+        _persist_submit_user_row(session, queued.get("text"), queued.get("_queued_display_kind"),
+                                 accept_metadata=queued.get("_authored_metadata"))
     else:
         from hermes_state_common import QUEUED_PROMPT_METADATA_KEY
         _persist_submit_user_row(session, queued.get("text"), queued.get("_queued_display_kind"),
-                                 accept_metadata={QUEUED_PROMPT_METADATA_KEY: True})
+                                 accept_metadata={**(queued.get("_authored_metadata") or {}), QUEUED_PROMPT_METADATA_KEY: True})
     fresh = session.get("_submit_user_row")
     if not (isinstance(fresh, dict) and isinstance(fresh.get("_row_id"), int)):
         return None  # re-append wrote nothing: keep the accept-time row active
@@ -431,7 +453,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
         method, status = {"steer": ("steer", "steered"), "interrupt": ("redirect", "redirected")}.get(mode, (None, None))
         if (method and supported[mode]
-                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status)) is not None):
+                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status, turn_author, display_kind)) is not None):
             return resp
     # Queue before asking the live turn to stop. Never call a provider/compute-host method under history_lock: an
     # interrupt can wait behind the op it cancels.
@@ -440,7 +462,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author,
+                                   display_kind=display_kind)
         # Durable AT ACCEPT (not when the turn runs): a cold resume sees the queued message and a
         # backend restart cannot lose it. Lives on the envelope, never the shared session slot.
         if envelope is not None:

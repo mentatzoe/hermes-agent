@@ -35,6 +35,7 @@ def authored_steer_kwargs(verb, event):
     internal = getattr(event, "internal", False)
     return {"facts": {
         "sender_id": None if internal else (event.source.user_id or None),
+        "is_bot": True if internal else bool(getattr(event.source, "is_bot", False)),
         "typed_user_content": typed_text_for_event(event),
         "recoverable_audio_paths": [] if internal else list(
             getattr(event, "_gateway_recoverable_audio_paths", None) or []),

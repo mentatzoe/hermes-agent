@@ -667,6 +667,7 @@ def _stage_turn_user_message(
     persist_user_timestamp: Optional[float], persist_user_platform_id: Optional[str],
     persist_user_display_kind: Optional[str],
     persist_user_display_metadata: Optional[Dict[str, Any]],
+    turn_author: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Any]:
     """Build this turn's user dict, reusing CLI-staged input only when its clean text
     matches this turn (a stale handoff must not replace later input; voice turns
@@ -696,11 +697,17 @@ def _stage_turn_user_message(
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
     if persist_user_display_metadata:
-        user_msg["display_metadata"] = persist_user_display_metadata
+        user_msg["display_metadata"] = {
+            **(user_msg.get("display_metadata") or {}), **persist_user_display_metadata,
+        }
     # The platform message id survives the turn-start flush; restart drain-window
     # recovery dedups via ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
+    if turn_author is not None:
+        user_msg["display_metadata"] = {
+            **(user_msg.get("display_metadata") or {}), "turn_author": dict(turn_author),
+        }
     authored.capture(agent, user_msg)
     return user_msg, pending_cli_message
 
@@ -1136,6 +1143,7 @@ def build_turn_context(
     user_msg, pending_cli_message = _stage_turn_user_message(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+        turn_author,
     )
     if (moa_active or agent.provider == "moa") and getattr(agent, "_authored_turn_source", None) is not None:
         raise authored.AuthoredContextUnavailable(

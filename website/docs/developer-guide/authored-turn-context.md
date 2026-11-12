@@ -54,23 +54,34 @@ This private local cache detects corruption and wrong bindings; it is not a sign
   "source_sha256": "sha256-of-complete-original-source-bytes",
   "verified_at": "ISO-8601-aware-UTC-time",
   "degraded": false,
-  "cache_write_failed": false
+  "cache_write_failed": false,
+  "admission": {
+    "timestamp": 1800000000.0,
+    "message_uid": "durable-original-message-uid",
+    "kind": "message",
+    "turn_author": {"id": "transport-sender", "name": "Pat", "is_bot": false},
+    "input_provenance": null,
+    "display_kind": null,
+    "source": "discord"
+  }
 }
 ```
+
+`admission` is an optional backwards-compatible extension. New captures bind the snapshot to its own capture-time epoch, original message UID (null for nested entries), kind (`message` or `entry`), and structured author/source facts. Carrier-row timestamps can change at compaction; neither they nor `verified_at` replace this admission time. Opener `turn_author` is also persisted in surrounding display metadata, including exact-row early-flush backfill. Local TUI client submissions explicitly set `input_provenance: local_human`; platform names alone never establish this. Relay bots and hidden/internal inputs keep their distinct provenance.
 
 `cache_write_failed` is optional. A cache fallback retains the original verification fields and sets `degraded: true`. An ID identifies an admission, not a unique body: identical bodies on separate inputs have different IDs. Replays and merges retain existing IDs. Consumers must preserve surrounding actor, display-kind, steering-entry and absorbed-message metadata when classifying human versus harness input; these snapshots are not new human speech.
 
 String turns use the existing `api_content` sidecar. Multimodal turns receive a separate text part and retain the existing writer's storage shape (text projection for normal flush, structured JSON for in-place compaction). Early-persisted rows receive snapshot metadata through a narrow JSON merge matched by session, row ID, user role, active state and actual stored content. Unrelated metadata is preserved; unresolved snapshot backfills raise rather than guessing the latest text-matching row.
 
-Consecutive-user merges, micro-compaction and in-flight replay/carrier absorption carry snapshots and existing message/absorbed IDs. Rendering is idempotent within each row. Historical replay uses its captured body rather than rereading today's profile.
+Consecutive-user merges, micro-compaction and in-flight replay/carrier absorption carry snapshots and existing message/absorbed IDs. The host summary-dispatch boundary retains every currently required snapshot, not only the most recent correction; it does not retain every historical profile copy indefinitely. SessionDB serialization renders snapshots on direct compaction writes as well as normal flushes, preserving the raw string `api_content` versus sentinel-encoded structured `content` distinction. Rendering is idempotent within each row. Historical replay uses its captured body rather than rereading today's profile.
 
 ## Request boundaries and limits
 
 After request middleware and provider conversion, Chat Completions, Responses and native Anthropic requests are checked for the exact required blocks. Missing or altered blocks raise before inference. The check does not establish model compliance with the text or live provider delivery.
 
-Codex app-server openers carry the rendered snapshot through the real session conversion to `turn/start`. Isolated tests cover that boundary with a fake external RPC client, not an actual Codex subprocess/backend. With this setting enabled, native mid-turn steer/redirect returns `false` rather than sending an unverified omission; callers must use their normal queued-turn fallback. Actual surface queuing and native runtime delivery remain acceptance gates.
+Codex app-server openers carry the rendered snapshot through the real session conversion to `turn/start`. Isolated tests cover that boundary with a fake external RPC client, not an actual Codex subprocess/backend. With this setting enabled, native mid-turn steer/redirect returns `false` rather than sending an unverified omission; callers must use their normal queued-turn fallback. The inline TUI text-queue fallback is tested through accept-time persistence, FIFO drain, real `AIAgent.run_conversation`, real session conversion, `turn/start` parameters and monitor readback using a fake external RPC client. With authored delivery enabled, repeated queued words remain separate occurrences; source/UID/timestamp bindings survive drain without recapture. Queued-only evidence remains unknown until a dispatch copy exists. A real native subprocess/backend remains untested.
 
-MoA is explicitly held before its preparer runs while authored delivery is enabled: its inner requests do not have the verified delivery contract in this slice. Full-compaction preservation is tested for a single in-flight input plus the targeted merge/replay cases; more complex multiple-active-input compression layouts need independent acceptance. If any currently required block is lost, the final request check stops the request rather than accepting partial delivery.
+MoA is explicitly held before its preparer runs while authored delivery is enabled: its inner requests do not have the verified delivery contract in this slice. Full-compaction preservation is tested for an opener plus two delivered corrections through repeated host summary dispatch, SQLite archive/compaction and resume. The summary provider is mocked. Isolated compute-host forwarding, classic terminal/one-shot id-less provenance, queue recovery after process death, media-bearing native queue fallback and other surface-specific queue implementations are excluded from this acceptance claim; legacy unbound provenance remains unknown. These are review/adoption holds, not implied coverage. If any currently required block is lost, the final request check stops the request rather than accepting partial delivery.
 
 ## Skill-context middleware host contract
 

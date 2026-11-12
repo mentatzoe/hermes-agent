@@ -712,6 +712,10 @@ def _(rid, params: dict) -> dict:
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
+    if raw_author is None and not internal_hosted_submit and display_kind is None:
+        # This is the local client-input boundary, not a platform-based guess
+        # in the agent (which also accepts unattended/programmatic turns).
+        display_metadata = {**(display_metadata or {}), "input_provenance": "local_human"}
     err = (
         _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback)
         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))

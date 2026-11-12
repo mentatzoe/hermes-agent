@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 from uuid import uuid4
 
 KEY = "authored_turn_context"
@@ -231,6 +232,21 @@ def capture(agent, row: dict, *, expect: bool = True) -> None:
         }
         return
     snapshot = source.snapshot()
+    from agent.message_metadata import stamp_message_uid
+    meta = row.get("display_metadata") or {}
+    facts = row.get("facts") or {}
+    author = meta.get("turn_author")
+    if author is None and facts:
+        author = {"id": facts.get("sender_id"), "is_bot": facts.get("is_bot")}
+    snapshot["admission"] = {
+        "timestamp": time.time(),
+        "message_uid": stamp_message_uid(row) if row.get("role") == "user" else None,
+        "kind": "message" if row.get("role") == "user" else "entry",
+        "turn_author": deepcopy(author),
+        "input_provenance": meta.get("input_provenance", facts.get("input_provenance")),
+        "display_kind": row.get("display_kind", facts.get("display_kind")),
+        "source": getattr(agent, "platform", None),
+    }
     _report_fault(agent, snapshot)
     row["display_metadata"] = {
         **(row.get("display_metadata") or {}), KEY: [snapshot]
@@ -276,6 +292,36 @@ def merge(previous: dict, following: dict) -> bool:
     return changed
 
 
+def retain_required(agent, before: list, after: list) -> None:
+    """Keep every active admission through the host compression boundary.
+
+    Do not retain all historical profile copies forever. The host's current
+    expected set names only this run's opener and delivered corrections.
+    """
+    expected = getattr(agent, "_authored_turn_expected", {})
+    present = {s["id"] for row in after if row.get("role") == "user" for s in snapshots(row)}
+    missing = set(expected) - present
+    if not missing:
+        return
+    carrier = next((row for row in reversed(after) if row.get("role") == "user"), None)
+    if carrier is None:
+        raise AuthoredContextUnavailable("Compression left no authored-context carrier")
+    from agent.message_metadata import record_absorbed_message
+    for row in before:
+        selected = [s for s in snapshots(row) if s["id"] in missing]
+        if selected:
+            merge(carrier, {"display_metadata": {KEY: selected}})
+            record_absorbed_message(carrier, row)
+            missing.difference_update(s["id"] for s in selected)
+    if missing:
+        raise AuthoredContextUnavailable("Active authored admissions unavailable during compression")
+    # Metadata changed, not the carrier's words: keep any existing recall or
+    # plugin sidecar and append only the missing required blocks.
+    if isinstance(carrier.get("api_content"), str):
+        carrier["api_content"] = render(carrier, carrier["api_content"])
+    carrier.pop("_db_persisted", None)
+
+
 def backfill(agent, row: dict, content, *, api_content=None) -> None:
     """Caller holds the persist lock. Never substitute a newest/text-only match."""
     db, sid = agent._session_db, agent.session_id
@@ -283,7 +329,10 @@ def backfill(agent, row: dict, content, *, api_content=None) -> None:
     try:
         for attempt in range(2):
             sidecar_ok = api_content is None or db.set_message_api_content(sid, row_id, content, api_content) == 1
-            if sidecar_ok and db.set_message_authored_snapshot(sid, row_id, content, snapshots(row)) == 1:
+            if sidecar_ok and db.set_message_authored_snapshot(
+                sid, row_id, content, snapshots(row),
+                provenance={k: row["display_metadata"][k] for k in ("turn_author", "input_provenance")
+                            if k in row.get("display_metadata", {})}) == 1:
                 row["_row_id"] = row_id
                 return
             if attempt == 0:
