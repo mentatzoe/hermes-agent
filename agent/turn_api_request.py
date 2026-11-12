@@ -163,6 +163,9 @@ def build_api_request(
         effective_task_id=effective_task_id, turn_id=turn_id,
     )
 
+    from agent import authored_turn_context as authored
+    authored.check_request(agent, api_kwargs)
+
     if env_var_enabled("HERMES_DUMP_REQUESTS"):
         agent._dump_api_request_debug(api_kwargs, reason="preflight")
 

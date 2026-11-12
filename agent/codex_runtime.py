@@ -734,8 +734,16 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     try:
         _start_codex_thread(agent)
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
+        from agent import authored_turn_context as authored
+        if not isinstance(current_turn_user_idx, int) or not 0 <= current_turn_user_idx < len(messages):
+            if getattr(agent, "_authored_turn_source", None) is not None:
+                raise authored.AuthoredContextUnavailable("Current user row is unavailable")
+            user_input = user_message
+        else:
+            user_input = authored.render(messages[current_turn_user_idx], user_message)
+        authored.check_request(agent, {"input": [{"role": "user", "content": user_input}]})
         turn = agent._codex_session.run_turn(
-            user_input=user_message,
+            user_input=user_input,
             model=wire_model, reasoning_effort=_codex_turn_effort(agent, wire_model),
             service_tier=_codex_turn_service_tier(agent))
     except Exception as exc:

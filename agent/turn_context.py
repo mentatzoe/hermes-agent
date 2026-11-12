@@ -1137,6 +1137,10 @@ def build_turn_context(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
     )
+    if (moa_active or agent.provider == "moa") and getattr(agent, "_authored_turn_source", None) is not None:
+        raise authored.AuthoredContextUnavailable(
+            "Authored context is not yet verified on MoA inner requests; select a direct provider"
+        )
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
