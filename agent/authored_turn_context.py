@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import logging
+import tempfile
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -65,10 +69,11 @@ def selected_sections(text: str, names: tuple[str, ...]) -> str:
 class Source:
     path: Path
     sections: tuple[str, ...]
+    home: Path
 
     @classmethod
     def from_config(cls, raw, home: Path):
-        if raw is None:
+        if raw is None or raw is False or (isinstance(raw, dict) and raw.get("enabled") is False):
             return None
         if not isinstance(raw, dict):
             raise AuthoredContextUnavailable("Invalid authored context configuration")
@@ -88,9 +93,9 @@ class Source:
             raise AuthoredContextUnavailable("Relative authored source escaped its home")
         if path.suffix.lower() not in {".md", ".markdown"}:
             raise AuthoredContextUnavailable("Authored context must be Markdown")
-        return cls(path, tuple(names))
+        return cls(path, tuple(names), home.resolve())
 
-    def snapshot(self) -> dict:
+    def _read_current(self) -> dict:
         try:
             fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
             with os.fdopen(fd, "rb") as stream:
@@ -105,10 +110,89 @@ class Source:
                 "Configured authored context could not be read"
             ) from None
         return {
-            "id": uuid4().hex,
+            "version": 1, "binding": self.binding,
             "sha256": sha256(body.encode("utf-8")).hexdigest(),
+            "source_sha256": sha256(raw).hexdigest(),
+            "verified_at": datetime.now(timezone.utc).isoformat(),
             "body": body,
         }
+
+    @property
+    def binding(self) -> dict:
+        return {"home": str(self.home), "source": str(self.path), "sections": list(self.sections)}
+
+    @property
+    def cache_path(self) -> Path:
+        key = sha256(json.dumps(self.binding, sort_keys=True).encode()).hexdigest()
+        return self.home / "state" / "authored-turn-context" / (key + ".json")
+
+    def _cache_directory(self, *, create=False) -> Path:
+        directory = self.cache_path.parent
+        if not directory.resolve().is_relative_to(self.home) or directory.is_symlink():
+            raise OSError("Authored cache escaped its home")
+        if create:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            directory.chmod(0o700)
+        if directory.stat().st_mode & 0o077:
+            raise OSError("Authored cache directory is not private")
+        return directory
+
+    def _write_verified(self, value: dict) -> None:
+        directory = self._cache_directory(create=True)
+        fd, temporary = tempfile.mkstemp(prefix=".verified-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(value, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.cache_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _read_verified(self) -> dict:
+        self._cache_directory()
+        fd = os.open(self.cache_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                raise ValueError("Authored cache is not a private file")
+            raw = stream.read(MAX_BYTES * 8 + 1)
+        if len(raw) > MAX_BYTES * 8:
+            raise ValueError("Oversized authored cache")
+        value = json.loads(raw)
+        if (value.get("version") != 1 or value.get("binding") != self.binding
+                or not isinstance(value.get("body"), str)
+                or len(value["body"].encode()) > MAX_BYTES + len(self.sections)
+                or sha256(value["body"].encode()).hexdigest() != value.get("sha256")
+                or not re.fullmatch(r"[0-9a-f]{64}", value.get("source_sha256", ""))):
+            raise ValueError("Invalid authored cache")
+        verified = datetime.fromisoformat(value["verified_at"])
+        if verified.tzinfo is None or verified > datetime.now(timezone.utc):
+            raise ValueError("Invalid verification time")
+        selected_sections(value["body"], self.sections)
+        return value
+
+    def snapshot(self) -> dict:
+        """Current file first, then only this binding's complete verified copy."""
+        try:
+            value = self._read_current()
+        except AuthoredContextUnavailable:
+            try:
+                value = self._read_verified()
+            except (OSError, ValueError, TypeError, KeyError, AuthoredContextUnavailable):
+                raise AuthoredContextUnavailable(
+                    "Authored context unavailable: current source and verified copy failed"
+                ) from None
+            return {**value, "id": uuid4().hex, "degraded": True}
+        failed = False
+        try:
+            self._write_verified(value)
+        except OSError:
+            failed = True
+        return {**value, "id": uuid4().hex, "degraded": False, "cache_write_failed": failed}
 
 
 def block(snapshot: dict) -> str:
@@ -138,11 +222,31 @@ def capture(agent, row: dict) -> None:
         }
         return
     snapshot = source.snapshot()
+    _report_fault(agent, snapshot)
     row["display_metadata"] = {
         **(row.get("display_metadata") or {}), KEY: [snapshot]
     }
     pending = getattr(agent, "_authored_turn_expected", {})
     agent._authored_turn_expected = {**pending, snapshot["id"]: block(snapshot)}
+
+
+def _report_fault(agent, snapshot: dict) -> None:
+    fault = "source" if snapshot.get("degraded") else "cache" if snapshot.get("cache_write_failed") else None
+    previous = getattr(agent, "_authored_context_fault", None)
+    agent._authored_context_fault = fault
+    if fault is None or previous == fault:
+        return
+    message = (
+        "Authored profile source unavailable; using the complete verified copy from "
+        + snapshot["verified_at"] + " (SHA-256 " + snapshot["sha256"] + ")."
+        if fault == "source" else
+        "Authored profile read successfully, but its verified fallback could not be saved."
+    )
+    logging.getLogger(__name__).warning(message)
+    callback = getattr(agent, "status_callback", None)
+    if callable(callback):
+        from gateway.warning_notifications import DiagnosticText
+        callback("lifecycle", DiagnosticText(message))
 
 
 def merge(previous: dict, following: dict) -> None:
