@@ -827,6 +827,7 @@ def _run_agent_tool_execution_middleware(
             request_args,
             lambda next_args: _authorized_dispatch(next_args if isinstance(next_args, dict) else request_args),
             original_args=function_args,
+            enabled_tools=tuple(agent.valid_tool_names or ()),
             **tool_hook_ids(agent, effective_task_id, tool_call_id),
         )
 
