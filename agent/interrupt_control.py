@@ -270,6 +270,9 @@ class InterruptControlMixin:
         interrupt). Keep each call's sender facts beside its unchanged model text."""
         if not text or not text.strip():
             return False
+        if (getattr(self, "api_mode", None) == "codex_app_server"
+                and getattr(self, "_authored_turn_source", None) is not None):
+            return False  # Surface queues a normal turn; native midturn has no durable admission path.
         cleaned = text.strip()
         entry = pending_human_input(cleaned, facts, agent=self)
         with _ic_lock(self, "_pending_steer_lock"):
@@ -290,6 +293,8 @@ class InterruptControlMixin:
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:
+            if getattr(self, "_authored_turn_source", None) is not None:
+                return False  # Do not send a native steer without its authored snapshot/replay proof.
             with _ic_lock(self, "_pending_redirect_lock"):
                 if self._interrupt_requested:
                     return False

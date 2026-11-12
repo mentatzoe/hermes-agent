@@ -61,6 +61,8 @@ def selected_sections(text: str, names: tuple[str, ...]) -> str:
             (i for i, level, _ in headings if i > start and level <= 3),
             len(lines),
         )
+        if not "".join(lines[start + 1:end]).strip():
+            raise AuthoredContextUnavailable("A required authored section is empty")
         out.append("".join(lines[start:end]))
     return "\n".join(out)
 
@@ -163,6 +165,8 @@ class Source:
         if len(raw) > MAX_BYTES * 8:
             raise ValueError("Oversized authored cache")
         value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("Invalid authored cache shape")
         if (value.get("version") != 1 or value.get("binding") != self.binding
                 or not isinstance(value.get("body"), str)
                 or len(value["body"].encode()) > MAX_BYTES + len(self.sections)
@@ -199,10 +203,15 @@ def block(snapshot: dict) -> str:
     body = snapshot["body"]
     if sha256(body.encode("utf-8")).hexdigest() != snapshot["sha256"]:
         raise AuthoredContextUnavailable("Stored authored context is inconsistent")
+    provenance = (
+        "\nSource unavailable; using a verified copy, verified at " + snapshot["verified_at"]
+        + "; source SHA-256 " + snapshot["source_sha256"] + "."
+        if snapshot.get("degraded") else ""
+    )
     return (
         f'<authored-context id="{snapshot["id"]}" '
         f'sha256="{snapshot["sha256"]}">\n'
-        f"{GUIDANCE}\n\n{body}\n</authored-context>"
+        f"{GUIDANCE}{provenance}\n\n{body}\n</authored-context>"
     )
 
 
@@ -247,7 +256,10 @@ def _report_fault(agent, snapshot: dict) -> None:
     callback = getattr(agent, "status_callback", None)
     if callable(callback):
         from gateway.warning_notifications import DiagnosticText
-        callback("lifecycle", DiagnosticText(message))
+        try:
+            callback("lifecycle", DiagnosticText(message))
+        except Exception:
+            logging.getLogger(__name__).warning("Authored context fault notice could not reach the surface")
 
 
 def merge(previous: dict, following: dict) -> bool:

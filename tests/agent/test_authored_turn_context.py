@@ -189,6 +189,43 @@ def test_current_source_survives_cache_write_failure(agent, monkeypatch):
     assert len(notices) == 1
 
 
+
+
+def test_empty_selected_section_is_invalid():
+    with pytest.raises(AuthoredContextUnavailable):
+        selected_sections("### Why we have this\n\n### Us\nReason.\n", NAMES)
+
+
+def test_malformed_cache_shape_is_specific_unavailable(agent):
+    source = agent._authored_turn_source
+    source.snapshot()
+    source.path.unlink()
+    source.cache_path.write_text('[]')
+    with pytest.raises(AuthoredContextUnavailable): source.snapshot()
+
+
+def test_fallback_wire_exposes_original_verification(agent):
+    source = agent._authored_turn_source
+    first = source.snapshot()
+    source.path.unlink()
+    fallback = source.snapshot()
+    wire = block(fallback)
+    assert first["verified_at"] in wire
+    assert first["source_sha256"] in wire
+    assert "verified copy" in wire
+
+
+def test_status_callback_failure_does_not_break_trustworthy_fallback(agent):
+    source = agent._authored_turn_source
+    source.snapshot()
+    source.path.unlink()
+    def broken(*a): raise RuntimeError("UI gone")
+    agent.status_callback = broken
+    row = {"role": "user", "content": "hi"}
+    capture(agent, row)
+    assert snapshots(row)[0]["degraded"]
+
+
 def test_unreadable_source_blocks_admission(agent):
     agent._authored_turn_source.path.unlink()
     with pytest.raises(AuthoredContextUnavailable):

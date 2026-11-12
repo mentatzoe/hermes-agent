@@ -43,6 +43,18 @@ def test_prologue_admits_independently_of_recall(tmp_path, mode, staged):
     if staged: assert row["display_metadata"]["actor"] == "human"
 
 
+
+
+@pytest.mark.parametrize("method", ["steer", "redirect"])
+def test_native_codex_midturn_refuses_unverified_delivery(tmp_path, method):
+    from unittest.mock import MagicMock
+    agent = configure(QueueAgent(), tmp_path)
+    agent.api_mode = "codex_app_server"
+    agent._codex_session = SimpleNamespace(request_steer=MagicMock(return_value=True))
+    assert getattr(agent, method)("correction") is False
+    agent._codex_session.request_steer.assert_not_called()
+
+
 class QueueAgent(InterruptControlMixin):
     def __init__(self):
         self._interrupt_requested = False
