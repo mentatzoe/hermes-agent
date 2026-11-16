@@ -275,27 +275,122 @@ class TestApprovalPathsRecordHumanWait:
             "pattern_key": "k",
             "pattern_keys": ["k"],
         }
+        from contextlib import contextmanager
+
+        from hermes_cli.plugins import discover_plugins
+        from tests.agent.thread_sync_helpers import CheckedThread, join_checked
+
+        # Cold plugin discovery is setup, not part of the human's response time (#60).
+        discover_plugins()
         notified = threading.Event()
-        result_holder = {}
+        waiting = threading.Event()
+        cleanup_started = threading.Event()
+        original_window = approval_human_wait.human_wait_window
 
-        def _worker():
-            result_holder["result"] = approval_mod._await_gateway_decision(
-                SESSION, lambda _data: notified.set(), approval_data
-            )
+        def notify(_data):
+            notified.set()
+            # The queue entry exists before notification. If teardown's first
+            # resolve missed a late enqueue, this callback owns its denial.
+            if cleanup_started.is_set():
+                approval_mod.resolve_gateway_approval(SESSION, "deny", resolve_all=True)
 
-        t = threading.Thread(target=_worker, daemon=True)
+        @contextmanager
+        def observed_window(session_key):
+            with original_window(session_key):
+                waiting.set()
+                yield
+
+        monkeypatch.setattr("tools.approval_gateway_wait.human_wait_window", observed_window)
+        t = CheckedThread(
+            lambda: approval_mod._await_gateway_decision(SESSION, notify, approval_data),
+            name="approval-human-wait",
+        )
         t.start()
-        assert notified.wait(timeout=5)
-        time.sleep(0.1)
         try:
+            assert notified.wait(timeout=5), "gateway approval notification did not arrive"
+            # Notification precedes the poll window; don't guess its entry with a sleep.
+            assert waiting.wait(timeout=5)
             assert approval_human_wait.human_wait_seconds(SESSION) > 0.0
         finally:
-            # Resolve the pending entry via the real production path.
+            cleanup_started.set()
             approval_mod.resolve_gateway_approval(SESSION, "deny", resolve_all=True)
-            t.join(timeout=5)
-        assert not t.is_alive()
-        # Window closed once the wait resolved.
-        assert approval_human_wait._human_wait_states[SESSION].pending == 0
+            join_checked(t)
+            assert t.value is not None
+            assert t.value["resolved"] and t.value["choice"] == "deny"
+            assert approval_human_wait._human_wait_states[SESSION].pending == 0
+            with approval_mod._lock:
+                assert not approval_mod._gateway_queues.get(SESSION)
+
+    @pytest.mark.parametrize("stall_at", ["before_enqueue", "after_enqueue"])
+    def test_gateway_wait_failure_retires_worker_before_patches_unwind(self, monkeypatch, stall_at):
+        """A notification failure must not strand an approval arriving during cleanup (#60)."""
+        from tools import approval_gateway_wait
+
+        release = threading.Event()
+        stalled = threading.Event()
+        workers = []
+        resolutions = []
+        original_entry = approval_gateway_wait._ApprovalEntry
+        original_hook = approval_context._fire_approval_hook
+        original_resolve = approval_mod.resolve_gateway_approval
+        original_start = threading.Thread.start
+
+        def hold_until_cleanup():
+            stalled.set()
+            assert release.wait(timeout=30), "cleanup never released the controlled stall"
+
+        def delayed_entry(*args, **kwargs):
+            hold_until_cleanup()
+            return original_entry(*args, **kwargs)
+
+        def delayed_hook(event, **kwargs):
+            if event == "pre_approval_request" and kwargs.get("session_key") == SESSION:
+                hold_until_cleanup()
+            return original_hook(event, **kwargs)
+
+        def resolve_then_release(*args, **kwargs):
+            count = original_resolve(*args, **kwargs)
+            resolutions.append(count)
+            # In the pre-enqueue case the first real resolve must see an empty
+            # queue. Only then may the worker publish its late request.
+            release.set()
+            return count
+
+        def record_start(thread, *args, **kwargs):
+            if thread.name == "approval-human-wait":
+                workers.append(thread)
+            return original_start(thread, *args, **kwargs)
+
+        with monkeypatch.context() as patches:
+            if stall_at == "before_enqueue":
+                patches.setattr(approval_gateway_wait, "_ApprovalEntry", delayed_entry)
+            else:
+                patches.setattr(approval_context, "_fire_approval_hook", delayed_hook)
+            patches.setattr(approval_mod, "resolve_gateway_approval", resolve_then_release)
+            patches.setattr(threading.Thread, "start", record_start)
+            try:
+                with pytest.raises(AssertionError) as failure:
+                    self.test_await_gateway_decision_records_wait(patches)
+                # Observe before patches unwind or the diagnostic rescue below.
+                alive = [worker.name for worker in workers if worker.is_alive()]
+                with approval_mod._lock:
+                    pending = len(approval_mod._gateway_queues.get(SESSION, []))
+                assert stalled.is_set()
+                assert resolutions[0] == (0 if stall_at == "before_enqueue" else 1)
+                assert not alive, f"approval workers survived the failed test: {alive}"
+                assert pending == 0, "failed test left a pending approval"
+                assert "gateway approval notification did not arrive" in str(failure.value)
+                assert len(workers) == 1
+                assert workers[0].value["resolved"] and workers[0].value["choice"] == "deny"
+                assert approval_human_wait._human_wait_states[SESSION].pending == 0
+            finally:
+                # Contain a regression without making rescue count as successful
+                # fixture cleanup: every assertion above observes the pre-rescue state.
+                release.set()
+                original_resolve(SESSION, "deny", resolve_all=True)
+                for worker in workers:
+                    worker.join(timeout=5)
+                assert not any(worker.is_alive() for worker in workers)
 
     def test_prompt_dangerous_approval_records_wait(self, monkeypatch):
         """The CLI prompt path must mark itself as human wait."""
